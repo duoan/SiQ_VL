@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Optional
 
 import torch
@@ -32,9 +33,20 @@ class SiQ_VLModalityProjector(nn.Module):
         bsz, seq, embed_dim = x.size()
         seq_root = int(seq**0.5)
         # Sequence length must be a perfect square for pixel shuffle
-        assert seq_root**2 == seq
+        if seq_root**2 != seq:
+            raise ValueError(
+                f"Sequence length {seq} is not a perfect square (sqrt={seq_root}). "
+                f"Cannot apply pixel shuffle. Please check your vision model configuration."
+            )
         # Sequence root must be divisible by scale factor
-        assert seq_root % self.scale_factor == 0
+        if seq_root % self.scale_factor != 0:
+            # Find valid factors
+            valid_factors = [f for f in range(1, seq_root + 1) if seq_root % f == 0]
+            raise ValueError(
+                f"seq_root {seq_root} is not divisible by scale factor {self.scale_factor}. "
+                f"Valid factors for seq_root {seq_root} are: {valid_factors}. "
+                f"Please set pixel_shuffle_factor to one of these values."
+            )
 
         height = width = seq_root
         x = x.view(bsz, height, width, embed_dim)
@@ -63,12 +75,91 @@ class SiQ_VLModel(nn.Module):
     accepts_loss_kwargs = False
     supports_gradient_checkpointing = True
 
+    @staticmethod
+    def _calculate_expected_seq_len(vision_config, vision_tower=None, vision_model_path=None):
+        """
+        Calculate expected sequence length from vision model configuration.
+        For SigLIP models: seq_len = (image_size / patch_size)^2
+        
+        If config doesn't have the info, try to infer from model name or do a test forward pass.
+        """
+        # Try to get image_size from config
+        image_size = getattr(vision_config, 'image_size', None)
+        
+        # Get patch_size from config
+        patch_size = getattr(vision_config, 'patch_size', None)
+        
+        # Try to infer from model name if available
+        if vision_model_path and (image_size is None or patch_size is None):
+            # Common SigLIP patterns: siglip2-base-patch16-224, siglip2-so400m-patch14-384, etc.
+            # Extract patch size (e.g., patch14, patch16)
+            patch_match = re.search(r'patch(\d+)', vision_model_path.lower())
+            if patch_match and patch_size is None:
+                patch_size = int(patch_match.group(1))
+            
+            # Extract image size (usually at the end: -224, -384, -512)
+            size_match = re.search(r'-(\d+)$', vision_model_path)
+            if size_match and image_size is None:
+                image_size = int(size_match.group(1))
+        
+        # Default patch_size if still None
+        if patch_size is None:
+            patch_size = 16  # Default for most SigLIP models
+        
+        if image_size is not None and patch_size is not None:
+            seq_len = (image_size // patch_size) ** 2
+            return seq_len
+        
+        # If we can't determine from config or name, do a test forward pass with common sizes
+        if vision_tower is not None:
+            # Try common image sizes: 224, 384, 512
+            for test_size in [224, 384, 512]:
+                try:
+                    dummy_image = torch.zeros(1, 3, test_size, test_size)
+                    with torch.no_grad():
+                        output = vision_tower(dummy_image)
+                        if hasattr(output, 'last_hidden_state'):
+                            seq_len = output.last_hidden_state.shape[1]
+                            # Verify it's a perfect square
+                            seq_root = int(seq_len ** 0.5)
+                            if seq_root ** 2 == seq_len:
+                                return seq_len
+                except Exception:
+                    continue
+        
+        return None
+
+    @staticmethod
+    def _calculate_pixel_shuffle_factor(seq_len):
+        """
+        Calculate a valid pixel_shuffle_factor for a given sequence length.
+        The factor must divide sqrt(seq_len) evenly.
+        """
+        if seq_len is None:
+            return None
+        
+        seq_root = int(seq_len ** 0.5)
+        
+        # Check if seq_len is a perfect square
+        if seq_root ** 2 != seq_len:
+            return None
+        
+        # Find the largest factor that divides seq_root evenly
+        # Try common factors: 2, 4, 8, 3, 6, 7, 14, etc.
+        # Start with larger factors for better compression
+        for factor in range(seq_root, 0, -1):
+            if seq_root % factor == 0:
+                return factor
+        
+        return 1  # Fallback: no shuffling
+
     def __init__(
         self,
         vision_model_path="google/siglip2-so400m-patch14-384",
         llm_model_path="Qwen/Qwen2.5-0.5B-Instruct",
         freeze_llm=True,
         gradient_accumulation_steps=1,
+        pixel_shuffle_factor=None,  # If None, will auto-calculate
     ):
         super().__init__()
 
@@ -94,6 +185,33 @@ class SiQ_VLModel(nn.Module):
         # Get vision hidden size (SigLIP SO400M is typically 1152)
         self.vision_hidden_size = self.vision_tower.config.hidden_size
 
+        # Calculate or determine pixel_shuffle_factor
+        if pixel_shuffle_factor is None:
+            # Try to calculate from config, model name, or test forward pass
+            expected_seq_len = self._calculate_expected_seq_len(
+                self.vision_tower.config, 
+                self.vision_tower,
+                vision_model_path
+            )
+            if expected_seq_len is not None:
+                calculated_factor = self._calculate_pixel_shuffle_factor(expected_seq_len)
+                if calculated_factor is not None and calculated_factor > 1:
+                    pixel_shuffle_factor = calculated_factor
+                    seq_root = int(expected_seq_len ** 0.5)
+                    print(f">>> Auto-calculated pixel_shuffle_factor: {pixel_shuffle_factor} (from seq_len={expected_seq_len}, seq_root={seq_root})")
+                else:
+                    print(f">>> Warning: Could not find valid pixel_shuffle_factor > 1 for seq_len={expected_seq_len}. Using factor=1 (no shuffling).")
+                    pixel_shuffle_factor = 1
+            else:
+                # If we can't determine, use a safe default
+                print(">>> Warning: Could not determine sequence length from vision model.")
+                print(">>> Using pixel_shuffle_factor=1 (no shuffling).")
+                print(">>> If you encounter errors, please specify pixel_shuffle_factor manually.")
+                pixel_shuffle_factor = 1
+        
+        self.pixel_shuffle_factor = pixel_shuffle_factor
+        print(f">>> Using pixel_shuffle_factor: {pixel_shuffle_factor}")
+
         # ==========================================================
         # 2. Load LLM (Qwen 2.5 0.5B)
         # ==========================================================
@@ -113,7 +231,7 @@ class SiQ_VLModel(nn.Module):
         # ==========================================================
         # Maps Vision Dimension -> LLM Dimension
         self.projector = SiQ_VLModalityProjector(
-            self.vision_hidden_size, 3, self.llm_hidden_size
+            self.vision_hidden_size, pixel_shuffle_factor, self.llm_hidden_size
         )
 
         # Placeholder ID for the <image> token.

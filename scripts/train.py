@@ -75,6 +75,24 @@ def parse_args():
         default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Path or name of the LLM model",
     )
+    parser.add_argument(
+        "--freeze_llm",
+        action="store_true",
+        default=True,
+        help="Freeze the LLM model (default: True)",
+    )
+    parser.add_argument(
+        "--no_freeze_llm",
+        dest="freeze_llm",
+        action="store_false",
+        help="Do not freeze the LLM model",
+    )
+    parser.add_argument(
+        "--pixel_shuffle_factor",
+        type=int,
+        default=None,
+        help="Pixel shuffle factor for the projector. If None, will auto-calculate based on vision model.",
+    )
     
     # Output configuration
     parser.add_argument(
@@ -102,6 +120,12 @@ def parse_args():
         type=int,
         default=1000,
         help="Maximum number of training steps",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to use from the dataset (for quick testing)",
     )
     parser.add_argument(
         "--num_proc",
@@ -161,6 +185,18 @@ def parse_args():
         default="siq_vl_stage_1",
         help="Wandb project name",
     )
+    parser.add_argument(
+        "--use_distributed",
+        action="store_true",
+        default=False,
+        help="Use distributed training (default: False, auto-detect if multiple GPUs available)",
+    )
+    parser.add_argument(
+        "--no_distributed",
+        dest="use_distributed",
+        action="store_false",
+        help="Disable distributed training",
+    )
     
     return parser.parse_args()
 
@@ -169,8 +205,35 @@ def train(args=None):
     if args is None:
         args = parse_args()
     
-    dist.init_process_group("nccl")
-    setup_for_distributed(dist.get_rank() == 0)
+    # Initialize distributed training only if explicitly requested and environment is set up
+    # (e.g., by accelerate launcher)
+    if args.use_distributed:
+        if dist.is_available() and dist.is_initialized():
+            # Already initialized by accelerate launcher
+            setup_for_distributed(dist.get_rank() == 0)
+            print(f">>> Using distributed training (rank {dist.get_rank()}/{dist.get_world_size()})")
+        elif dist.is_available():
+            # Try to initialize if not already done (requires proper env vars)
+            try:
+                dist.init_process_group("nccl")
+                setup_for_distributed(dist.get_rank() == 0)
+                print(f">>> Initialized distributed training (rank {dist.get_rank()}/{dist.get_world_size()})")
+            except Exception as e:
+                print(f">>> Warning: Failed to initialize distributed training: {e}")
+                print(">>> Continuing without distributed training.")
+                args.use_distributed = False
+        else:
+            print(">>> Warning: Distributed training requested but PyTorch distributed not available.")
+            args.use_distributed = False
+    else:
+        # Check if already initialized (e.g., by accelerate launcher)
+        if dist.is_available() and dist.is_initialized():
+            setup_for_distributed(dist.get_rank() == 0)
+            args.use_distributed = True
+            print(f">>> Distributed training detected (rank {dist.get_rank()}/{dist.get_world_size()})")
+        else:
+            print(">>> Running in single-GPU/non-distributed mode.")
+            args.use_distributed = False
 
     # ====================================================
     # 1. Configuration
@@ -207,8 +270,9 @@ def train(args=None):
     model = SiQ_VLModel(
         vision_model_path=vision_model_name_or_path,
         llm_model_path=llm_model_name_or_path,
-        freeze_llm=True,
+        freeze_llm=args.freeze_llm,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        pixel_shuffle_factor=args.pixel_shuffle_factor,
     )
 
     # Enable Gradient Checkpointing (Critical for VRAM efficiency)
@@ -234,6 +298,12 @@ def train(args=None):
 
     # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets
     train_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=0)
+    
+    # Limit dataset size if specified (for quick testing)
+    if args.max_samples is not None:
+        print(f">>> Limiting dataset to {args.max_samples} samples for quick testing")
+        train_raw_dataset = train_raw_dataset.select(range(min(args.max_samples, len(train_raw_dataset))))
+    
     if is_dist():
         # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
         train_raw_dataset = train_raw_dataset.shard(
