@@ -85,15 +85,15 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
         "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
         "--sub_sets" "sharegpt4v(knowledge)"  # Only use knowledge subset for quick testing
         "--max_samples" "1000"
-        "--per_device_train_batch_size" "1"
+        "--per_device_train_batch_size" "2"
         "--gradient_accumulation_steps" "2"
-        "--max_steps" "50"
+        "--max_steps" "20"
         "--num_proc" "2"
         "--dataloader_num_workers" "1"
         "--learning_rate" "1e-3"
         "--no_bf16"  # MacBook typically doesn't support bf16
         "--fp16"  # Use fp16 if available
-        "--logging_steps" "1"
+        "--logging_steps" "2"
         "--save_steps" "10"
         "--no_distributed"
     )
