@@ -384,6 +384,10 @@ def train(args=None):
     # This ensures wandb uses the correct project name when initialized by Trainer
     os.environ["WANDB_PROJECT"] = args.project
     print(f">>> Setting WANDB_PROJECT to: {args.project}")
+    # save your trained model checkpoint to wandb
+    os.environ["WANDB_LOG_MODEL"]="true"
+    # turn off watch to log faster
+    os.environ["WANDB_WATCH"]="false"
     
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
