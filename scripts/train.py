@@ -1,6 +1,8 @@
 import argparse
 import builtins
 import os
+import re
+from datetime import datetime
 
 import torch.distributed as dist
 from datasets import concatenate_datasets, load_dataset
@@ -30,6 +32,55 @@ def get_world_size():
 
 def get_rank():
     return dist.get_rank() if is_dist() else 0
+
+
+def extract_model_name(model_path: str) -> str:
+    """
+    Extract a short model name from a full model path.
+    Keeps important model specifications like patch size and resolution.
+    Examples:
+        "google/siglip-so400m-patch14-384" -> "siglip-so400m-patch14-384"
+        "Qwen/Qwen2.5-0.5B-Instruct" -> "qwen2.5-0.5b-instruct"
+    """
+    # Get the last part after '/'
+    name = model_path.split("/")[-1]
+    # Convert to lowercase and replace underscores with hyphens for consistency
+    name = name.lower().replace("_", "-")
+    # Keep all model specifications (patch sizes, resolutions, etc.)
+    # These are important for distinguishing model variants
+    return name
+
+
+def generate_run_name(
+    vision_model_path: str,
+    llm_model_path: str,
+    project_name: str,
+) -> str:
+    """
+    Generate a run name from model names, stage, and datetime.
+    Format: {vision_model}_{llm_model}_{stage}_{datetime}
+    """
+    vision_name = extract_model_name(vision_model_path)
+    llm_name = extract_model_name(llm_model_path)
+    
+    # Extract stage name from project (e.g., "siq_vl_stage_1" -> "stage_1")
+    if "stage" in project_name.lower():
+        # Try to extract stage_* pattern
+        stage_match = re.search(r"stage[_\s]?(\d+)", project_name.lower())
+        if stage_match:
+            stage = f"stage_{stage_match.group(1)}"
+        else:
+            stage = project_name.split("_")[-1] if "_" in project_name else project_name
+    else:
+        stage = project_name.split("_")[-1] if "_" in project_name else project_name
+    
+    # Generate datetime string (format: YYYYMMDD_HHMMSS)
+    datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Combine: vision_llm_stage_datetime
+    run_name = f"{vision_name}_{llm_name}_{stage}_{datetime_str}"
+    
+    return run_name
 
 
 def setup_for_distributed(is_master):
@@ -182,7 +233,7 @@ def parse_args():
     parser.add_argument(
         "--project",
         type=str,
-        default="siq_vl_stage_1",
+        default="siq_vl",
         help="Wandb project name",
     )
     parser.add_argument(
@@ -321,9 +372,22 @@ def train(args=None):
     # ====================================================
     # 4. Training Arguments
     # ====================================================
+    # Generate run name from model names, stage, and datetime
+    run_name = generate_run_name(
+        vision_model_path=vision_model_name_or_path,
+        llm_model_path=llm_model_name_or_path,
+        project_name=args.project,
+    )
+    print(f">>> Generated run name: {run_name}")
+    
+    # Explicitly set wandb project name via environment variable
+    # This ensures wandb uses the correct project name when initialized by Trainer
+    os.environ["WANDB_PROJECT"] = args.project
+    print(f">>> Setting WANDB_PROJECT to: {args.project}")
+    
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        run_name="siq_vlm_run1",
+        run_name=run_name,
         # --- Batch Size & Speed ---
         per_device_train_batch_size=per_device_train_batch_size,  # Adjust based on VRAM (4-8 for 24GB)
         gradient_accumulation_steps=gradient_accumulation_steps,  # Effective batch size = 8 * 4 = 32
