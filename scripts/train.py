@@ -1,3 +1,4 @@
+import argparse
 import builtins
 import os
 
@@ -44,7 +45,130 @@ def setup_for_distributed(is_master):
     builtins.print = print
 
 
-def train():
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train SiQ_VL model")
+    
+    # Dataset configuration
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="HuggingFaceM4/FineVision",
+        help="Path to your FineVision dataset (or the name if on HF Hub)",
+    )
+    parser.add_argument(
+        "--sub_sets",
+        type=str,
+        default="coco_colors,densefusion_1m,face_emotion,google_landmarks,laion_gpt4v,sharegpt4o,sharegpt4v(coco),sharegpt4v(llava),sharegpt4v(knowledge),sharegpt4v(sam)",
+        help="Comma-separated list of dataset subsets",
+    )
+    
+    # Model configuration
+    parser.add_argument(
+        "--vision_model_name_or_path",
+        type=str,
+        default="google/siglip-so400m-patch14-384",
+        help="Path or name of the vision model",
+    )
+    parser.add_argument(
+        "--llm_model_name_or_path",
+        type=str,
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Path or name of the LLM model",
+    )
+    
+    # Output configuration
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./checkpoints/siq_vlm_run1",
+        help="Directory to save checkpoints",
+    )
+    
+    # Training hyperparameters
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=8,
+        help="Batch size per device",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=4,
+        help="Number of gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=1000,
+        help="Maximum number of training steps",
+    )
+    parser.add_argument(
+        "--num_proc",
+        type=int,
+        default=96,
+        help="Number of processes for dataset loading",
+    )
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=4,
+        help="Number of workers for dataloader",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-3,
+        help="Learning rate",
+    )
+    
+    # Precision configuration
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        default=True,
+        help="Use bf16 precision",
+    )
+    parser.add_argument(
+        "--no_bf16",
+        dest="bf16",
+        action="store_false",
+        help="Disable bf16 precision",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        default=False,
+        help="Use fp16 precision",
+    )
+    
+    # Logging and saving configuration
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=10,
+        help="Number of steps between logging",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=500,
+        help="Number of steps between saving checkpoints",
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default="siq_vl_stage_1",
+        help="Wandb project name",
+    )
+    
+    return parser.parse_args()
+
+
+def train(args=None):
+    if args is None:
+        args = parse_args()
+    
     dist.init_process_group("nccl")
     setup_for_distributed(dist.get_rank() == 0)
 
@@ -52,29 +176,14 @@ def train():
     # 1. Configuration
     # ====================================================
     # Path to your FineVision dataset (or the name if on HF Hub)
-    DATA_PATH = "HuggingFaceM4/FineVision"
-    SUB_SETS = [
-        "coco_colors",
-        "densefusion_1m",
-        "face_emotion",
-        "google_landmarks",
-        "laion_gpt4v",
-        "sharegpt4o",
-        "sharegpt4v(coco)",
-        "sharegpt4v(llava)",
-        "sharegpt4v(knowledge)",
-        "sharegpt4v(sam)",
-        # "allava_laion",
-        # "cocoqa",
-        # "LLaVA_Instruct_150K",
-        # "llavar_gpt4_20k",
-    ]
+    DATA_PATH = args.data_path
+    SUB_SETS = [subset.strip() for subset in args.sub_sets.split(",")]
 
-    vision_model_name_or_path = "google/siglip-so400m-patch14-384"
-    llm_model_name_or_path = "Qwen/Qwen2.5-1.5B-Instruct"
+    vision_model_name_or_path = args.vision_model_name_or_path
+    llm_model_name_or_path = args.llm_model_name_or_path
 
     # Directory to save checkpoints
-    OUTPUT_DIR = "./checkpoints/siq_vlm_run1"
+    OUTPUT_DIR = args.output_dir
 
     # ====================================================
     # 2. Initialize Processor & Model
@@ -88,9 +197,9 @@ def train():
     processor = SiQ_VLProcessor(image_processor, tokenizer)
 
     # Define training hyperparameters before model initialization
-    per_device_train_batch_size = 8
-    gradient_accumulation_steps = 4
-    max_steps = 1000
+    per_device_train_batch_size = args.per_device_train_batch_size
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    max_steps = args.max_steps
 
     print(">>> Loading Model...")
     # Initialize our Custom Model
@@ -120,7 +229,7 @@ def train():
     all_raw_datasets = []
 
     for subset in SUB_SETS:
-        raw_dataset = load_dataset(DATA_PATH, name=subset, split="train", num_proc=96)
+        raw_dataset = load_dataset(DATA_PATH, name=subset, split="train", num_proc=args.num_proc)
         all_raw_datasets.append(raw_dataset)
 
     # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets
@@ -148,26 +257,26 @@ def train():
         # --- Batch Size & Speed ---
         per_device_train_batch_size=per_device_train_batch_size,  # Adjust based on VRAM (4-8 for 24GB)
         gradient_accumulation_steps=gradient_accumulation_steps,  # Effective batch size = 8 * 4 = 32
-        dataloader_num_workers=4,
+        dataloader_num_workers=args.dataloader_num_workers,
         # --- Learning Rate ---
         # Project alignment using 1e-3
         # Recommendation for full finetuning: 1e-5 to 2e-5
-        learning_rate=1e-3,
+        learning_rate=args.learning_rate,
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
         max_steps=max_steps,  # VLMs overfit easily; 1000 steps is usually sufficient for multimodal project alignment
         max_grad_norm=1.0,  # Clip gradients to prevent instability
         # --- Precision & Memory ---
-        bf16=True,  # REQUIRED for Qwen (Ampere+ GPUs). Do not use fp16.
-        fp16=False,
+        bf16=args.bf16,  # REQUIRED for Qwen (Ampere+ GPUs). Do not use fp16.
+        fp16=args.fp16,
         gradient_checkpointing=True,
         # --- Logging & Metrics & Saving ---
-        logging_steps=10,
+        logging_steps=args.logging_steps,
         save_strategy="steps",
-        save_steps=500,
+        save_steps=args.save_steps,
         save_total_limit=2,  # Keep only the last 2 checkpoints to save disk space
         report_to="wandb",
-        project="siq_vl_stage_1",
+        project=args.project,
         # --- CRITICAL FIX FOR LOSS REPORTING ---
         # The issue: Trainer was summing losses across gradient accumulation steps
         # instead of averaging them, causing reported loss to be 4x higher
@@ -227,4 +336,5 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    args = parse_args()
+    train(args)
