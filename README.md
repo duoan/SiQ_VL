@@ -749,8 +749,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 🙏 Acknowledgments
 
-- [SigLIP](https://github.com/google-research/big_vision) for the vision encoder
-- [Qwen](https://github.com/QwenLM/Qwen2-VL) for the language model
+- [SigLIP2](https://github.com/google-research/big_vision) for the vision encoder
+- [Qwen2.5](https://github.com/QwenLM/Qwen2-VL) for the language model
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) for the framework
 - [FineVision](https://huggingface.co/datasets/HuggingFaceM4/FineVision) for the training dataset
 
