@@ -196,12 +196,12 @@ if __name__ == "__main__":
     # 1. Load basic components
     # Note: Use SigLIP 1 config if SigLIP 2 isn't explicitly on HF yet (they are compatible)
     image_processor = AutoImageProcessor.from_pretrained(
-        "google/siglip2-so400m-patch16-512"
+        "google/siglip2-base-patch16-224"
     )
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
     # 2. Initialize your Custom Processor
-    processor = SiQ_VLProcessor(image_processor, tokenizer, image_size=512, patch_size=16, pixel_shuffle_factor=2)
+    processor = SiQ_VLProcessor(image_processor, tokenizer, image_size=224, patch_size=14, pixel_shuffle_factor=2)
 
     # 3. Prepare Data (OpenAI/ChatML Format)
     messages = [

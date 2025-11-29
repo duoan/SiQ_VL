@@ -122,6 +122,8 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
         MAC_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-base-patch16-224"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            # reduce to 64 image tokens
+            "--pixel_shuffle_factor" "2"
             "--sub_sets" "sharegpt4v(knowledge)"  # Only use knowledge subset for quick testing
             "--max_samples" "1000"
             "--per_device_train_batch_size" "2"
@@ -140,6 +142,8 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
         MAC_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-base-patch16-224"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            # reduce to 64 image tokens
+            "--pixel_shuffle_factor" "2"
             "--sub_sets" "sharegpt4v(knowledge)"  # Quick VQA-like subset
             "--max_samples" "1000"
             "--per_device_train_batch_size" "2"
@@ -166,8 +170,8 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
-            # reduce to 256 tokens
-            "--pixel_shuffle_factor" "2"
+            # reduce to 64 image tokens
+            "--pixel_shuffle_factor" "4"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_steps" "1000"
@@ -185,8 +189,8 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
-            # reduce to 256 tokens
-            "--pixel_shuffle_factor" "2" 
+            # reduce to 64 image tokens
+            "--pixel_shuffle_factor" "4" 
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_samples" "1000000"
