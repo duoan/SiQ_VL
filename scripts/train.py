@@ -13,7 +13,11 @@ from transformers import (
     TrainingArguments,
 )
 
-from siq_vl.callbacks import MetricsCallback, SmartGPUCleanCallback
+from siq_vl.callbacks import (
+    GenerationCallback,
+    MetricsCallback,
+    SmartGPUCleanCallback,
+)
 from siq_vl.collator import SiQ_VLDataCollator
 from siq_vl.dataset import VQAIterableDataset
 from siq_vl.model import SiQ_VLModel
@@ -237,6 +241,36 @@ def parse_args():
         help="Wandb project name",
     )
     parser.add_argument(
+        "--gen_eval_samples",
+        type=int,
+        default=20,
+        help="Number of fixed samples to use for generation evaluation (default: 20)",
+    )
+    parser.add_argument(
+        "--gen_eval_interval",
+        type=int,
+        default=100,
+        help="Evaluate generation every N steps (default: 100)",
+    )
+    parser.add_argument(
+        "--gen_max_new_tokens",
+        type=int,
+        default=256,
+        help="Maximum number of new tokens to generate (default: 256)",
+    )
+    parser.add_argument(
+        "--gen_temperature",
+        type=float,
+        default=0.7,
+        help="Temperature for generation sampling (default: 0.7)",
+    )
+    parser.add_argument(
+        "--gen_num_beams",
+        type=int,
+        default=2,
+        help="Number of beams for generation beam search (default: 2)",
+    )
+    parser.add_argument(
         "--use_distributed",
         action="store_true",
         default=False,
@@ -384,8 +418,6 @@ def train(args=None):
     # This ensures wandb uses the correct project name when initialized by Trainer
     os.environ["WANDB_PROJECT"] = args.project
     print(f">>> Setting WANDB_PROJECT to: {args.project}")
-    # save your trained model checkpoint to wandb
-    os.environ["WANDB_LOG_MODEL"]="true"
     # turn off watch to log faster
     os.environ["WANDB_WATCH"]="false"
     
@@ -438,13 +470,31 @@ def train(args=None):
     # ====================================================
     # 5. Start Training
     # ====================================================
+    # Initialize generation callback for periodic evaluation
+    # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
+    generation_callback = GenerationCallback(
+        processor=processor,
+        eval_dataset=train_raw_dataset,  # sample visual QA examples from the raw HF dataset
+        eval_samples=None,  # or pass a fixed list if you want fully deterministic samples
+        num_samples=args.gen_eval_samples,
+        eval_interval=args.gen_eval_interval,
+        max_new_tokens=args.gen_max_new_tokens,
+        temperature=args.gen_temperature,
+        do_sample=True,
+        num_beams=args.gen_num_beams,
+    )
+    
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
         processing_class=processor,
-        callbacks=[MetricsCallback(), SmartGPUCleanCallback()],
+        callbacks=[
+            MetricsCallback(),
+            SmartGPUCleanCallback(),
+            generation_callback,
+        ],
     )
 
     print(">>> DEBUG: Checking Labels...")

@@ -72,7 +72,6 @@ echo ">>> Using Python: $PYTHON_CMD"
 BASE_ARGS=(
     "--freeze_llm"
     "--output_dir" "./checkpoints/siq_vlm_stage1"
-    "--project" "siq_vl_stage_1"
 )
 
 # Host-specific parameters

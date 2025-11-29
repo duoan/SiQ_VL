@@ -1,13 +1,16 @@
 import json
 import os
 import re
-from typing import Optional
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, AutoModelForCausalLM
 from transformers.utils import logging
+
+from siq_vl.processing import SiQ_VLProcessor
 
 logger = logging.get_logger(__name__)
 
@@ -278,6 +281,121 @@ class SiQ_VLModel(nn.Module):
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
         )
 
+    def _prepare_llm_inputs(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        image_embeds: torch.FloatTensor,
+        labels: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[torch.LongTensor], torch.LongTensor, List[int]]:
+        """
+        Common helper to splice image embeddings into text embeddings and build
+        padded embeddings, labels, and attention mask for the LLM.
+
+        Used by both the training forward pass and the generation path.
+
+        Args:
+            input_ids: [batch, seq_len]
+            inputs_embeds: [batch, seq_len, hidden]
+            image_embeds: [batch, num_patches, hidden]
+            labels: Optional[batch, seq_len]
+
+        Returns:
+            final_input_embeds: [batch, max_seq_len, hidden]
+            final_labels: Optional[batch, max_seq_len]
+            final_attention_mask: [batch, max_seq_len]
+            seq_lengths: list of original (unpadded) lengths per sample after splicing
+        """
+        new_input_embeds: List[torch.Tensor] = []
+        new_labels: Optional[List[torch.Tensor]] = [] if labels is not None else None
+
+        batch_size = inputs_embeds.shape[0]
+
+        for i in range(batch_size):
+            # Check where the image placeholder is located
+            cur_input_ids = input_ids[i]
+
+            # If no image placeholder is found (text-only sample), keep as is
+            if (cur_input_ids == self.image_token_id).sum() == 0:
+                new_input_embeds.append(inputs_embeds[i])
+                if labels is not None and new_labels is not None:
+                    new_labels.append(labels[i])
+                continue
+
+            # 1. Find ALL image token positions
+            image_token_mask = cur_input_ids == self.image_token_id
+            num_image_tokens = image_token_mask.sum().item()
+
+            if num_image_tokens == 0:
+                # No image tokens, shouldn't happen but handle gracefully
+                new_input_embeds.append(inputs_embeds[i])
+                if labels is not None and new_labels is not None:
+                    new_labels.append(labels[i])
+                continue
+
+            # Find the first and last image token positions
+            image_token_indices = image_token_mask.nonzero(as_tuple=True)[0]
+            image_start_idx = image_token_indices[0].item()
+            image_end_idx = image_token_indices[-1].item() + 1  # +1 to include the last token
+
+            # 2. Slice the text embeddings: Prefix + Suffix
+            # CRITICAL: Skip ALL image tokens, not just the first one!
+            prefix_embeds = inputs_embeds[i, :image_start_idx]
+            suffix_embeds = inputs_embeds[i, image_end_idx:]
+
+            # 3. Concatenate: [Prefix, Image_Features, Suffix]
+            cur_image_embed = image_embeds[i]
+            combined_embed = torch.cat(
+                [prefix_embeds, cur_image_embed, suffix_embeds], dim=0
+            )
+            new_input_embeds.append(combined_embed)
+
+            # 4. Handle Labels (Align with new sequence length)
+            if labels is not None and new_labels is not None:
+                cur_labels = labels[i]
+                prefix_labels = cur_labels[:image_start_idx]
+                suffix_labels = cur_labels[image_end_idx:]
+
+                # Create labels for the image tokens
+                # We use ignore_index (-100) because we don't want the model to predict the image patches
+                image_labels = torch.full(
+                    (cur_image_embed.shape[0],),
+                    self.ignore_index,
+                    dtype=labels.dtype,
+                    device=labels.device,
+                )
+
+                combined_labels = torch.cat(
+                    [prefix_labels, image_labels, suffix_labels], dim=0
+                )
+                new_labels.append(combined_labels)
+
+        # Re-pack the batch: pad embeddings to the longest sequence in the batch
+        final_input_embeds = pad_sequence(new_input_embeds, batch_first=True)
+
+        # Pad labels if provided
+        final_labels: Optional[torch.LongTensor] = None
+        if labels is not None and new_labels is not None:
+            final_labels = pad_sequence(
+                new_labels, batch_first=True, padding_value=self.ignore_index
+            )
+
+        # Generate attention mask (1 for valid tokens, 0 for padding)
+        final_attention_mask = torch.ones(
+            final_input_embeds.shape[:2],
+            dtype=torch.long,
+            device=final_input_embeds.device,
+        )
+
+        # Mask out the padding areas (assuming right-padding by pad_sequence)
+        seq_lengths: List[int] = []
+        for i, embed in enumerate(new_input_embeds):
+            length = len(embed)
+            seq_lengths.append(length)
+            final_attention_mask[i, length:] = 0
+
+        return final_input_embeds, final_labels, final_attention_mask, seq_lengths
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -326,103 +444,22 @@ class SiQ_VLModel(nn.Module):
         # ==========================================================
         # 3. The Surgery: Embedding Fusion (Splicing)
         # ==========================================================
-        # We need to find the <image> placeholder in 'input_ids'
-        # and replace its embedding with the actual 'image_embeds'.
-
-        new_input_embeds = []
-        new_labels = [] if labels is not None else None
-
-        batch_size = inputs_embeds.shape[0]
-
-        for i in range(batch_size):
-            # Check where the image placeholder is located
-            cur_input_ids = input_ids[i]
-
-            # If no image placeholder is found (text-only sample), keep as is
-            if (cur_input_ids == self.image_token_id).sum() == 0:
-                new_input_embeds.append(inputs_embeds[i])
-                if labels is not None and new_labels is not None:
-                    new_labels.append(labels[i])
-                continue
-
-            # --- Splicing Logic ---
-            # 1. Find ALL image token positions
-            image_token_mask = cur_input_ids == self.image_token_id
-            num_image_tokens = image_token_mask.sum().item()
-
-            if num_image_tokens == 0:
-                # No image tokens, shouldn't happen but handle gracefully
-                new_input_embeds.append(inputs_embeds[i])
-                if labels is not None and new_labels is not None:
-                    new_labels.append(labels[i])
-                continue
-
-            # Find the first and last image token positions
-            image_token_indices = image_token_mask.nonzero(as_tuple=True)[0]
-            image_start_idx = image_token_indices[0].item()
-            image_end_idx = (
-                image_token_indices[-1].item() + 1
-            )  # +1 to include the last token
-
-            # 2. Slice the text embeddings: Prefix + Suffix
-            # CRITICAL: Skip ALL image tokens, not just the first one!
-            prefix_embeds = inputs_embeds[i, :image_start_idx]
-            suffix_embeds = inputs_embeds[i, image_end_idx:]  # Skip all 81 tokens
-
-            # 3. Concatenate: [Prefix, Image_Features, Suffix]
-            cur_image_embed = image_embeds[i]  # Shape: [81, hidden]
-            combined_embed = torch.cat(
-                [prefix_embeds, cur_image_embed, suffix_embeds], dim=0
-            )
-            new_input_embeds.append(combined_embed)
-
-            # 4. Handle Labels (Align with new sequence length)
-            if labels is not None and new_labels is not None:
-                cur_labels = labels[i]
-                prefix_labels = cur_labels[:image_start_idx]
-                suffix_labels = cur_labels[image_end_idx:]  # Skip all 81 tokens
-
-                # Create labels for the image tokens
-                # We use ignore_index (-100) because we don't want the model to predict the image patches
-                image_labels = torch.full(
-                    (cur_image_embed.shape[0],),
-                    self.ignore_index,
-                    dtype=labels.dtype,
-                    device=labels.device,
-                )
-
-                combined_labels = torch.cat(
-                    [prefix_labels, image_labels, suffix_labels], dim=0
-                )
-                new_labels.append(combined_labels)
-
-        # 4. Re-Pack the Batch
-        # Since inserting images changes the sequence length, we must re-pad the batch
-
-        # Pad Embeddings to the longest sequence in the batch
-        final_input_embeds = pad_sequence(new_input_embeds, batch_first=True)
-
-        # Pad Labels
-        final_labels = None
-        if labels is not None and new_labels is not None:
-            final_labels = pad_sequence(
-                new_labels, batch_first=True, padding_value=self.ignore_index
-            )
-
-        # Generate Attention Mask
-        # (1 for valid tokens, 0 for padding)
-        final_attention_mask = torch.ones(
-            final_input_embeds.shape[:2],
-            dtype=torch.long,
-            device=final_input_embeds.device,
+        # Use the helper method to splice image embeddings into text embeddings
+        # and build padded embeddings, labels, and attention mask for the LLM
+        (
+            final_input_embeds,
+            final_labels,
+            final_attention_mask,
+            _seq_lengths,  # Not needed in forward pass, but returned by helper
+        ) = self._prepare_llm_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            image_embeds=image_embeds,
+            labels=labels,
         )
 
-        # Mask out the padding areas (assuming right-padding by pad_sequence)
-        for i, embed in enumerate(new_input_embeds):
-            final_attention_mask[i, len(embed) :] = 0
-
         # ==========================================================
-        # 5. Forward Pass through LLM
+        # 4. Forward Pass through LLM
         # ==========================================================
 
         # --- DEBUG: Check final shapes before LLM ---
@@ -518,3 +555,222 @@ class SiQ_VLModel(nn.Module):
             json.dump(custom_config, f, indent=2)
 
         print(f">>> Model saved successfully to {model_path}")
+
+    def generate_answer(
+        self,
+        processor: SiQ_VLProcessor,
+        samples: Union[
+            Tuple[Union[Image.Image, str], str],
+            List[Tuple[Union[Image.Image, str], str]],
+        ],
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        num_beams: int = 2,
+        device: Optional[torch.device] = None,
+    ) -> Union[str, List[str]]:
+        """
+        Generate answers for one or more (image, question) pairs.
+
+        Args:
+            processor: The SiQ_VLProcessor instance.
+            samples: Either a single (image, question) tuple or
+                     a list of (image, question) tuples, where:
+                     - image: PIL Image or path to image file
+                     - question: question string
+            max_new_tokens: Maximum number of tokens to generate (default: 256).
+            temperature: Sampling temperature (default: 0.7).
+            do_sample: Whether to use sampling (default: True).
+            device: Device to run on. If None, uses model's device.
+
+        Returns:
+            Single generated answer (str) if inputs are single-sample,
+            otherwise a list of answers (List[str]) for batched inputs.
+        """
+        # Normalize to batch of (image, question) tuples
+        if isinstance(samples, tuple):
+            batch_samples: List[Tuple[Union[Image.Image, str], str]] = [samples]
+            single_sample = True
+        elif isinstance(samples, list):
+            if len(samples) == 0:
+                raise ValueError("samples list must not be empty.")
+            # Basic validation: each item is a 2-tuple (image, question)
+            for s in samples:
+                if not (isinstance(s, tuple) and len(s) == 2):
+                    raise ValueError(
+                        "Each element in samples must be a (image, question) tuple."
+                    )
+            batch_samples = samples
+            single_sample = False
+        else:
+            raise ValueError(
+                "samples must be either a (image, question) tuple or a list of such tuples."
+            )
+
+        batch_size = len(batch_samples)
+
+        # Get device
+        if device is None:
+            device = next(self.parameters()).device
+
+        # Convert images to PIL if needed and collect questions
+        processed_images: List[Image.Image] = []
+        questions: List[str] = []
+        for img, q in batch_samples:
+            if isinstance(img, str):
+                processed_images.append(Image.open(img).convert("RGB"))
+            elif isinstance(img, Image.Image):
+                processed_images.append(img)
+            else:
+                from siq_vl.dataset import _to_pil_rgb
+
+                processed_images.append(_to_pil_rgb(img))
+            questions.append(q)
+
+        self.eval()
+
+        # Prepare messages in ChatML format (batched)
+        messages: List[dict] = []
+        for img, q in zip(processed_images, questions):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": q},
+                    ],
+                }
+            )
+
+        # Process inputs (batched)
+        inputs = processor(
+            text=messages,
+            images=processed_images,
+            return_tensors="pt",
+            add_generation_prompt=True,
+            padding="longest",
+        )
+
+        # Move to device
+        input_ids = inputs["input_ids"].to(device)
+        pixel_values = inputs["pixel_values"].to(device)
+
+        with torch.no_grad():
+            # 1. Get image embeddings and project them (same as model forward)
+            image_features = self.get_vision_features(pixel_values)
+            image_embeds = self.projector(image_features)
+
+            # 2. Get text embeddings
+            text_embeds = self.llm.get_input_embeddings()(input_ids)
+
+            # 3. Fuse image embeddings into text embeddings per batch element
+            (
+                final_input_embeds,
+                _final_labels,
+                final_attention_mask,
+                seq_lengths,
+            ) = self._prepare_llm_inputs(
+                input_ids=input_ids,
+                inputs_embeds=text_embeds,
+                image_embeds=image_embeds,
+                labels=None,
+            )
+
+            # 4. Generate using LLM with the combined embeddings
+            generated_ids = self.llm.generate(
+                inputs_embeds=final_input_embeds,
+                attention_mask=final_attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+                num_beams=num_beams,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id,
+            )
+
+            # 5. Extract only the newly generated tokens per sample
+            answers: List[str] = []
+            for i in range(batch_size):
+                prompt_length = seq_lengths[i]
+                gen_tokens = generated_ids[i][prompt_length:]
+
+                if len(gen_tokens) > 0:
+                    text = processor.decode(
+                        gen_tokens, skip_special_tokens=True
+                    ).strip()
+                else:
+                    text = "[No generation]"
+
+                answers.append(text)
+
+        # Return single string if called with single-sample inputs, otherwise list
+        if single_sample:
+            return answers[0]
+        return answers
+
+
+def load_model_from_checkpoint(
+    checkpoint_dir: str,
+    device: Optional[Union[str, torch.device]] = None,
+) -> Tuple[SiQ_VLModel, SiQ_VLProcessor]:
+    """
+    Load model and processor from a checkpoint directory.
+    
+    Args:
+        checkpoint_dir: Path to the checkpoint directory
+        device: Device to load model on (default: "cuda" if available, else "cpu")
+    
+    Returns:
+        Tuple of (model, processor)
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    # Load checkpoint configuration
+    config_path = os.path.join(checkpoint_dir, "model_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            model_config = json.load(f)
+        vision_model_path = model_config.get("vision_model_path")
+        llm_model_path = model_config.get("llm_model_path")
+        freeze_llm = model_config.get("freeze_llm", True)
+    else:
+        # Fallback: try to infer from checkpoint directory structure or use defaults
+        print(f">>> Warning: model_config.json not found in {checkpoint_dir}")
+        print(">>> Using default model paths. This may not match your checkpoint.")
+        vision_model_path = "google/siglip-so400m-patch14-384"
+        llm_model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+        freeze_llm = True
+    
+    # Load processor (saved with the model)
+    print(f">>> Loading processor from {checkpoint_dir}...")
+    processor = SiQ_VLProcessor.from_pretrained(checkpoint_dir)
+    
+    # Initialize model with saved configuration
+    print(f">>> Loading model: vision={vision_model_path}, llm={llm_model_path}...")
+    model = SiQ_VLModel(
+        vision_model_path=vision_model_path,
+        llm_model_path=llm_model_path,
+        freeze_llm=freeze_llm,
+    )
+    
+    # Load the trained weights
+    model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    if os.path.exists(model_path):
+        print(f">>> Loading weights from {model_path}...")
+        model.load_state_dict(
+            torch.load(model_path, map_location=device),
+            strict=False,  # Allow missing keys (e.g., if some layers weren't trained)
+        )
+    else:
+        print(f">>> Warning: pytorch_model.bin not found in {checkpoint_dir}")
+        print(">>> Using model with pretrained weights only.")
+    
+    model.to(device)
+    model.eval()
+    
+    print(f">>> Model loaded successfully on {device}")
+    
+    return model, processor
