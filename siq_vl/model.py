@@ -162,7 +162,7 @@ class SiQ_VLModel(nn.Module):
         llm_model_path="Qwen/Qwen2.5-0.5B-Instruct",
         freeze_llm=True,
         gradient_accumulation_steps=1,
-        pixel_shuffle_factor=None,  # If None, will auto-calculate
+        pixel_shuffle_factor=1,  # Default to 1 (no shuffling)
     ):
         super().__init__()
 
@@ -188,30 +188,7 @@ class SiQ_VLModel(nn.Module):
         # Get vision hidden size (SigLIP SO400M is typically 1152)
         self.vision_hidden_size = self.vision_tower.config.hidden_size
 
-        # Calculate or determine pixel_shuffle_factor
-        if pixel_shuffle_factor is None:
-            # Try to calculate from config, model name, or test forward pass
-            expected_seq_len = self._calculate_expected_seq_len(
-                self.vision_tower.config, 
-                self.vision_tower,
-                vision_model_path
-            )
-            if expected_seq_len is not None:
-                calculated_factor = self._calculate_pixel_shuffle_factor(expected_seq_len)
-                if calculated_factor is not None and calculated_factor > 1:
-                    pixel_shuffle_factor = calculated_factor
-                    seq_root = int(expected_seq_len ** 0.5)
-                    print(f">>> Auto-calculated pixel_shuffle_factor: {pixel_shuffle_factor} (from seq_len={expected_seq_len}, seq_root={seq_root})")
-                else:
-                    print(f">>> Warning: Could not find valid pixel_shuffle_factor > 1 for seq_len={expected_seq_len}. Using factor=1 (no shuffling).")
-                    pixel_shuffle_factor = 1
-            else:
-                # If we can't determine, use a safe default
-                print(">>> Warning: Could not determine sequence length from vision model.")
-                print(">>> Using pixel_shuffle_factor=1 (no shuffling).")
-                print(">>> If you encounter errors, please specify pixel_shuffle_factor manually.")
-                pixel_shuffle_factor = 1
-        
+        # Use provided pixel_shuffle_factor (default is 1)
         self.pixel_shuffle_factor = pixel_shuffle_factor
         print(f">>> Using pixel_shuffle_factor: {pixel_shuffle_factor}")
 

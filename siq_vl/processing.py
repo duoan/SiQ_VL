@@ -26,6 +26,9 @@ class SiQ_VLProcessor(ProcessorMixin):
         self,
         image_processor: SiglipImageProcessor,
         tokenizer: Qwen2TokenizerFast,
+        *,
+        image_size: int = 384,
+        patch_size: int = 14,
         pixel_shuffle_factor: int = 3,
     ):
         """
@@ -40,6 +43,8 @@ class SiQ_VLProcessor(ProcessorMixin):
         self.image_processor: SiglipImageProcessor = image_processor
         self.tokenizer: Qwen2TokenizerFast = tokenizer
         self.pixel_shuffle_factor = pixel_shuffle_factor
+        self.image_size = image_size
+        self.patch_size = patch_size
 
         # Calculate the number of image tokens dynamically
         self.num_image_tokens = self._calculate_num_image_tokens()
@@ -60,25 +65,9 @@ class SiQ_VLProcessor(ProcessorMixin):
         Returns:
             Number of image tokens after pixel shuffle
         """
-        # Get image size from image processor
-        if hasattr(self.image_processor, 'size'):
-            if isinstance(self.image_processor.size, dict):
-                image_size = self.image_processor.size.get("height", 384)
-            else:
-                image_size = self.image_processor.size
-        else:
-            image_size = 384  # Default for SigLIP SO400M
-        
-        # Get patch size from image processor config
-        if hasattr(self.image_processor, 'patch_size'):
-            patch_size = self.image_processor.patch_size
-        elif hasattr(self.image_processor, 'config') and hasattr(self.image_processor.config, 'patch_size'):
-            patch_size = self.image_processor.config.patch_size
-        else:
-            patch_size = 14  # Default for SigLIP SO400M
-        
+
         # Calculate number of patches per dimension
-        patches_per_dim = image_size // patch_size
+        patches_per_dim = self.image_size // self.patch_size
         
         # After pixel shuffle, reduce by the shuffle factor
         reduced_patches_per_dim = patches_per_dim // self.pixel_shuffle_factor
@@ -86,9 +75,9 @@ class SiQ_VLProcessor(ProcessorMixin):
         # Total number of tokens
         num_tokens = reduced_patches_per_dim ** 2
         
-        logger.info(
-            f"Image tokenization: {image_size}x{image_size} image, "
-            f"patch_size={patch_size}, "
+        print(
+            f"Image tokenization: {self.image_size}x{self.image_size} image, "
+            f"patch_size={self.patch_size}, "
             f"patches={patches_per_dim}x{patches_per_dim}={patches_per_dim**2}, "
             f"after pixel_shuffle(factor={self.pixel_shuffle_factor}): "
             f"{reduced_patches_per_dim}x{reduced_patches_per_dim}={num_tokens} tokens"
@@ -207,12 +196,12 @@ if __name__ == "__main__":
     # 1. Load basic components
     # Note: Use SigLIP 1 config if SigLIP 2 isn't explicitly on HF yet (they are compatible)
     image_processor = AutoImageProcessor.from_pretrained(
-        "google/siglip-so400m-patch14-384"
+        "google/siglip2-so400m-patch16-512"
     )
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
     # 2. Initialize your Custom Processor
-    processor = SiQ_VLProcessor(image_processor, tokenizer)
+    processor = SiQ_VLProcessor(image_processor, tokenizer, image_size=512, patch_size=16, pixel_shuffle_factor=2)
 
     # 3. Prepare Data (OpenAI/ChatML Format)
     messages = [
@@ -234,6 +223,7 @@ if __name__ == "__main__":
         images=raw_image,
         return_tensors="pt",
         add_generation_prompt=True,  # Adds <|im_start|>assistant
+        pixel_shuffle_factor=8,
     )
 
     # 5. Verify

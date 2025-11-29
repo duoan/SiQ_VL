@@ -56,6 +56,63 @@ def extract_model_name(model_path: str) -> str:
     return name
 
 
+def extract_vision_config(model_path: str) -> tuple[int, int]:
+    """
+    Extract image_size and patch_size from vision model path.
+    
+    Examples:
+        "google/siglip2-so400m-patch16-512" -> (512, 16)
+        "google/siglip2-so400m-patch14-224" -> (224, 14)
+        "google/siglip-so400m-patch14-384" -> (384, 14)
+    
+    Args:
+        model_path: Full model path or name (e.g., "google/siglip2-so400m-patch16-512")
+    
+    Returns:
+        Tuple of (image_size, patch_size)
+    
+    Raises:
+        ValueError: If image_size or patch_size cannot be extracted from the model path or config.
+    """
+    model_name = model_path.lower()
+    
+    # Extract patch size (e.g., patch14, patch16)
+    patch_match = re.search(r'patch(\d+)', model_name)
+    patch_size = int(patch_match.group(1)) if patch_match else None
+    
+    # Extract image size (usually at the end: -224, -384, -512)
+    # Try to match pattern like -224, -384, -512 at the end
+    size_match = re.search(r'-(\d+)$', model_name)
+    image_size = int(size_match.group(1)) if size_match else None
+    
+    # If we can't extract from name, try to get from config
+    if patch_size is None or image_size is None:
+        try:
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(model_path)
+            if patch_size is None:
+                patch_size = getattr(config, 'patch_size', None)
+            if image_size is None:
+                image_size = getattr(config, 'image_size', None)
+        except Exception:
+            # If config loading fails, we'll raise an error below
+            pass
+    
+    # Raise error if we still can't determine the values
+    if patch_size is None:
+        raise ValueError(
+            f"Cannot extract patch_size from model path '{model_path}'. "
+            f"Expected format: '...patch<number>...' (e.g., 'patch14', 'patch16')"
+        )
+    if image_size is None:
+        raise ValueError(
+            f"Cannot extract image_size from model path '{model_path}'. "
+            f"Expected format: '...-<number>' at the end (e.g., '-224', '-384', '-512')"
+        )
+    
+    return image_size, patch_size
+
+
 def infer_stage_name(output_dir: str | None = None) -> str:
     """
     Infer a concise stage name like 'stage1', 'stage2'.
@@ -169,8 +226,8 @@ def parse_args():
     parser.add_argument(
         "--pixel_shuffle_factor",
         type=int,
-        default=None,
-        help="Pixel shuffle factor for the projector. If None, will auto-calculate based on vision model.",
+        default=1,
+        help="Pixel shuffle factor for the projector (default: 1, no shuffling).",
     )
     
     # Output configuration
@@ -396,8 +453,18 @@ def train(args=None):
     image_processor = AutoImageProcessor.from_pretrained(vision_model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(llm_model_name_or_path)
 
+    # Extract image_size and patch_size from vision model path
+    image_size, patch_size = extract_vision_config(vision_model_name_or_path)
+    print(f">>> Extracted vision config: image_size={image_size}, patch_size={patch_size}")
+
     # Initialize our Custom Processor
-    processor = SiQ_VLProcessor(image_processor, tokenizer)
+    processor = SiQ_VLProcessor(
+        image_processor, 
+        tokenizer,
+        image_size=image_size,
+        patch_size=patch_size,
+        pixel_shuffle_factor=args.pixel_shuffle_factor,
+    )
 
     # Define training hyperparameters before model initialization
     per_device_train_batch_size = args.per_device_train_batch_size
