@@ -166,7 +166,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
-            "--per_device_train_batch_size" "8"
+            "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_steps" "1000"
             "--num_proc" "96"
@@ -182,8 +182,8 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
-            "--per_device_train_batch_size" "8"
-            "--gradient_accumulation_steps" "8"
+            "--per_device_train_batch_size" "4"
+            "--gradient_accumulation_steps" "4"
             "--max_samples" "1000000"
             "--num_proc" "96"
             "--dataloader_num_workers" "4"
