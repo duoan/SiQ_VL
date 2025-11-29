@@ -13,7 +13,6 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-
 from siq_vl.callbacks import (
     GenerationCallback,
     MetricsCallback,
@@ -23,6 +22,7 @@ from siq_vl.collator import SiQ_VLDataCollator
 from siq_vl.dataset import VQAIterableDataset
 from siq_vl.model import SiQ_VLModel
 from siq_vl.processing import SiQ_VLProcessor
+from publish_to_hub import publish_to_hub
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -56,10 +56,41 @@ def extract_model_name(model_path: str) -> str:
     return name
 
 
+def infer_stage_name(output_dir: str | None = None) -> str:
+    """
+    Infer a concise stage name like 'stage1', 'stage2'.
+
+    Priority:
+      1) STAGE env var (e.g. "1" or "2")
+      2) output_dir path containing "stage1"/"stage_1"/"stage-1" etc.
+      3) fallback to "stage1"
+    """
+
+    # 1) Environment variable from shell/launcher
+    env_stage = os.environ.get("STAGE")
+    if env_stage is not None:
+        env_stage = env_stage.strip()
+        if env_stage.isdigit():
+            return f"stage{env_stage}"
+
+    def _infer_from_string(s: str) -> str | None:
+        s = s.lower()
+        m = re.search(r"stage[_\\s-]?(\\d+)", s)
+        if m:
+            return f"stage{m.group(1)}"
+        return None
+
+    stage = None
+    if output_dir is not None:
+        stage = _infer_from_string(output_dir)
+
+    # Fallback to "stage1" if we can't infer anything sensible
+    return stage or "stage1"
+
+
 def generate_run_name(
     vision_model_path: str,
     llm_model_path: str,
-    project_name: str,
     output_dir: str | None = None,
 ) -> str:
     """
@@ -69,38 +100,14 @@ def generate_run_name(
     vision_name = extract_model_name(vision_model_path)
     llm_name = extract_model_name(llm_model_path)
 
-    # --- Robust stage inference ---
-    # Priority:
-    #   1) Explicit "stageX" pattern in project name (e.g. "siq_vlm_stage1")
-    #   2) Explicit "stageX" pattern in output_dir (e.g. "./checkpoints/siq_vlm_stage2/...")
-    #   3) Fallback to last token of project name
-    stage = None
+    stage = infer_stage_name(output_dir)
 
-    def _infer_stage_from_string(s: str) -> str | None:
-        s = s.lower()
-        # Match: "stage1", "stage_1", "stage-1", "stage 1"
-        m = re.search(r"stage[_\s-]?(\d+)", s)
-        if m:
-            return f"stage_{m.group(1)}"
-        return None
-
-    # 1) Try from project name
-    stage = _infer_stage_from_string(project_name) or stage
-
-    # 2) Try from output_dir if still unknown
-    if stage is None and output_dir is not None:
-        stage = _infer_stage_from_string(output_dir)
-
-    # 3) Fallback: use last token of project name
-    if stage is None:
-        stage = project_name.split("_")[-1] if "_" in project_name else project_name
-    
     # Generate datetime string (format: YYYYMMDD_HHMMSS)
     datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     # Combine: vision_llm_stage_datetime
     run_name = f"{vision_name}_{llm_name}_{stage}_{datetime_str}"
-    
+
     return run_name
 
 
@@ -170,8 +177,11 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints/siq_vlm_run1",
-        help="Directory to save checkpoints",
+        default="./checkpoints",
+        help=(
+            "Root directory for checkpoints. The final path is computed as "
+            "'{output_dir}/siq-vl_{vision_backbone}_{llm_backbone}/{stage}'."
+        ),
     )
     
     # Training hyperparameters
@@ -255,12 +265,6 @@ def parse_args():
         help="Number of steps between saving checkpoints",
     )
     parser.add_argument(
-        "--project",
-        type=str,
-        default="siq_vl",
-        help="Wandb project name",
-    )
-    parser.add_argument(
         "--gen_eval_samples",
         type=int,
         default=20,
@@ -301,6 +305,23 @@ def parse_args():
         dest="use_distributed",
         action="store_false",
         help="Disable distributed training",
+    )
+    # Hugging Face Hub configuration
+    parser.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        default=False,
+        help="If set, push the final checkpoint to the Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit Hub model id (e.g. 'org/siq_vl-...'). "
+            "If not provided, a name of the form "
+            "'siq_vl-{vision}__{llm}-{stage}' will be used."
+        ),
     )
     
     return parser.parse_args()
@@ -350,14 +371,20 @@ def train(args=None):
     vision_model_name_or_path = args.vision_model_name_or_path
     llm_model_name_or_path = args.llm_model_name_or_path
 
-    # Backbone identifiers (used both for output_dir and for locating
-    # previous-stage checkpoints).
+    # Backbone identifiers (used both for output_dir and for naming).
     vision_name = extract_model_name(vision_model_name_or_path)
     llm_name = extract_model_name(llm_model_name_or_path)
-    backbone_dir = f"{vision_name}__{llm_name}"
 
+    # Infer stage name once so we can use it consistently for paths and Hub IDs
+    stage_name = infer_stage_name(args.output_dir)
+
+    # New local checkpoint layout:
+    #   {output_dir}/siq-vl_{vision_backbone}_{llm_backbone}/{stage}
+    # e.g.:
+    #   ./checkpoints/siq-vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct/stage1
     base_output_dir = args.output_dir
-    OUTPUT_DIR = os.path.join(base_output_dir, backbone_dir)
+    run_root = os.path.join(base_output_dir, f"siq-vl_{vision_name}_{llm_name}")
+    OUTPUT_DIR = os.path.join(run_root, stage_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f">>> Using output_dir: {OUTPUT_DIR}")
 
@@ -398,9 +425,7 @@ def train(args=None):
     #   - We detect "stage 2" based on the project name containing "stage_2".
     #     In that case, we auto-load the latest Stage 1 checkpoint that matches
     #     the current backbone configuration.
-    if "stage_2" in args.project.lower():
-        stage1_root = base_output_dir.replace("siq_vlm_stage2", "siq_vlm_stage1")
-        stage1_backbone_dir = os.path.join(stage1_root, backbone_dir)
+    if stage_name == "stage2":
 
         def _resolve_latest_stage1_checkpoint(path: str) -> str | None:
             if not os.path.isdir(path):
@@ -432,7 +457,11 @@ def train(args=None):
             candidate = os.path.join(path, latest_dir, "pytorch_model.bin")
             return candidate if os.path.isfile(candidate) else None
 
-        ckpt_file = _resolve_latest_stage1_checkpoint(stage1_backbone_dir)
+        # Prefer the new layout final checkpoint:
+        #   {output_dir}/siq-vl_{vision}_{llm}/stage1/final
+        stage1_dir_new = os.path.join(run_root, "stage1", "final")
+
+        ckpt_file = _resolve_latest_stage1_checkpoint(stage1_dir_new)
         if ckpt_file is not None:
             print(f">>> Initializing model weights from Stage 1 checkpoint: {ckpt_file}")
             state_dict = torch.load(ckpt_file, map_location="cpu")
@@ -446,7 +475,7 @@ def train(args=None):
                 print(unexpected_keys[:20])
         else:
             print(
-                f">>> Warning: No matching Stage 1 checkpoint found in {stage1_backbone_dir}. "
+                f">>> Warning: No matching Stage 1 checkpoint found in {stage1_dir_new}. "
                 f"Stage 2 will start from the base backbones."
             )
 
@@ -519,15 +548,14 @@ def train(args=None):
     run_name = generate_run_name(
         vision_model_path=vision_model_name_or_path,
         llm_model_path=llm_model_name_or_path,
-        project_name=args.project,
         output_dir=OUTPUT_DIR,
     )
     print(f">>> Generated run name: {run_name}")
     
     # Explicitly set wandb project name via environment variable
     # This ensures wandb uses the correct project name when initialized by Trainer
-    os.environ["WANDB_PROJECT"] = args.project
-    print(f">>> Setting WANDB_PROJECT to: {args.project}")
+    os.environ["WANDB_PROJECT"] = "siq-vl"
+    print(">>> Setting WANDB_PROJECT to: siq-vl")
     
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -554,7 +582,7 @@ def train(args=None):
         save_steps=args.save_steps,
         save_total_limit=2,  # Keep only the last 2 checkpoints to save disk space
         report_to="wandb",
-        project=args.project,
+        project="siq-vl",
         # --- CRITICAL FIX FOR LOSS REPORTING ---
         # The issue: Trainer was summing losses across gradient accumulation steps
         # instead of averaging them, causing reported loss to be 4x higher
@@ -626,8 +654,52 @@ def train(args=None):
     # 6. Save Final Model
     # ====================================================
     print(">>> Saving Final Model...")
-    trainer.save_model(OUTPUT_DIR)
-    processor.save_pretrained(OUTPUT_DIR)
+    # Save the final, consolidated state under a dedicated "final" subfolder.
+    final_dir = os.path.join(OUTPUT_DIR, "final")
+    os.makedirs(final_dir, exist_ok=True)
+    trainer.save_model(final_dir)
+    processor.save_pretrained(final_dir)
+
+    # ====================================================
+    # 7. (Optional) Push to Hugging Face Hub
+    # ====================================================
+    if getattr(args, "push_to_hub", False):
+        print(">>> Pushing checkpoint to Hugging Face Hub...")
+
+        # Derive stage name like 'stage1' / 'stage2' to match publish_to_hub convention
+        stage_name = infer_stage_name(base_output_dir)
+
+        # Default repo id (single underscores between logical segments),
+        # with a "siq-vl" prefix:
+        #   siq-vl_{vision_backbone}_{llm_backbone}_{stage}
+        default_repo_name = f"siq-vl_{vision_name}_{llm_name}_{stage_name}"
+        hub_model_id = args.hub_model_id or default_repo_name
+
+        print(f">>> Using Hub model id: {hub_model_id}")
+
+        # Try to read current W&B run (if available) to enrich commit message & tag
+        wandb_run = None
+        wandb_url = None
+        wandb_run_id = None
+        try:
+            import wandb  # type: ignore
+
+            wandb_run = wandb.run
+            if wandb_run is not None:
+                wandb_url = getattr(wandb_run, "url", None)
+                wandb_run_id = getattr(wandb_run, "id", None)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f">>> Warning: Could not access wandb run info: {e}")
+
+        # Delegate actual upload logic to scripts.publish_to_hub.publish_to_hub.
+        # We always publish the "final" state rather than intermediate checkpoints.
+        publish_to_hub(
+            checkpoint_dir=final_dir,
+            hub_model_id=hub_model_id,
+            wandb_run_url=wandb_url,
+            wandb_run_id=wandb_run_id,
+        )
+
     print(">>> Done!")
 
 

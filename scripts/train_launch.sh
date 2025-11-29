@@ -36,8 +36,19 @@ detect_host() {
             echo "aws_other"
         fi
     elif command -v curl >/dev/null 2>&1; then
-        # Try to get instance type from EC2 metadata service
-        INSTANCE_TYPE=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+        # Try to get instance type from EC2 metadata service using IMDSv2
+        TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" \
+                    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                    -s --max-time 2 2>/dev/null || echo "")
+
+        if [[ -n "$TOKEN" ]]; then
+            INSTANCE_TYPE=$(curl -s --max-time 2 \
+                -H "X-aws-ec2-metadata-token: $TOKEN" \
+                http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+        else
+            INSTANCE_TYPE=""
+        fi
+
         if [[ "$INSTANCE_TYPE" == *"p4d.24xlarge"* ]]; then
             echo "aws_p4d"
         elif [[ -n "$INSTANCE_TYPE" ]]; then
@@ -92,15 +103,14 @@ if [[ "$STAGE" == "1" ]]; then
     # Stage 1: freeze LLM, train projector
     BASE_ARGS=(
         "--freeze_llm"
-        "--output_dir" "./checkpoints/siq_vlm_stage1"
-        # Keep default project name from train.py ("siq_vl")
+        "--output_dir" "./checkpoints"
+        # Keep default project name from train.py ("siq-vl")
     )
 else
     # Stage 2: unfreeze LLM, full finetuning
     BASE_ARGS=(
         "--no_freeze_llm"
-        "--output_dir" "./checkpoints/siq_vlm_stage2"
-        "--project" "siq_vl_stage_2"
+        "--output_dir" "./checkpoints"
     )
 fi
 
@@ -165,6 +175,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "10"
             "--save_steps" "500"
+            "--push_to_hub"
         )
     else
         # Stage 2: large-scale finetuning with ~1M VQA samples, auto max_steps
@@ -180,6 +191,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "20"
             "--save_steps" "1000"
+            "--push_to_hub"
         )
     fi
 

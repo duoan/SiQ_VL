@@ -6,7 +6,7 @@ SiQ-VL is a vision-language model (VLM) that integrates a SigLIP-based vision en
 
 ## Experiment Tracking
 
-Training runs and experiments are tracked using Weights & Biases. View training metrics, model checkpoints, and experiment logs at: [https://wandb.ai/ReproduceAI/siq_vl](https://wandb.ai/ReproduceAI/siq_vl)
+Training runs and experiments are tracked using Weights & Biases. View training metrics, model checkpoints, and experiment logs at: [https://wandb.ai/ReproduceAI/siq-vl](https://wandb.ai/ReproduceAI/siq-vl)
 
 ## Architecture Overview
 
@@ -613,6 +613,57 @@ accelerate launch \
     --gradient_accumulation_steps 4 \
     ...
 ```
+
+### Publishing Checkpoints to the Hugging Face Hub
+
+You can optionally publish trained checkpoints to the Hugging Face Hub so others can use the models without retraining.
+
+- **Naming convention**: Repos are named as  
+  `siq_vl_{vision_backbone}_{llm_backbone}_{stage}`  
+  For example: `siq_vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`.
+
+- **Stage inference**: The stage suffix (e.g., `stage1`, `stage2`) is automatically inferred from your `--project` name and/or `--output_dir`.  
+  - Stage 1 runs launched via `scripts/train_stage_1.sh` will typically publish as `..._stage1`.  
+  - Stage 2 runs launched via `scripts/train_stage_2.sh` will typically publish as `..._stage2`.
+
+- **W&B integration**:
+  - The Hub commit message includes the W&B run URL (when available).
+  - A lightweight Hub git tag of the form `wandb-{run_id}` is created, whose message contains the W&B run URL.
+
+#### Example: Publish Stage 1 Model (MacBook quick run)
+
+```bash
+bash scripts/train_stage_1.sh \
+  --push_to_hub
+```
+
+This will:
+
+- Train Stage 1 using the MacBook defaults.
+- Save the final model under `./checkpoints/siq_vlm_stage1/{vision}__{llm}`.
+- Create (or reuse) a Hub repo named like:
+  - `siq_vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`
+- Upload all files from the final checkpoint directory.
+- Add a Hub tag `wandb-{run_id}` with a message that includes the W&B run URL.
+
+#### Example: Publish Stage 2 Model (AWS p4d full run)
+
+```bash
+STAGE=2 bash scripts/train_launch.sh \
+  --push_to_hub
+```
+
+This will:
+
+- Train Stage 2 (full finetuning) using the AWS p4d defaults.
+- Save the final model under `./checkpoints/siq_vlm_stage2/{vision}__{llm}`.
+- Create (or reuse) a Hub repo named like:
+  - `siq_vl_siglip2-so400m-patch16-512_qwen2.5-1.5b-instruct_stage2`
+- Upload all files from the final checkpoint directory.
+- Add a Hub tag `wandb-{run_id}` with a message that includes the W&B run URL.
+
+> To override the default repo id (for example to push under an organization), pass:
+> `--hub_model_id your-org/siq_vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`.
 
 ## Project Structure
 
