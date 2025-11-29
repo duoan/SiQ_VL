@@ -276,7 +276,15 @@ class GenerationCallback(TrainerCallback):
         device: torch.device,
     ) -> str:
         """Generate answer using the model's generate_answer method."""
-        return model.generate_answer(
+        # If model is wrapped with DDP, unwrap it for generation to avoid hook conflicts
+        # This is safe because generation uses no_grad() and doesn't compute gradients
+        if hasattr(model, 'module'):
+            # Model is wrapped with DDP or other wrapper
+            unwrapped_model = model.module
+        else:
+            unwrapped_model = model
+        
+        return unwrapped_model.generate_answer(
             processor=processor,
             samples=(image, question),
             max_new_tokens=self.max_new_tokens,
@@ -411,41 +419,55 @@ class GenerationCallback(TrainerCallback):
                 print(">>> [GenerationCallback] Warning: No eval samples found.")
                 return
             
-            # Get device
-            device = next(model.parameters()).device
+            # Get device and unwrap model - use unwrapped model to avoid DDP issues
+            # CRITICAL: Unwrap DDP model to prevent hook conflicts during generation
+            if hasattr(model, 'module'):
+                unwrapped_model = model.module
+            else:
+                unwrapped_model = model
+            device = next(unwrapped_model.parameters()).device
             
             # Generate predictions
-            table_data = []
-            for i, sample in enumerate(eval_samples):
-                try:
-                    # Convert image to PIL if needed
-                    from siq_vl.dataset import _to_pil_rgb
-                    image = _to_pil_rgb(sample["image"])
-                    question = sample["question"]
-                    ground_truth = sample["answer"]
-                    
-                    # Generate answer
-                    # Use a simpler generation approach
-                    generated = self._generate_answer_simple(
-                        model, processor, image, question, device
-                    )
-                    
-                    # Get wandb image (reused if already uploaded)
-                    wandb_img = self._get_wandb_image(image)
-                    
-                    table_data.append([
-                        wandb_img,
-                        question,
-                        ground_truth,
-                        generated,
-                    ])
-                    
-                    if (i + 1) % 5 == 0:
-                        print(f">>> [GenerationCallback] Generated {i + 1}/{len(eval_samples)} samples...")
+            # CRITICAL: Ensure we're in eval mode and using no_grad context
+            # to prevent interference with DDP hooks during training
+            original_training = unwrapped_model.training
+            
+            try:
+                unwrapped_model.eval()
+                table_data = []
+                for i, sample in enumerate(eval_samples):
+                    try:
+                        # Convert image to PIL if needed
+                        from siq_vl.dataset import _to_pil_rgb
+                        image = _to_pil_rgb(sample["image"])
+                        question = sample["question"]
+                        ground_truth = sample["answer"]
                         
-                except Exception as e:
-                    print(f">>> [GenerationCallback] Error generating for sample {i}: {e}")
-                    continue
+                        # Generate answer with explicit no_grad to prevent gradient computation
+                        with torch.no_grad():
+                            generated = self._generate_answer_simple(
+                                unwrapped_model, processor, image, question, device
+                            )
+                        
+                        # Get wandb image (reused if already uploaded)
+                        wandb_img = self._get_wandb_image(image)
+                        
+                        table_data.append([
+                            wandb_img,
+                            question,
+                            ground_truth,
+                            generated,
+                        ])
+                        
+                        if (i + 1) % 5 == 0:
+                            print(f">>> [GenerationCallback] Generated {i + 1}/{len(eval_samples)} samples...")
+                            
+                    except Exception as e:
+                        print(f">>> [GenerationCallback] Error generating for sample {i}: {e}")
+                        continue
+            finally:
+                # Restore original training mode
+                unwrapped_model.train(original_training)
             
             # Create wandb table
             table = wandb.Table(
