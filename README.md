@@ -1,19 +1,21 @@
-# SiQ-VL: Seek Vision Language Model
+# SiQ-VL: A Vision-Language Model for Multimodal Understanding
 
-SiQ-VL is a Vision-Language Model (VLM) that combines **SigLIP** (vision encoder) with **Qwen2.5** (language model) through a learnable projector. The model is trained from scratch using a multi-stage training pipeline designed for efficient multimodal understanding and generation tasks.
+## Abstract
 
-## 🏗️ Architecture
+SiQ-VL is a vision-language model (VLM) that integrates a SigLIP-based vision encoder with a Qwen2.5 language model through a learnable projection module. The architecture employs a multi-stage training paradigm designed to progressively develop capabilities in multimodal understanding and text generation tasks.
 
-SiQ-VL consists of three main components:
+## Architecture Overview
 
-1. **Vision Tower**: SigLIP-based vision encoder (frozen during training)
-2. **Projector**: Learnable module that maps vision features to LLM embedding space with pixel shuffle compression
-3. **Language Model**: Qwen2.5 for text generation (frozen in Stage 1, fine-tuned in later stages)
+The SiQ-VL architecture comprises three principal components:
 
-### Model Architecture Diagram
+1. **Vision Encoder**: A SigLIP-based vision tower that remains frozen throughout the training process
+2. **Projection Module**: A learnable projector that transforms vision features into the language model embedding space, incorporating pixel shuffle operations for sequence length compression
+3. **Language Model**: A Qwen2.5 transformer-based model responsible for text generation, which remains frozen in Stage 1 and is fine-tuned in subsequent training stages
+
+### Architectural Diagram
 
 <details>
-<summary>📊 Click to view Mermaid diagram (if supported)</summary>
+<summary>Model Architecture Diagram (Mermaid)</summary>
 
 ```mermaid
 graph TB
@@ -56,7 +58,7 @@ graph TB
     ┌─────────┐                   ┌──────────────┐
     │  Image  │                   │   Tokenizer  │
     │  (PIL)  │                   │   (Qwen2.5)  │
-    └────┬────┘                   └──────┬───────┘
+    └────┬────┘                   └───────┬──────┘
          │                                │
          │                                │
          ▼                                ▼
@@ -241,60 +243,60 @@ RL Components      │  N/A    │  N/A    │  N/A    │ Active  │
                    │         │         │         │         │
 ```
 
-### Key Features
+### Key Design Features
 
-- **Multi-Stage Training**: Progressive training pipeline from projector alignment to full fine-tuning
-- **Pixel Shuffle Compression**: Reduces sequence length of vision tokens for better efficiency
-- **Auto-configuration**: Automatically calculates pixel shuffle factor based on vision model configuration
-- **Distributed Training**: Supports multi-GPU training with Accelerate
-- **Memory Efficient**: Gradient checkpointing and optimized data loading
+- **Multi-Stage Training Paradigm**: A progressive training strategy that transitions from projector alignment to comprehensive model fine-tuning
+- **Pixel Shuffle Compression**: Implements spatial compression to reduce vision token sequence length, improving computational efficiency
+- **Automatic Configuration**: Dynamically computes pixel shuffle factors based on vision encoder specifications
+- **Distributed Training Support**: Facilitates multi-GPU training through the Accelerate framework
+- **Memory Optimization**: Incorporates gradient checkpointing and optimized data loading strategies
 
-## 🎓 Training Pipeline
+## Training Methodology
 
-SiQ-VL follows a multi-stage training approach to progressively build a capable VLM:
+The SiQ-VL model is trained using a multi-stage approach designed to incrementally develop vision-language capabilities:
 
-### Stage 1: Projector Alignment ✅ (Implemented)
+### Stage 1: Projector Alignment
 
-**Objective**: Align vision features with the LLM embedding space by training only the projector.
+**Objective**: Establish alignment between vision encoder outputs and the language model embedding space through supervised training of the projection module exclusively.
 
-- **Frozen Components**: Vision encoder (SigLIP) and LLM (Qwen2.5)
-- **Trainable**: Projector only
-- **Dataset**: FineVision (multimodal instruction-following)
-- **Purpose**: Establish basic vision-language alignment
-- **Status**: ✅ Fully implemented
+- **Frozen Components**: Vision encoder (SigLIP) and language model (Qwen2.5)
+- **Trainable Parameters**: Projection module only
+- **Training Dataset**: FineVision multimodal instruction-following dataset
+- **Purpose**: Initialize vision-language feature alignment
+- **Implementation Status**: Fully implemented
 
-### Stage 2: LLM Fine-tuning on VQA (Planned)
+### Stage 2: Language Model Fine-tuning on Visual Question Answering
 
-**Objective**: Unfreeze the LLM and train on large-scale VQA datasets to improve visual question answering capabilities.
-
-- **Frozen Components**: Vision encoder (SigLIP)
-- **Trainable**: Projector + LLM
-- **Dataset**: Large VQA datasets (e.g., VQAv2, GQA, TextVQA, etc.)
-- **Purpose**: Enhance visual understanding and reasoning
-- **Status**: 🚧 Planned
-
-### Stage 3: Supervised Fine-Tuning (SFT) with CoT (Planned)
-
-**Objective**: Fine-tune on reasoning datasets with Chain-of-Thought (CoT) annotations to improve reasoning capabilities.
+**Objective**: Fine-tune the language model component on large-scale visual question answering datasets to enhance visual comprehension and reasoning capabilities.
 
 - **Frozen Components**: Vision encoder (SigLIP)
-- **Trainable**: Projector + LLM
-- **Dataset**: Reasoning datasets with CoT annotations
-- **Purpose**: Develop step-by-step reasoning and explanation capabilities
-- **Status**: 🚧 Planned
+- **Trainable Parameters**: Projection module and language model
+- **Training Dataset**: Large-scale VQA datasets including VQAv2, GQA, and TextVQA
+- **Purpose**: Develop enhanced visual understanding and question-answering capabilities
+- **Implementation Status**: Planned for future release
 
-### Stage 4: Reinforcement Learning (RL) Training (Planned)
+### Stage 3: Supervised Fine-tuning with Chain-of-Thought Reasoning
 
-**Objective**: Further improve model performance using reinforcement learning techniques (e.g., RLHF, DPO, etc.).
+**Objective**: Fine-tune the model on reasoning datasets annotated with chain-of-thought (CoT) demonstrations to improve step-by-step reasoning and explanatory capabilities.
 
-- **Method**: RL-based optimization (specific method TBD)
-- **Purpose**: Align model outputs with human preferences and improve response quality
-- **Status**: 🚧 Planned
+- **Frozen Components**: Vision encoder (SigLIP)
+- **Trainable Parameters**: Projection module and language model
+- **Training Dataset**: Visual reasoning datasets with chain-of-thought annotations
+- **Purpose**: Develop systematic reasoning and step-by-step explanation capabilities
+- **Implementation Status**: Planned for future release
 
-### Training Pipeline Flow
+### Stage 4: Reinforcement Learning-based Optimization
+
+**Objective**: Enhance model performance through reinforcement learning techniques, such as reinforcement learning from human feedback (RLHF) or direct preference optimization (DPO), to better align outputs with human preferences.
+
+- **Training Method**: Reinforcement learning-based optimization (specific methodology to be determined)
+- **Purpose**: Improve output quality and alignment with human preferences
+- **Implementation Status**: Planned for future release
+
+### Training Pipeline Flow Diagram
 
 <details>
-<summary>📊 Click to view Mermaid diagram (if supported)</summary>
+<summary>Training Pipeline Visualization (Mermaid)</summary>
 
 ```mermaid
 graph TD
@@ -464,16 +466,18 @@ Checkpoint Input     │ Base models    │ Stage 1        │ Stage 2        �
 Checkpoint Output    │ Stage 1        │ Stage 2        │ Stage 3        │ Final Model
 ```
 
-## 📋 Requirements
+## Requirements
 
-- Python >= 3.10, < 3.11
+### System Requirements
+
+- Python 3.10 (Python >= 3.10 and < 3.11)
 - PyTorch >= 2.9.1
-- CUDA-capable GPU (for training, recommended: 24GB+ VRAM)
-- [uv](https://github.com/astral-sh/uv) package manager (recommended) or pip
+- CUDA-capable GPU with at least 24GB VRAM (recommended for training)
+- Package manager: [uv](https://github.com/astral-sh/uv) (recommended) or pip
 
-## 🚀 Installation
+## Installation
 
-### Using uv (Recommended)
+### Installation via uv (Recommended)
 
 ```bash
 # Install uv if not already installed
@@ -493,11 +497,11 @@ uv sync
 pip install -e .
 ```
 
-## 📊 Datasets
+## Training Datasets
 
 ### Stage 1: FineVision Dataset
 
-The **Stage 1** training uses the **FineVision** dataset from HuggingFace, which includes multiple subsets:
+Stage 1 training employs the FineVision dataset, available through HuggingFace, which comprises multiple data subsets:
 
 - `coco_colors`
 - `densefusion_1m`
@@ -510,15 +514,15 @@ The **Stage 1** training uses the **FineVision** dataset from HuggingFace, which
 - `sharegpt4v(knowledge)`
 - `sharegpt4v(sam)`
 
-### Future Stages
+### Future Training Stages
 
-- **Stage 2**: Large-scale VQA datasets (VQAv2, GQA, TextVQA, etc.)
-- **Stage 3**: Reasoning datasets with Chain-of-Thought annotations
-- **Stage 4**: Preference datasets for RL training
+- **Stage 2**: Large-scale visual question answering datasets (VQAv2, GQA, TextVQA)
+- **Stage 3**: Visual reasoning datasets annotated with chain-of-thought demonstrations
+- **Stage 4**: Human preference datasets for reinforcement learning optimization
 
-## 🎯 Training
+## Training Instructions
 
-> **Note**: Currently, only **Stage 1** (Projector Alignment) is implemented. Stages 2-4 are planned for future releases.
+> **Note**: Presently, only Stage 1 (Projector Alignment) is fully implemented. Stages 2-4 are planned for future releases.
 
 ### Stage 1: Projector Alignment Training
 
@@ -530,11 +534,11 @@ The easiest way to start Stage 1 training is using the provided shell script, wh
 bash scripts/train_stage_1.sh
 ```
 
-The script automatically:
-- Detects host type (MacBook, AWS p4d, etc.)
-- Sets appropriate hyperparameters for Stage 1
-- Configures distributed training if needed
-- Freezes LLM and trains only the projector
+The script performs the following automatic configurations:
+- Detects the computing environment (e.g., MacBook, AWS p4d instances)
+- Sets appropriate hyperparameters for Stage 1 training
+- Configures distributed training when multiple GPUs are available
+- Freezes the language model and trains only the projection module
 
 #### Manual Training
 
@@ -555,7 +559,7 @@ python scripts/train.py \
     --bf16
 ```
 
-**Important**: Stage 1 uses `--freeze_llm` by default. Only the projector is trained during this stage.
+**Important**: Stage 1 training employs `--freeze_llm` by default, ensuring that only the projection module parameters are updated during this training phase.
 
 ### Training Arguments
 
@@ -606,7 +610,7 @@ accelerate launch \
     ...
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 SiQ_VL/
@@ -625,38 +629,43 @@ SiQ_VL/
 └── lmms-eval/          # Evaluation framework (optional)
 ```
 
-## 🗺️ Roadmap
+## Development Roadmap
 
-- [x] **Stage 1**: Projector alignment training (Implemented)
-- [ ] **Stage 2**: LLM fine-tuning on large VQA datasets
-- [ ] **Stage 3**: Supervised fine-tuning with Chain-of-Thought reasoning
-- [ ] **Stage 4**: Reinforcement learning training (RLHF/DPO/etc.)
-- [ ] Evaluation scripts and benchmarks
-- [ ] Model inference and serving utilities
+- [x] **Stage 1**: Projector alignment training (Completed)
+- [ ] **Stage 2**: Language model fine-tuning on large-scale VQA datasets
+- [ ] **Stage 3**: Supervised fine-tuning with chain-of-thought reasoning
+- [ ] **Stage 4**: Reinforcement learning-based training (RLHF/DPO)
+- [ ] Evaluation scripts and benchmark integration
+- [ ] Model inference and deployment utilities
 
-## 🔧 Model Details
+## Model Specifications
 
-### Vision Encoder
-- **Model**: SigLIP (SigLIP 2 SO400M or base variants)
-- **Status**: Frozen during training
-- **Output**: Vision features with configurable patch size and image resolution
+### Vision Encoder Specifications
 
-### Projector
-- **Type**: Linear projection with pixel shuffle
-- **Function**: Maps vision hidden dimension to LLM hidden dimension
-- **Compression**: Pixel shuffle reduces sequence length (e.g., 729 → 81 tokens for 384x384 images with factor=3)
-- **Normalization**: LayerNorm for distribution alignment
+- **Model Architecture**: SigLIP (SigLIP 2 SO400M or base model variants)
+- **Training Status**: Parameters remain frozen throughout all training stages
+- **Output Characteristics**: Produces vision features with configurable patch size and image resolution settings
 
-### Language Model
-- **Model**: Qwen2.5 (0.5B, 1.5B, or larger variants)
-- **Status**: 
-  - **Stage 1**: Frozen (only projector trained)
-  - **Stage 2+**: Unfrozen (full fine-tuning)
-- **Special Tokens**: Uses Qwen's native `<|image_pad|>`, `<|vision_start|>`, `<|vision_end|>` tokens
+### Projection Module Specifications
 
-## 💡 Usage Example
+- **Architecture Type**: Linear projection layer with pixel shuffle operation
+- **Functional Role**: Transforms vision encoder hidden dimensions to match language model embedding dimensions
+- **Compression Mechanism**: Pixel shuffle operation reduces sequence length (e.g., 729 tokens → 81 tokens for 384×384 pixel images with shuffle factor of 3)
+- **Normalization**: Layer normalization applied for distribution alignment
+
+### Language Model Specifications
+
+- **Model Architecture**: Qwen2.5 (available in 0.5B, 1.5B, and larger parameter variants)
+- **Training Status**: 
+  - **Stage 1**: Parameters remain frozen; only projection module is trained
+  - **Stage 2 and subsequent stages**: Parameters are unfrozen for full fine-tuning
+- **Special Token Handling**: Utilizes Qwen's native special tokens including `<|image_pad|>`, `<|vision_start|>`, and `<|vision_end|>`
+
+## Usage Examples
 
 ### Loading a Stage 1 Checkpoint
+
+The following code demonstrates how to load a trained Stage 1 checkpoint for inference:
 
 ```python
 from siq_vl.model import SiQ_VLModel
@@ -710,10 +719,9 @@ with torch.no_grad():
 # Note: Full generation code depends on your inference setup
 ```
 
-### Loading from Scratch (for Training)
+### Initializing Model from Base Architectures
 
-```python
-# Initialize model from base models (for Stage 1 training)
+The following example demonstrates model initialization from pre-trained base models for Stage 1 training:
 model = SiQ_VLModel(
     vision_model_path="google/siglip-so400m-patch14-384",
     llm_model_path="Qwen/Qwen2.5-0.5B-Instruct",
@@ -721,36 +729,38 @@ model = SiQ_VLModel(
 )
 ```
 
-## 📝 Training Notes
+## Training Notes and Recommendations
 
-### Stage 1 Specific Notes
+### Stage 1 Training Considerations
 
-- **Memory Requirements**: Training requires significant VRAM. For 24GB GPUs, use batch size 4-8 with gradient accumulation.
-- **Precision**: Qwen models work best with bfloat16. Avoid fp16 for Qwen.
-- **Overfitting**: VLMs can overfit quickly. 1000 steps is often sufficient for projector alignment in Stage 1.
-- **Checkpointing**: The model saves checkpoints in PyTorch format (`.bin`) to avoid safetensors compatibility issues.
-- **Learning Rate**: Stage 1 uses a higher learning rate (1e-3) for projector alignment. Later stages will use lower rates (1e-5 to 2e-5) for LLM fine-tuning.
+- **Memory Requirements**: Training requires substantial VRAM. For GPUs with 24GB VRAM, recommended batch sizes range from 4-8 with gradient accumulation enabled.
+- **Numerical Precision**: Qwen models exhibit optimal performance with bfloat16 precision. The use of float16 precision is not recommended for Qwen architectures.
+- **Overfitting Behavior**: Vision-language models may exhibit rapid overfitting. Approximately 1000 training steps typically suffice for projector alignment in Stage 1.
+- **Checkpoint Format**: Models are saved in PyTorch format (`.bin` files) to circumvent potential safetensors compatibility issues.
+- **Learning Rate Selection**: Stage 1 employs a learning rate of 1e-3 for projector alignment. Subsequent stages utilize lower learning rates (1e-5 to 2e-5) for language model fine-tuning.
 
-### Training Pipeline Notes
+### Multi-Stage Training Considerations
 
-- **Progressive Training**: Each stage builds upon the previous stage's checkpoint. Always load the Stage 1 checkpoint before starting Stage 2.
-- **Component Freezing**: 
-  - Stage 1: Vision encoder + LLM frozen
-  - Stage 2+: Only vision encoder frozen
-- **Dataset Scaling**: Each stage uses progressively more specialized datasets to target specific capabilities.
+- **Progressive Checkpoint Loading**: Each training stage builds upon checkpoints from previous stages. Stage 1 checkpoints must be loaded prior to initiating Stage 2 training.
+- **Parameter Freezing Strategy**: 
+  - Stage 1: Vision encoder and language model parameters remain frozen
+  - Stage 2 and subsequent stages: Only vision encoder parameters remain frozen
+- **Dataset Progression**: Training stages employ increasingly specialized datasets designed to target specific model capabilities.
 
-## 🤝 Contributing
+## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions to this project are welcome. Please submit pull requests for review.
 
-## 📄 License
+## License
 
-[Add your license information here]
+[License information to be added]
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- [SigLIP2](https://github.com/google-research/big_vision) for the vision encoder
-- [Qwen2.5](https://github.com/QwenLM/Qwen2-VL) for the language model
-- [HuggingFace Transformers](https://github.com/huggingface/transformers) for the framework
-- [FineVision](https://huggingface.co/datasets/HuggingFaceM4/FineVision) for the training dataset
+This work builds upon the following open-source contributions:
+
+- **SigLIP2** (Zhai et al., 2023): Vision encoder architecture implementation [[GitHub](https://arxiv.org/abs/2502.14786)]
+- **Qwen2.5** (Qwen Team, 2024): Language model architecture [[GitHub](https://arxiv.org/abs/2412.15115)]
+- **HuggingFace Transformers** (Wolf et al., 2020): Deep learning framework [[GitHub](https://github.com/huggingface/transformers)]
+- **FineVision Dataset** (HuggingFace, 2025): open dataset for data-centric training of Vision Language Models [[HuggingFace](https://huggingface.co/datasets/HuggingFaceM4/FineVision)]
 
