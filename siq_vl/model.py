@@ -1,4 +1,3 @@
-import json
 import os
 import re
 from typing import List, Optional, Tuple, Union
@@ -7,9 +6,11 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import logging
 
+from siq_vl.config import SiQ_VLConfig
 from siq_vl.processing import SiQ_VLProcessor
 
 logger = logging.get_logger(__name__)
@@ -71,7 +72,21 @@ class SiQ_VLModalityProjector(nn.Module):
         return x
 
 
-class SiQ_VLModel(nn.Module):
+class SiQ_VLModel(PreTrainedModel):
+    """
+    SiQ-VL model combining SigLIP vision encoder with Qwen language model.
+    
+    This model inherits from PreTrainedModel which provides the methods:
+    - save_pretrained() and from_pretrained() for saving/loading
+    - get_input_embeddings() and set_input_embeddings()
+    - and a few others generic methods
+    
+    See the documentation for all the methods available.
+    """
+    
+    config_class = SiQ_VLConfig
+    base_model_prefix = "siq_vl"
+    
     # CRITICAL: Tell Trainer we don't accept loss kwargs
     # This ensures Trainer properly normalizes loss for gradient accumulation
     # See: https://github.com/huggingface/transformers/blob/main/src/transformers/trainer.py#L4060-4064
@@ -158,23 +173,52 @@ class SiQ_VLModel(nn.Module):
 
     def __init__(
         self,
-        vision_model_path="google/siglip2-so400m-patch14-384",
-        llm_model_path="Qwen/Qwen2.5-0.5B-Instruct",
-        freeze_llm=True,
-        gradient_accumulation_steps=1,
-        pixel_shuffle_factor=1,  # Default to 1 (no shuffling)
+        config: Optional[SiQ_VLConfig] = None,
+        vision_model_path: Optional[str] = None,
+        llm_model_path: Optional[str] = None,
+        freeze_llm: Optional[bool] = None,
+        gradient_accumulation_steps: int = 1,
+        pixel_shuffle_factor: Optional[int] = None,
     ):
-        super().__init__()
-
-        self.vision_model_path = vision_model_path
-        self.llm_model_path = llm_model_path
+        """
+        Initialize SiQ_VLModel.
+        
+        Args:
+            config: SiQ_VLConfig instance. If None, will be created from other args.
+            vision_model_path: Path to vision model (overrides config if provided)
+            llm_model_path: Path to LLM (overrides config if provided)
+            freeze_llm: Whether to freeze LLM (overrides config if provided)
+            gradient_accumulation_steps: Gradient accumulation steps (for compatibility)
+            pixel_shuffle_factor: Pixel shuffle factor (overrides config if provided)
+        """
+        # Initialize config if not provided
+        if config is None:
+            config = SiQ_VLConfig(
+                vision_model_path=vision_model_path or "google/siglip2-so400m-patch14-384",
+                llm_model_path=llm_model_path or "Qwen/Qwen2.5-0.5B-Instruct",
+                freeze_llm=freeze_llm if freeze_llm is not None else True,
+                pixel_shuffle_factor=pixel_shuffle_factor or 1,
+            )
+        else:
+            # Override config with provided args if any
+            if vision_model_path is not None:
+                config.vision_model_path = vision_model_path
+            if llm_model_path is not None:
+                config.llm_model_path = llm_model_path
+            if freeze_llm is not None:
+                config.freeze_llm = freeze_llm
+            if pixel_shuffle_factor is not None:
+                config.pixel_shuffle_factor = pixel_shuffle_factor
+        
+        super().__init__(config)
+        
         self.gradient_accumulation_steps = gradient_accumulation_steps
 
         # ==========================================================
         # 1. Load Vision Tower (SigLIP 2)
         # ==========================================================
-        print(f"Loading Vision Tower: {vision_model_path}...")
-        full_vision_model = AutoModel.from_pretrained(vision_model_path)
+        print(f"Loading Vision Tower: {config.vision_model_path}...")
+        full_vision_model = AutoModel.from_pretrained(config.vision_model_path)
         self.vision_tower = full_vision_model.vision_model
         del full_vision_model
 
@@ -186,20 +230,26 @@ class SiQ_VLModel(nn.Module):
         print(">>> Vision Tower Frozen.")
 
         # Get vision hidden size (SigLIP SO400M is typically 1152)
-        self.vision_hidden_size = self.vision_tower.config.hidden_size
+        vision_hidden_size = self.vision_tower.config.hidden_size
+        if config.vision_hidden_size is None:
+            config.vision_hidden_size = vision_hidden_size
+        self.vision_hidden_size = config.vision_hidden_size
 
-        # Use provided pixel_shuffle_factor (default is 1)
-        self.pixel_shuffle_factor = pixel_shuffle_factor
-        print(f">>> Using pixel_shuffle_factor: {pixel_shuffle_factor}")
+        # Use pixel_shuffle_factor from config
+        self.pixel_shuffle_factor = config.pixel_shuffle_factor
+        print(f">>> Using pixel_shuffle_factor: {self.pixel_shuffle_factor}")
 
         # ==========================================================
         # 2. Load LLM (Qwen 2.5 0.5B)
         # ==========================================================
-        print(f"Loading LLM: {llm_model_path}...")
-        self.llm = AutoModelForCausalLM.from_pretrained(llm_model_path)
-        self.llm_hidden_size = self.llm.config.hidden_size  # Qwen 0.5B is 896
+        print(f"Loading LLM: {config.llm_model_path}...")
+        self.llm = AutoModelForCausalLM.from_pretrained(config.llm_model_path)
+        llm_hidden_size = self.llm.config.hidden_size  # Qwen 0.5B is 896
+        if config.llm_hidden_size is None:
+            config.llm_hidden_size = llm_hidden_size
+        self.llm_hidden_size = config.llm_hidden_size
 
-        if freeze_llm:
+        if config.freeze_llm:
             self.llm.requires_grad_(False)
             self.llm.eval()
             for param in self.llm.parameters():
@@ -211,20 +261,14 @@ class SiQ_VLModel(nn.Module):
         # ==========================================================
         # Maps Vision Dimension -> LLM Dimension
         self.projector = SiQ_VLModalityProjector(
-            self.vision_hidden_size, pixel_shuffle_factor, self.llm_hidden_size
+            self.vision_hidden_size, self.pixel_shuffle_factor, self.llm_hidden_size
         )
 
-        # Placeholder ID for the <image> token.
-        # with a special ID (e.g., -200) that doesn't exist in the tokenizer.
-        self.ignore_index = -100  # Standard label for ignoring loss
-
-        # https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/tokenizer_config.json
-        # Use Qwen's native <|image_pad|> token ID
-        self.image_token_id = 151655
-
-        # Optional: You might want to define start/end tokens too if you use them
-        self.vision_start_id = 151652  # <|vision_start|>
-        self.vision_end_id = 151653  # <|vision_end|>
+        # Store token IDs from config
+        self.ignore_index = config.ignore_index
+        self.image_token_id = config.image_token_id
+        self.vision_start_id = config.vision_start_id
+        self.vision_end_id = config.vision_end_id
 
         self.projector.apply(self._init_projector_weights)
 
@@ -461,77 +505,30 @@ class SiQ_VLModel(nn.Module):
         # This tells Trainer to properly normalize loss for gradient accumulation
         # No manual normalization needed here - Trainer handles it automatically
 
-        # --- DEBUG: Check loss and accuracy ---
-        # if self.training and hasattr(outputs, "loss") and final_labels is not None:
-        #     # Calculate prediction accuracy on valid labels
-        #     predictions = outputs.logits.argmax(dim=-1)
-        #     valid_mask = final_labels != -100
-
-        #     correct = 0
-        #     total = 0
-        #     accuracy = 0.0
-
-        #     if valid_mask.sum() > 0:
-        #         correct = (
-        #             (predictions[valid_mask] == final_labels[valid_mask]).sum().item()
-        #         )
-        #         total = valid_mask.sum().item()
-        #         accuracy = correct / total * 100
-
-        #     logger.warning_once(  # type: ignore
-        #         f"\n[DEBUG LLM Output]"
-        #         f"\n  Loss (from LLM): {outputs.loss.item():.4f}"
-        #         f"\n  Loss requires_grad: {outputs.loss.requires_grad}"
-        #         f"\n  Loss shape: {outputs.loss.shape}"
-        #         f"\n  Accuracy: {accuracy:.2f}% ({correct}/{total} correct)"
-        #         f"\n  Logits shape: {outputs.logits.shape}"
-        #         f"\n  Logits stats: Mean={outputs.logits.mean().item():.4f}, Std={outputs.logits.std().item():.4f}, Max={outputs.logits.max().item():.4f}"
-        #     )
-
-        # CRITICAL: Check if loss needs to be normalized
-        # In DDP with gradient accumulation, we might need to scale the loss
-        # if self.training and hasattr(outputs, "loss"):
-        #     # Print the loss that will be returned to Trainer
-        #     logger.warning_once(  # type: ignore
-        #         f"\n[DEBUG] Returning loss to Trainer: {outputs.loss.item():.4f}"
-        #     )
-
-        return outputs
+        # Return CausalLMOutputWithPast for compatibility with Transformers
+        return CausalLMOutputWithPast(
+            loss=outputs.loss,
+            logits=outputs.logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     def save_pretrained(self, save_directory, **kwargs):
         """
-        Custom save method to handle:
-        1. Saving the full model state_dict (including Projector).
-        2. Avoiding the 'safetensors' shared weight error by using torch.save (.bin).
-        3. Saving the base configuration.
+        Save the model and configuration using Transformers standard format.
+        
+        This method:
+        1. Saves the model config (SiQ_VLConfig)
+        2. Saves the model state_dict
+        3. Optionally saves in safetensors format if requested
         """
-        print(f">>> Custom Saving to {save_directory}...")
-
-        if not os.path.exists(save_directory):
-            os.makedirs(save_directory)
-
-        # 1. Save the LLM Config
-        # This creates 'config.json' so Hugging Face knows the base parameters
-        self.llm.config.save_pretrained(save_directory)
-
-        # 2. Save the Full State Dict as a standard PyTorch binary
-        # We explicitly use 'pytorch_model.bin' to avoid Safetensors issues
-        model_path = os.path.join(save_directory, "pytorch_model.bin")
-        torch.save(self.state_dict(), model_path)
-
-        # 3. Save a custom config file (Optional but recommended)
-        # This helps you remember what vision encoder you used
-        custom_config = {
-            "vision_model_path": self.vision_model_path,
-            "llm_model_path": self.llm_model_path,
-            "model_type": "siq_vl",
-            "image_token_id": self.image_token_id,
-        }
-
-        with open(os.path.join(save_directory, "model_config.json"), "w") as f:
-            json.dump(custom_config, f, indent=2)
-
-        print(f">>> Model saved successfully to {model_path}")
+        print(f">>> Saving model to {save_directory}...")
+        
+        # Use parent class method to save config and state_dict
+        super().save_pretrained(save_directory, **kwargs)
+        
+        print(f">>> Model saved successfully to {save_directory}")
 
     def generate_answer(
         self,
@@ -686,12 +683,51 @@ class SiQ_VLModel(nn.Module):
         return answers
 
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike],
+        *model_args,
+        config: Optional[Union[SiQ_VLConfig, str, os.PathLike]] = None,
+        **kwargs,
+    ):
+        """
+        Load a pretrained model from a directory or Hugging Face Hub.
+        
+        Args:
+            pretrained_model_name_or_path: Path to model directory or model ID on Hub
+            *model_args: Additional positional arguments
+            config: Optional config override
+            **kwargs: Additional keyword arguments passed to PreTrainedModel.from_pretrained
+        
+        Returns:
+            SiQ_VLModel instance
+        """
+        # Load config if not provided
+        if config is None:
+            config = SiQ_VLConfig.from_pretrained(pretrained_model_name_or_path)
+        elif isinstance(config, (str, os.PathLike)):
+            config = SiQ_VLConfig.from_pretrained(config)
+        
+        # Use parent class method to load the model
+        model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            config=config,
+            **kwargs,
+        )
+        
+        return model
+
+
 def load_model_from_checkpoint(
     checkpoint_dir: str,
     device: Optional[Union[str, torch.device]] = None,
 ) -> Tuple[SiQ_VLModel, SiQ_VLProcessor]:
     """
     Load model and processor from a checkpoint directory.
+    
+    This is a convenience function that uses the standard from_pretrained method.
     
     Args:
         checkpoint_dir: Path to the checkpoint directory
@@ -705,45 +741,13 @@ def load_model_from_checkpoint(
     if isinstance(device, str):
         device = torch.device(device)
     
-    # Load checkpoint configuration
-    config_path = os.path.join(checkpoint_dir, "model_config.json")
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            model_config = json.load(f)
-        vision_model_path = model_config.get("vision_model_path")
-        llm_model_path = model_config.get("llm_model_path")
-        freeze_llm = model_config.get("freeze_llm", True)
-    else:
-        # Fallback: try to infer from checkpoint directory structure or use defaults
-        print(f">>> Warning: model_config.json not found in {checkpoint_dir}")
-        print(">>> Using default model paths. This may not match your checkpoint.")
-        vision_model_path = "google/siglip-so400m-patch14-384"
-        llm_model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-        freeze_llm = True
-    
     # Load processor (saved with the model)
     print(f">>> Loading processor from {checkpoint_dir}...")
     processor = SiQ_VLProcessor.from_pretrained(checkpoint_dir)
     
-    # Initialize model with saved configuration
-    print(f">>> Loading model: vision={vision_model_path}, llm={llm_model_path}...")
-    model = SiQ_VLModel(
-        vision_model_path=vision_model_path,
-        llm_model_path=llm_model_path,
-        freeze_llm=freeze_llm,
-    )
-    
-    # Load the trained weights
-    model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-    if os.path.exists(model_path):
-        print(f">>> Loading weights from {model_path}...")
-        model.load_state_dict(
-            torch.load(model_path, map_location=device),
-            strict=False,  # Allow missing keys (e.g., if some layers weren't trained)
-        )
-    else:
-        print(f">>> Warning: pytorch_model.bin not found in {checkpoint_dir}")
-        print(">>> Using model with pretrained weights only.")
+    # Load model using from_pretrained
+    print(f">>> Loading model from {checkpoint_dir}...")
+    model = SiQ_VLModel.from_pretrained(checkpoint_dir)
     
     model.to(device)
     model.eval()

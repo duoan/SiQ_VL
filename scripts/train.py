@@ -471,14 +471,22 @@ def train(args=None):
     gradient_accumulation_steps = args.gradient_accumulation_steps
 
     print(">>> Loading Model...")
-    # Initialize our Custom Model
-    # freeze_vision=True: Freezes the Vision Tower, training only Projector + LLM
-    model = SiQ_VLModel(
+    # Initialize our Custom Model using config
+    # Option 1: Use config-based initialization (recommended)
+    from siq_vl.config import SiQ_VLConfig
+    
+    config = SiQ_VLConfig(
         vision_model_path=vision_model_name_or_path,
         llm_model_path=llm_model_name_or_path,
         freeze_llm=args.freeze_llm,
-        gradient_accumulation_steps=gradient_accumulation_steps,
         pixel_shuffle_factor=args.pixel_shuffle_factor,
+        image_size=image_size,
+        patch_size=patch_size,
+    )
+    
+    model = SiQ_VLModel(
+        config=config,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
 
     # ----------------------------------------------------
