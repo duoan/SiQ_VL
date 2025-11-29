@@ -4,6 +4,10 @@
 
 SiQ-VL is a vision-language model (VLM) that integrates a SigLIP-based vision encoder with a Qwen2.5 language model through a learnable projection module. The architecture employs a multi-stage training paradigm designed to progressively develop capabilities in multimodal understanding and text generation tasks.
 
+## Experiment Tracking
+
+Training runs and experiments are tracked using Weights & Biases. View training metrics, model checkpoints, and experiment logs at: [https://wandb.ai/ReproduceAI/siq_vl](https://wandb.ai/ReproduceAI/siq_vl)
+
 ## Architecture Overview
 
 The SiQ-VL architecture comprises three principal components:
