@@ -176,7 +176,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "10"
             "--save_steps" "500"
-            "--generate_eval_interval" "200"
+            "--gen_eval_interval" "200"
             "--push_to_hub"
         )
     else
@@ -195,7 +195,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "20"
             "--save_steps" "1000"
-            "--generate_eval_interval" "1000"
+            "--gen_eval_interval" "1000"
             "--push_to_hub"
         )
     fi
