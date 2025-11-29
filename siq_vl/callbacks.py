@@ -286,6 +286,14 @@ class GenerationCallback(TrainerCallback):
             device=device,
         )
     
+    def _is_rank0(self, args: TrainingArguments) -> bool:
+        """Check if current process is rank 0 (main process)."""
+        # If distributed training is not initialized, we're on rank 0
+        if not torch.distributed.is_initialized():
+            return True
+        # In distributed training, check local_rank
+        return args.local_rank == 0
+    
     def on_train_begin(
         self,
         args: TrainingArguments,
@@ -295,8 +303,8 @@ class GenerationCallback(TrainerCallback):
         **kwargs,
     ):
         """Run generation at the start of training (step 0)."""
-        # Only run on main process
-        if args.local_rank != 0 and args.local_rank != -1:
+        # Only run on main process (rank 0)
+        if not self._is_rank0(args):
             return
         
         # Run generation at step 0
@@ -311,11 +319,16 @@ class GenerationCallback(TrainerCallback):
         **kwargs,
     ):
         """Run generation at the end of training."""
-        # Only run on main process
-        if args.local_rank != 0 and args.local_rank != -1:
+        # Only run on main process (rank 0)
+        if not self._is_rank0(args):
             return
         
-        # Run generation at final step
+        # Skip if the final step is already covered by eval_interval
+        # (e.g., if eval_interval=200 and final step=1000, on_log already ran at step 1000)
+        if state.global_step > 0 and state.global_step % self.eval_interval == 0:
+            return
+        
+        # Run generation at final step (only if not already done by on_log)
         self._run_generation(args, state, model=model, **kwargs)
     
     def on_log(
@@ -327,8 +340,8 @@ class GenerationCallback(TrainerCallback):
         **kwargs,
     ):
         """Generate predictions and log to wandb at specified intervals."""
-        # Only run on main process
-        if args.local_rank != 0 and args.local_rank != -1:
+        # Only run on main process (rank 0)
+        if not self._is_rank0(args):
             return
         
         # Check if we should evaluate at this step
