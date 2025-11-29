@@ -207,8 +207,6 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
 
     export PATH="$VENV_DIR/bin:$PATH"
     $ACCELERATE_CMD launch \
-        --dispatch_batches=false \
-        --split_batches=false \
         "$TRAIN_SCRIPT" \
         "${BASE_ARGS[@]}" \
         "${AWS_ARGS[@]}" \
