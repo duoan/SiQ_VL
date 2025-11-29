@@ -166,7 +166,8 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
-            "--pixel_shuffle_factor" "4"
+            # reduce to 256 tokens
+            "--pixel_shuffle_factor" "2"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_steps" "1000"
@@ -184,8 +185,8 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
-            # for 512x512 images, patch size is 16, will have 512/16 * 512/16 = 1024 image tokens, so pixel_shuffle_factor should be 4 to get 256 image tokens,
-            "--pixel_shuffle_factor" "4" 
+            # reduce to 256 tokens
+            "--pixel_shuffle_factor" "2" 
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_samples" "1000000"
