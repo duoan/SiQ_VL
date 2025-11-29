@@ -60,6 +60,7 @@ def generate_run_name(
     vision_model_path: str,
     llm_model_path: str,
     project_name: str,
+    output_dir: str | None = None,
 ) -> str:
     """
     Generate a run name from model names, stage, and datetime.
@@ -67,16 +68,31 @@ def generate_run_name(
     """
     vision_name = extract_model_name(vision_model_path)
     llm_name = extract_model_name(llm_model_path)
-    
-    # Extract stage name from project (e.g., "siq_vl_stage_1" -> "stage_1")
-    if "stage" in project_name.lower():
-        # Try to extract stage_* pattern
-        stage_match = re.search(r"stage[_\s]?(\d+)", project_name.lower())
-        if stage_match:
-            stage = f"stage_{stage_match.group(1)}"
-        else:
-            stage = project_name.split("_")[-1] if "_" in project_name else project_name
-    else:
+
+    # --- Robust stage inference ---
+    # Priority:
+    #   1) Explicit "stageX" pattern in project name (e.g. "siq_vlm_stage1")
+    #   2) Explicit "stageX" pattern in output_dir (e.g. "./checkpoints/siq_vlm_stage2/...")
+    #   3) Fallback to last token of project name
+    stage = None
+
+    def _infer_stage_from_string(s: str) -> str | None:
+        s = s.lower()
+        # Match: "stage1", "stage_1", "stage-1", "stage 1"
+        m = re.search(r"stage[_\s-]?(\d+)", s)
+        if m:
+            return f"stage_{m.group(1)}"
+        return None
+
+    # 1) Try from project name
+    stage = _infer_stage_from_string(project_name) or stage
+
+    # 2) Try from output_dir if still unknown
+    if stage is None and output_dir is not None:
+        stage = _infer_stage_from_string(output_dir)
+
+    # 3) Fallback: use last token of project name
+    if stage is None:
         stage = project_name.split("_")[-1] if "_" in project_name else project_name
     
     # Generate datetime string (format: YYYYMMDD_HHMMSS)
@@ -504,6 +520,7 @@ def train(args=None):
         vision_model_path=vision_model_name_or_path,
         llm_model_path=llm_model_name_or_path,
         project_name=args.project,
+        output_dir=OUTPUT_DIR,
     )
     print(f">>> Generated run name: {run_name}")
     
