@@ -4,6 +4,7 @@ import os
 import re
 from datetime import datetime
 
+import torch
 import torch.distributed as dist
 from datasets import concatenate_datasets, load_dataset
 from transformers import (
@@ -173,8 +174,11 @@ def parse_args():
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=1000,
-        help="Maximum number of training steps",
+        default=-1,
+        help=(
+            "Maximum number of training steps. "
+            "If <= 0, it will be auto-calculated from max_samples and the global batch size."
+        ),
     )
     parser.add_argument(
         "--max_samples",
@@ -330,8 +334,16 @@ def train(args=None):
     vision_model_name_or_path = args.vision_model_name_or_path
     llm_model_name_or_path = args.llm_model_name_or_path
 
-    # Directory to save checkpoints
-    OUTPUT_DIR = args.output_dir
+    # Backbone identifiers (used both for output_dir and for locating
+    # previous-stage checkpoints).
+    vision_name = extract_model_name(vision_model_name_or_path)
+    llm_name = extract_model_name(llm_model_name_or_path)
+    backbone_dir = f"{vision_name}__{llm_name}"
+
+    base_output_dir = args.output_dir
+    OUTPUT_DIR = os.path.join(base_output_dir, backbone_dir)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f">>> Using output_dir: {OUTPUT_DIR}")
 
     # ====================================================
     # 2. Initialize Processor & Model
@@ -347,7 +359,6 @@ def train(args=None):
     # Define training hyperparameters before model initialization
     per_device_train_batch_size = args.per_device_train_batch_size
     gradient_accumulation_steps = args.gradient_accumulation_steps
-    max_steps = args.max_steps
 
     print(">>> Loading Model...")
     # Initialize our Custom Model
@@ -359,6 +370,69 @@ def train(args=None):
         gradient_accumulation_steps=gradient_accumulation_steps,
         pixel_shuffle_factor=args.pixel_shuffle_factor,
     )
+
+    # ----------------------------------------------------
+    # Optionally load weights from the latest Stage 1 checkpoint
+    # ----------------------------------------------------
+    # Convention:
+    #   - Stage 1 output_root: ./checkpoints/siq_vlm_stage1
+    #   - Stage 2 output_root: ./checkpoints/siq_vlm_stage2
+    #   - Within each root, we create a backbone-specific subdir:
+    #         {vision_name}__{llm_name}
+    #   - We detect "stage 2" based on the project name containing "stage_2".
+    #     In that case, we auto-load the latest Stage 1 checkpoint that matches
+    #     the current backbone configuration.
+    if "stage_2" in args.project.lower():
+        stage1_root = base_output_dir.replace("siq_vlm_stage2", "siq_vlm_stage1")
+        stage1_backbone_dir = os.path.join(stage1_root, backbone_dir)
+
+        def _resolve_latest_stage1_checkpoint(path: str) -> str | None:
+            if not os.path.isdir(path):
+                return None
+
+            # Prefer a top-level pytorch_model.bin if it exists
+            top_level_bin = os.path.join(path, "pytorch_model.bin")
+            if os.path.isfile(top_level_bin):
+                return top_level_bin
+
+            # Otherwise, look for checkpoint-* subdirectories
+            checkpoint_dirs = [
+                d
+                for d in os.listdir(path)
+                if d.startswith("checkpoint-")
+                and os.path.isdir(os.path.join(path, d))
+            ]
+            if not checkpoint_dirs:
+                return None
+
+            def _step_from_name(name: str) -> int:
+                try:
+                    return int(name.split("-")[-1])
+                except Exception:
+                    return -1
+
+            checkpoint_dirs.sort(key=_step_from_name)
+            latest_dir = checkpoint_dirs[-1]
+            candidate = os.path.join(path, latest_dir, "pytorch_model.bin")
+            return candidate if os.path.isfile(candidate) else None
+
+        ckpt_file = _resolve_latest_stage1_checkpoint(stage1_backbone_dir)
+        if ckpt_file is not None:
+            print(f">>> Initializing model weights from Stage 1 checkpoint: {ckpt_file}")
+            state_dict = torch.load(ckpt_file, map_location="cpu")
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+            if missing_keys:
+                print(f">>> Warning: Missing keys when loading checkpoint ({len(missing_keys)}):")
+                print(missing_keys[:20])
+            if unexpected_keys:
+                print(f">>> Warning: Unexpected keys when loading checkpoint ({len(unexpected_keys)}):")
+                print(unexpected_keys[:20])
+        else:
+            print(
+                f">>> Warning: No matching Stage 1 checkpoint found in {stage1_backbone_dir}. "
+                f"Stage 2 will start from the base backbones."
+            )
 
     # Enable Gradient Checkpointing (Critical for VRAM efficiency)
     # model.llm.gradient_checkpointing_enable()
@@ -384,11 +458,30 @@ def train(args=None):
     # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets
     train_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=0)
     
-    # Limit dataset size if specified (for quick testing)
+    # Limit dataset size if specified (for quick testing / controlling total samples)
     if args.max_samples is not None:
-        print(f">>> Limiting dataset to {args.max_samples} samples for quick testing")
+        print(f">>> Limiting dataset to {args.max_samples} samples")
         train_raw_dataset = train_raw_dataset.select(range(min(args.max_samples, len(train_raw_dataset))))
-    
+
+    # ----------------------------------------------------
+    # Auto-calculate max_steps from max_samples & global batch
+    # ----------------------------------------------------
+    max_steps = args.max_steps
+    if max_steps is None or max_steps <= 0:
+        # Compute effective global batch size
+        global_batch_size = per_device_train_batch_size * gradient_accumulation_steps * get_world_size()
+        if global_batch_size <= 0:
+            global_batch_size = 1
+
+        effective_samples = len(train_raw_dataset)
+        max_steps = (effective_samples + global_batch_size - 1) // global_batch_size
+        print(
+            f">>> Auto-calculated max_steps={max_steps} "
+            f"(effective_samples={effective_samples}, global_batch_size={global_batch_size})"
+        )
+    else:
+        print(f">>> Using user-specified max_steps={max_steps}")
+
     if is_dist():
         # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
         train_raw_dataset = train_raw_dataset.shard(
@@ -418,8 +511,6 @@ def train(args=None):
     # This ensures wandb uses the correct project name when initialized by Trainer
     os.environ["WANDB_PROJECT"] = args.project
     print(f">>> Setting WANDB_PROJECT to: {args.project}")
-    # turn off watch to log faster
-    os.environ["WANDB_WATCH"]="false"
     
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -434,7 +525,7 @@ def train(args=None):
         learning_rate=args.learning_rate,
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
-        max_steps=max_steps,  # VLMs overfit easily; 1000 steps is usually sufficient for multimodal project alignment
+        max_steps=max_steps,
         max_grad_norm=1.0,  # Clip gradients to prevent instability
         # --- Precision & Memory ---
         bf16=args.bf16,  # REQUIRED for Qwen (Ampere+ GPUs). Do not use fp16.
