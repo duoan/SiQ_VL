@@ -2,9 +2,11 @@ import argparse
 import builtins
 from datetime import datetime
 import os
+import random
 import re
 
 from datasets import concatenate_datasets, load_dataset
+import numpy as np
 from publish_to_hub import publish_to_hub
 import torch
 import torch.distributed as dist
@@ -165,6 +167,26 @@ def generate_run_name(
     run_name = f"{vision_name}_{llm_name}_{stage}_{datetime_str}"
 
     return run_name
+
+
+def seed_everything(seed: int = 42):
+    """
+    Set random seeds for reproducibility across all libraries.
+
+    Args:
+        seed: Random seed value (default: 42)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # For deterministic behavior (may slow down training)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # Set environment variable for Python hash randomization
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print(f">>> Set random seed to {seed} for reproducibility")
 
 
 def setup_for_distributed(is_master):
@@ -364,6 +386,12 @@ def parse_args():
         help="Number of beams for generation beam search (default: 2)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42)",
+    )
+    parser.add_argument(
         "--use_distributed",
         action="store_true",
         default=False,
@@ -399,6 +427,9 @@ def parse_args():
 def train(args=None):
     if args is None:
         args = parse_args()
+
+    # Set random seeds for reproducibility
+    seed_everything(args.seed)
 
     # Initialize distributed training only if explicitly requested and environment is set up
     # (e.g., by accelerate launcher)

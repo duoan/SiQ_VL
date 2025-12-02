@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+import random
 
 import numpy as np
 from PIL import Image
@@ -75,8 +76,13 @@ def _to_pil_rgb(image: str | Image.Image) -> Image.Image:
 
 class VQADataset(Dataset):
     """
-    Standard Dataset that expands multi-turn conversations into individual samples.
+    Standard Dataset that randomly selects one turn per item on each access.
     Supports DistributedSampler automatically via Trainer's DataLoader.
+
+    This approach is much faster during initialization since we don't need to
+    pre-expand all samples. Each item will be visited once per epoch, but a
+    random turn will be selected each time. To cover all turns, run multiple
+    training epochs.
     """
 
     def __init__(self, hf_dataset):
@@ -84,24 +90,30 @@ class VQADataset(Dataset):
         hf_dataset: HuggingFace dataset object
         """
         self.dataset = hf_dataset
-        # Pre-expand all samples: build a list of (item_idx, turn_idx) pairs
-        self.samples = []
-        for item_idx in range(len(hf_dataset)):
-            item = hf_dataset[item_idx]
-            num_turns = len(item.get("texts", []))
-            for turn_idx in range(num_turns):
-                self.samples.append((item_idx, turn_idx))
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        item_idx, turn_idx = self.samples[idx]
-        item = self.dataset[item_idx]
+        item = self.dataset[idx]
         image = _to_pil_rgb(item["images"][0])
-        turn = item["texts"][turn_idx]
-        q = turn["user"]
-        a = turn["assistant"]
+        texts = item.get("texts", [])
+
+        if len(texts) == 0:
+            # Fallback if no texts
+            return {
+                "image": image,
+                "question": "",
+                "answer": "",
+            }
+
+        # Randomly select one turn from this item
+        # Each epoch will see a different random turn, allowing coverage of all turns
+        # across multiple training epochs
+        turn_idx = random.randint(0, len(texts) - 1)
+        turn = texts[turn_idx]
+        q = turn.get("user", "")
+        a = turn.get("assistant", "")
 
         return {
             "image": image,
