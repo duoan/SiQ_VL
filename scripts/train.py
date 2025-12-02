@@ -612,14 +612,15 @@ def train(args=None):
         all_raw_datasets.append(raw_dataset)
 
     # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets
-    concat_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=0)
+    random.shuffle(all_raw_datasets)
+    concat_raw_dataset = concatenate_datasets(all_raw_datasets)
 
     # Limit dataset size if specified (for quick testing / controlling total samples)
     if args.max_samples is not None:
         print(f">>> Limiting dataset to {args.max_samples} samples")
         concat_raw_dataset = concat_raw_dataset.select(range(min(args.max_samples, len(concat_raw_dataset))))
 
-    splits = concat_raw_dataset.train_test_split(test_size=0.1)
+    splits = concat_raw_dataset.train_test_split(test_size=0.1, shuffle=True)
     train_raw_dataset = splits["train"]
     eval_raw_dataset = splits["test"]
 
