@@ -327,6 +327,13 @@ def parse_args():
         help="Number of steps between evaluation",
     )
     parser.add_argument(
+        "--max_eval_samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to use for evaluation (None = use all). "
+        "Set this to limit eval time if eval dataset is large.",
+    )
+    parser.add_argument(
         "--gen_samples",
         type=int,
         default=20,
@@ -590,7 +597,14 @@ def train(args=None):
     # No manual sharding needed!
     print(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
     train_dataset = VQADataset(train_raw_dataset)
-    eval_dataset = VQADataset(eval_raw_dataset)
+    eval_raw_dataset_for_trainer = eval_raw_dataset
+
+    # Limit eval samples if specified to avoid long eval times
+    if args.max_eval_samples is not None and len(eval_raw_dataset) > args.max_eval_samples:
+        print(f">>> Limiting eval dataset to {args.max_eval_samples} samples (from {len(eval_raw_dataset)})")
+        eval_raw_dataset_for_trainer = eval_raw_dataset.select(range(args.max_eval_samples))
+
+    eval_dataset = VQADataset(eval_raw_dataset_for_trainer)
 
     print(">>> DEBUG: Train Dataset:", train_dataset)
     print(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
@@ -651,6 +665,9 @@ def train(args=None):
         # --- Evaluation ---
         eval_strategy="steps",
         eval_steps=args.eval_steps,
+        per_device_eval_batch_size=per_device_train_batch_size,  # Use same batch size for eval
+        eval_accumulation_steps=1,  # Accumulate eval results in one go
+        # Note: max_eval_samples is handled when creating eval_dataset above
         # --- Learning Rate ---
         # Project alignment using 1e-3
         # Recommendation for full finetuning: 1e-5 to 2e-5
