@@ -5,16 +5,16 @@ description = "Seek Vision Language Model"
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    "accelerate>=1.12.0",
-    "datasets>=4.4.1",
-    "deepspeed>=0.18.2",
-    "pillow>=12.0.0",
-    "setuptools>=80.9.0",
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
-    "tqdm>=4.67.1",
-    "transformers>=4.57.3",
-    "wandb>=0.23.0",
+  "accelerate>=1.12.0",
+  "datasets>=4.4.1",
+  "deepspeed>=0.18.2",
+  "pillow>=12.0.0",
+  "setuptools>=80.9.0",
+  "torch>=2.9.1",
+  "torchvision>=0.24.1",
+  "tqdm>=4.67.1",
+  "transformers>=4.57.3",
+  "wandb>=0.23.0",
 ]
 
 [tool.setuptools]
@@ -40,3 +40,72 @@ explicit = true
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+# Ruff configuration
+[tool.ruff]
+# Line length limit
+line-length = 120
+# Target Python version
+target-version = "py310"
+# Excluded directories and files
+exclude = [
+  ".git",
+  "__pycache__",
+  ".venv",
+  "venv",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  "wandb",
+  "checkpoints",
+  "lmms-eval",
+  "*.egg-info",
+  "build",
+  "dist",
+]
+
+[tool.ruff.lint]
+# Enabled rule sets
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort (import sorting)
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "UP",  # pyupgrade
+  "ARG", # flake8-unused-arguments
+  "SIM", # flake8-simplify
+  "TCH", # flake8-type-checking
+  "PIE", # flake8-pie
+  "PT",  # flake8-pytest-style
+  "RET", # flake8-return
+  "RUF", # Ruff-specific rules
+]
+# Ignored rules
+ignore = [
+  "E501",   # Line length (handled by formatter)
+  "B008",   # Default arguments in function calls
+  "C901",   # Complexity
+  "ARG001", # Unused function arguments
+  "ARG002", # Unused method arguments
+  "ARG003", # Unused class method arguments
+  "ARG004", # Unused static method arguments
+  "ARG005", # Unused lambda arguments
+]
+
+[tool.ruff.lint.isort]
+# Use ruff's import sorting
+known-first-party = ["siq_vl"]
+force-sort-within-sections = true
+split-on-trailing-comma = true
+
+[tool.ruff.format]
+# Formatting options
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[dependency-groups]
+dev = ["ruff>=0.14.7"]

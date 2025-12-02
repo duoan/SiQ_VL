@@ -1,28 +1,26 @@
 import argparse
 import builtins
+from datetime import datetime
 import os
 import re
-from datetime import datetime
 
+from datasets import concatenate_datasets, load_dataset
+from publish_to_hub import publish_to_hub
 import torch
 import torch.distributed as dist
-from datasets import concatenate_datasets, load_dataset
 from transformers import (
     AutoImageProcessor,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
 )
+
 from siq_vl.callbacks import (
-    GenerationCallback,
-    MetricsCallback,
     SmartGPUCleanCallback,
 )
 from siq_vl.collator import SiQ_VLDataCollator
-from siq_vl.dataset import VQAIterableDataset
-from siq_vl.model import SiQ_VLModel
-from siq_vl.processing import SiQ_VLProcessor
-from publish_to_hub import publish_to_hub
+from siq_vl.dataset import VQADataset
+from siq_vl.model.processing import SiQ_VLProcessor
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -59,45 +57,46 @@ def extract_model_name(model_path: str) -> str:
 def extract_vision_config(model_path: str) -> tuple[int, int]:
     """
     Extract image_size and patch_size from vision model path.
-    
+
     Examples:
         "google/siglip2-so400m-patch16-512" -> (512, 16)
         "google/siglip2-so400m-patch14-224" -> (224, 14)
         "google/siglip-so400m-patch14-384" -> (384, 14)
-    
+
     Args:
         model_path: Full model path or name (e.g., "google/siglip2-so400m-patch16-512")
-    
+
     Returns:
         Tuple of (image_size, patch_size)
-    
+
     Raises:
         ValueError: If image_size or patch_size cannot be extracted from the model path or config.
     """
     model_name = model_path.lower()
-    
+
     # Extract patch size (e.g., patch14, patch16)
-    patch_match = re.search(r'patch(\d+)', model_name)
+    patch_match = re.search(r"patch(\d+)", model_name)
     patch_size = int(patch_match.group(1)) if patch_match else None
-    
+
     # Extract image size (usually at the end: -224, -384, -512)
     # Try to match pattern like -224, -384, -512 at the end
-    size_match = re.search(r'-(\d+)$', model_name)
+    size_match = re.search(r"-(\d+)$", model_name)
     image_size = int(size_match.group(1)) if size_match else None
-    
+
     # If we can't extract from name, try to get from config
     if patch_size is None or image_size is None:
         try:
             from transformers import AutoConfig
+
             config = AutoConfig.from_pretrained(model_path)
             if patch_size is None:
-                patch_size = getattr(config, 'patch_size', None)
+                patch_size = getattr(config, "patch_size", None)
             if image_size is None:
-                image_size = getattr(config, 'image_size', None)
+                image_size = getattr(config, "image_size", None)
         except Exception:
             # If config loading fails, we'll raise an error below
             pass
-    
+
     # Raise error if we still can't determine the values
     if patch_size is None:
         raise ValueError(
@@ -109,7 +108,7 @@ def extract_vision_config(model_path: str) -> tuple[int, int]:
             f"Cannot extract image_size from model path '{model_path}'. "
             f"Expected format: '...-<number>' at the end (e.g., '-224', '-384', '-512')"
         )
-    
+
     return image_size, patch_size
 
 
@@ -183,7 +182,7 @@ def setup_for_distributed(is_master):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SiQ_VL model")
-    
+
     # Dataset configuration
     parser.add_argument(
         "--data_path",
@@ -197,7 +196,7 @@ def parse_args():
         default="coco_colors,densefusion_1m,face_emotion,google_landmarks,laion_gpt4v,sharegpt4o,sharegpt4v(coco),sharegpt4v(llava),sharegpt4v(knowledge),sharegpt4v(sam)",
         help="Comma-separated list of dataset subsets",
     )
-    
+
     # Model configuration
     parser.add_argument(
         "--vision_model_name_or_path",
@@ -229,7 +228,7 @@ def parse_args():
         default=1,
         help="Pixel shuffle factor for the projector (default: 1, no shuffling).",
     )
-    
+
     # Output configuration
     parser.add_argument(
         "--output_dir",
@@ -240,7 +239,7 @@ def parse_args():
             "'{output_dir}/siq-vl_{vision_backbone}_{llm_backbone}/{stage}'."
         ),
     )
-    
+
     # Training hyperparameters
     parser.add_argument(
         "--per_device_train_batch_size",
@@ -287,7 +286,7 @@ def parse_args():
         default=1e-3,
         help="Learning rate",
     )
-    
+
     # Precision configuration
     parser.add_argument(
         "--bf16",
@@ -307,7 +306,7 @@ def parse_args():
         default=False,
         help="Use fp16 precision",
     )
-    
+
     # Logging and saving configuration
     parser.add_argument(
         "--logging_steps",
@@ -322,13 +321,19 @@ def parse_args():
         help="Number of steps between saving checkpoints",
     )
     parser.add_argument(
-        "--gen_eval_samples",
+        "--eval_steps",
+        type=int,
+        default=100,
+        help="Number of steps between evaluation",
+    )
+    parser.add_argument(
+        "--gen_samples",
         type=int,
         default=20,
         help="Number of fixed samples to use for generation evaluation (default: 20)",
     )
     parser.add_argument(
-        "--gen_eval_interval",
+        "--gen_steps",
         type=int,
         default=100,
         help="Evaluate generation every N steps (default: 100)",
@@ -380,14 +385,14 @@ def parse_args():
             "'siq_vl-{vision}__{llm}-{stage}' will be used."
         ),
     )
-    
+
     return parser.parse_args()
 
 
 def train(args=None):
     if args is None:
         args = parse_args()
-    
+
     # Initialize distributed training only if explicitly requested and environment is set up
     # (e.g., by accelerate launcher)
     if args.use_distributed:
@@ -459,7 +464,7 @@ def train(args=None):
 
     # Initialize our Custom Processor
     processor = SiQ_VLProcessor(
-        image_processor, 
+        image_processor,
         tokenizer,
         image_size=image_size,
         patch_size=patch_size,
@@ -473,21 +478,17 @@ def train(args=None):
     print(">>> Loading Model...")
     # Initialize our Custom Model using config
     # Option 1: Use config-based initialization (recommended)
-    from siq_vl.config import SiQ_VLConfig
-    
+    from siq_vl.model.configuration import SiQ_VLConfig
+    from siq_vl.model.modeling import SiQ_VLModel
+
     config = SiQ_VLConfig(
-        vision_model_path=vision_model_name_or_path,
-        llm_model_path=llm_model_name_or_path,
-        freeze_llm=args.freeze_llm,
-        pixel_shuffle_factor=args.pixel_shuffle_factor,
-        image_size=image_size,
-        patch_size=patch_size,
+        pretrained_vision_model_path=vision_model_name_or_path,
+        pretrained_language_model_path=llm_model_name_or_path,
+        freeze_language_model=args.freeze_llm,
+        vision_pixel_shuffle_factor=args.pixel_shuffle_factor,
     )
-    
-    model = SiQ_VLModel(
-        config=config,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-    )
+
+    model = SiQ_VLModel(config=config)
 
     # ----------------------------------------------------
     # Optionally load weights from the latest Stage 1 checkpoint
@@ -513,10 +514,7 @@ def train(args=None):
 
             # Otherwise, look for checkpoint-* subdirectories
             checkpoint_dirs = [
-                d
-                for d in os.listdir(path)
-                if d.startswith("checkpoint-")
-                and os.path.isdir(os.path.join(path, d))
+                d for d in os.listdir(path) if d.startswith("checkpoint-") and os.path.isdir(os.path.join(path, d))
             ]
             if not checkpoint_dirs:
                 return None
@@ -576,12 +574,32 @@ def train(args=None):
         all_raw_datasets.append(raw_dataset)
 
     # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets
-    train_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=0)
-    
+    concat_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=0)
+
     # Limit dataset size if specified (for quick testing / controlling total samples)
     if args.max_samples is not None:
         print(f">>> Limiting dataset to {args.max_samples} samples")
-        train_raw_dataset = train_raw_dataset.select(range(min(args.max_samples, len(train_raw_dataset))))
+        concat_raw_dataset = concat_raw_dataset.select(range(min(args.max_samples, len(concat_raw_dataset))))
+
+    splits = concat_raw_dataset.train_test_split(test_size=0.1)
+    train_raw_dataset = splits["train"]
+    eval_raw_dataset = splits["test"]
+
+    # Use VQADataset (standard Dataset) instead of VQAIterableDataset
+    # This allows Trainer's DataLoader to automatically use DistributedSampler
+    # No manual sharding needed!
+    print(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
+    train_dataset = VQADataset(train_raw_dataset)
+    eval_dataset = VQADataset(eval_raw_dataset)
+
+    print(">>> DEBUG: Train Dataset:", train_dataset)
+    print(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
+    print(">>> DEBUG: Eval Dataset:", eval_dataset)
+    print(f">>> DEBUG: Eval Dataset Length: {len(eval_dataset)}")
+    if len(train_dataset) > 0:
+        print(">>> DEBUG: Train Dataset Sample:", train_dataset[0])
+    if len(eval_dataset) > 0:
+        print(">>> DEBUG: Eval Dataset Sample:", eval_dataset[0])
 
     # ----------------------------------------------------
     # Auto-calculate max_steps from max_samples & global batch
@@ -593,7 +611,9 @@ def train(args=None):
         if global_batch_size <= 0:
             global_batch_size = 1
 
-        effective_samples = len(train_raw_dataset)
+        # Use the original concat_raw_dataset length for max_steps calculation
+        # (before sharding, so we get the total dataset size)
+        effective_samples = len(concat_raw_dataset)
         max_steps = (effective_samples + global_batch_size - 1) // global_batch_size
         print(
             f">>> Auto-calculated max_steps={max_steps} "
@@ -602,19 +622,8 @@ def train(args=None):
     else:
         print(f">>> Using user-specified max_steps={max_steps}")
 
-    if is_dist():
-        # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
-        train_raw_dataset = train_raw_dataset.shard(
-            num_shards=get_world_size(), index=get_rank()
-        )
-
-    # Wrap with our Lazy Dataset (Handles filtering and turn sampling)
-    train_dataset = VQAIterableDataset(
-        train_raw_dataset, processor, return_raw_data=True
-    )
-
     # Initialize Collator
-    data_collator = SiQ_VLDataCollator(tokenizer=tokenizer)
+    data_collator = SiQ_VLDataCollator(processor=processor, return_raw_data=True)
 
     # ====================================================
     # 4. Training Arguments
@@ -626,12 +635,12 @@ def train(args=None):
         output_dir=OUTPUT_DIR,
     )
     print(f">>> Generated run name: {run_name}")
-    
+
     # Explicitly set wandb project name via environment variable
     # This ensures wandb uses the correct project name when initialized by Trainer
     os.environ["WANDB_PROJECT"] = "siq-vl"
     print(">>> Setting WANDB_PROJECT to: siq-vl")
-    
+
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         run_name=run_name,
@@ -639,6 +648,9 @@ def train(args=None):
         per_device_train_batch_size=per_device_train_batch_size,  # Adjust based on VRAM (4-8 for 24GB)
         gradient_accumulation_steps=gradient_accumulation_steps,  # Effective batch size = 8 * 4 = 32
         dataloader_num_workers=args.dataloader_num_workers,
+        # --- Evaluation ---
+        eval_strategy="steps",
+        eval_steps=args.eval_steps,
         # --- Learning Rate ---
         # Project alignment using 1e-3
         # Recommendation for full finetuning: 1e-5 to 2e-5
@@ -683,29 +695,30 @@ def train(args=None):
     # ====================================================
     # Initialize generation callback for periodic evaluation
     # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
-    generation_callback = GenerationCallback(
-        processor=processor,
-        eval_dataset=train_raw_dataset,  # sample visual QA examples from the raw HF dataset
-        eval_samples=None,  # or pass a fixed list if you want fully deterministic samples
-        num_samples=args.gen_eval_samples,
-        eval_interval=args.gen_eval_interval,
-        max_new_tokens=args.gen_max_new_tokens,
-        temperature=args.gen_temperature,
-        do_sample=True,
-        num_beams=args.gen_num_beams,
-    )
-    
+    # generation_callback = GenerationCallback(
+    #     processor=processor,
+    #     eval_dataloader=eval_dataloader,
+    #     num_samples=args.gen_samples,
+    #     eval_interval=args.gen_steps,
+    #     max_new_tokens=args.gen_max_new_tokens,
+    #     temperature=args.gen_temperature,
+    #     do_sample=True,
+    #     num_beams=args.gen_num_beams,
+    # )
+
+    callbacks = []
+
+    if torch.cuda.is_available():
+        callbacks.append(SmartGPUCleanCallback())
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         processing_class=processor,
-        callbacks=[
-            MetricsCallback(),
-            SmartGPUCleanCallback(),
-            generation_callback,
-        ],
+        callbacks=callbacks,
     )
 
     print(">>> DEBUG: Checking Labels...")
@@ -714,13 +727,11 @@ def train(args=None):
     labels = batch["labels"][0]
     for i in range(len(input_ids)):
         if labels[i] != -100:
-            print(
-                f"Token: {tokenizer.decode([input_ids[i]])} | Label: {labels[i].item()}"
-            )
+            print(f"Token: {tokenizer.decode([input_ids[i]])} | Label: {labels[i].item()}")
     print("input_ids:\n", input_ids, "\n")
     print("labels:\n", [label.item() for label in labels], "\n")
-    print("Question:\n", batch["question"][0], "\n")
-    print("Answer:\n", batch["answer"][0], "\n")
+    print("Question:\n", batch["questions"][0], "\n")
+    print("Answer:\n", batch["answers"][0], "\n")
 
     print(">>> Start Training...")
     trainer.train()

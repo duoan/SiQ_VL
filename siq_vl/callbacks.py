@@ -2,11 +2,9 @@ import gc
 import hashlib
 import math
 import time
-from typing import Dict, List, Optional
 
-import torch
-import wandb
 from PIL import Image
+import torch
 from transformers import (
     TrainerCallback,
     TrainerControl,
@@ -14,6 +12,7 @@ from transformers import (
     TrainingArguments,
 )
 
+import wandb
 
 
 def clean_cuda_memory():
@@ -36,9 +35,7 @@ def check_cuda_memory_and_clean(force: bool = False, verbose: bool = False):
         memory_cached = memory_reserved - memory_allocated
         usage_ratio = memory_allocated / total_memory
         reserved_ratio = memory_reserved / total_memory
-        cache_efficiency = (
-            memory_allocated / memory_reserved if memory_reserved > 0 else 1.0
-        )
+        cache_efficiency = memory_allocated / memory_reserved if memory_reserved > 0 else 1.0
 
         if verbose:
             print(
@@ -62,10 +59,7 @@ def check_cuda_memory_and_clean(force: bool = False, verbose: bool = False):
 
         elif reserved_ratio > 0.5 and cache_efficiency < 0.6:
             should_clean = True
-            reason = (
-                f"Fragmentation detected: eff={cache_efficiency * 100:.1f}%, "
-                f"reserved={reserved_ratio * 100:.1f}%"
-            )
+            reason = f"Fragmentation detected: eff={cache_efficiency * 100:.1f}%, reserved={reserved_ratio * 100:.1f}%"
 
         elif memory_cached < 0.5 < usage_ratio and cache_efficiency > 0.95:
             should_clean = True
@@ -179,9 +173,9 @@ class GenerationCallback(TrainerCallback):
 
     def __init__(
         self,
-        processor,
+        processor=None,
         eval_dataset=None,
-        eval_samples: Optional[List[Dict]] = None,
+        eval_samples: list[dict] | None = None,
         num_samples: int = 20,
         eval_interval: int = 100,
         max_new_tokens: int = 256,
@@ -191,10 +185,12 @@ class GenerationCallback(TrainerCallback):
     ):
         """
         Args:
-            processor: Processor used for text/image preprocessing.
-            eval_dataset: Dataset to sample evaluation examples from (e.g. HF dataset).
+            processor: SiQ_VLProcessor instance for processing inputs. If None, will try to get from Trainer.
+            eval_dataset: Dataset to sample evaluation examples from. Should support __len__ and __getitem__.
                          If None and eval_samples is also None, generation is skipped.
-            eval_samples: Fixed list of samples to evaluate on. If None, will sample from eval_dataset.
+            eval_samples: Fixed list of samples to evaluate on. Each sample should be a dict with:
+                         {"image": PIL.Image, "question": str, "answer": str}
+                         If None, will sample from eval_dataset.
             num_samples: Number of samples to use if eval_samples is None (default: 20)
             eval_interval: Evaluate every N steps (default: 100)
             max_new_tokens: Maximum number of tokens to generate (default: 256)
@@ -213,87 +209,159 @@ class GenerationCallback(TrainerCallback):
         self.num_beams = num_beams
 
         # Cache for wandb images to avoid re-uploading
-        self.image_cache: Dict[str, wandb.Image] = {}
+        self.image_cache: dict[str, wandb.Image] = {}
 
     def _get_image_hash(self, image: Image.Image) -> str:
         """Generate a hash for an image to use as cache key."""
         # Convert PIL image to bytes for hashing
         import io
+
         img_bytes = io.BytesIO()
-        image.save(img_bytes, format='PNG')
+        image.save(img_bytes, format="PNG")
         img_bytes.seek(0)
         return hashlib.md5(img_bytes.read()).hexdigest()
-    
+
     def _get_wandb_image(self, image: Image.Image) -> wandb.Image:
         """Get or create a wandb.Image, reusing cached version if available."""
         img_hash = self._get_image_hash(image)
         if img_hash not in self.image_cache:
             self.image_cache[img_hash] = wandb.Image(image)
         return self.image_cache[img_hash]
-    
-    def _sample_from_dataset(self, dataset, num_samples: int) -> List[Dict]:
+
+    def _sample_from_dataset(self, dataset, num_samples: int) -> list[dict]:
         """Sample fixed examples from the dataset."""
         samples = []
         # Use a fixed seed to get the same samples every time
         import random
+
         random.seed(42)
-        indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
-        
+
+        # Get dataset length
+        try:
+            dataset_len = len(dataset)
+        except (TypeError, AttributeError):
+            print(">>> [GenerationCallback] Warning: Dataset does not support len(), cannot sample.")
+            return []
+
+        if dataset_len == 0:
+            print(">>> [GenerationCallback] Warning: Dataset is empty.")
+            return []
+
+        indices = random.sample(range(dataset_len), min(num_samples, dataset_len))
+
         for idx in indices:
-            item = dataset[idx]
+            try:
+                item = dataset[idx]
+            except Exception as e:
+                print(f">>> [GenerationCallback] Warning: Failed to get item {idx} from dataset: {e}")
+                continue
+
             # Extract image, question, and answer
-            image = item.get("images", [None])[0] if "images" in item else None
+            # Handle different dataset formats
+            image = None
+            question = None
+            answer = None
+
+            # Try to get image from different possible keys
+            if "images" in item:
+                images = item["images"]
+                if isinstance(images, list) and len(images) > 0:
+                    image = images[0]
+                elif not isinstance(images, list):
+                    image = images
+            elif "image" in item:
+                image = item["image"]
+
             if image is None:
                 continue
-                
-            # Handle different dataset formats
+
+            # Handle different text formats
             if "texts" in item and len(item["texts"]) > 0:
-                # Multi-turn format
+                # Multi-turn format (like VQAIterableDataset's underlying format)
                 turn = item["texts"][0]
                 question = turn.get("user", "")
                 answer = turn.get("assistant", "")
             elif "question" in item and "answer" in item:
-                # Simple Q&A format
+                # Simple Q&A format (like VQAIterableDataset's yielded format)
                 question = item["question"]
                 answer = item["answer"]
             else:
+                # Try to find question/answer in other possible keys
+                question = item.get("question") or item.get("q") or item.get("prompt")
+                answer = item.get("answer") or item.get("a") or item.get("response")
+
+            if question is None:
                 continue
-                
-            samples.append({
-                "image": image,
-                "question": question,
-                "answer": answer,
-            })
-        
+
+            samples.append(
+                {
+                    "image": image,
+                    "question": question,
+                    "answer": answer or "",
+                }
+            )
+
         return samples
-    
-    def _generate_answer_simple(
+
+    def _generate_answer_batch(
         self,
         model,
         processor,
-        image: Image.Image,
-        question: str,
+        samples: list[tuple[Image.Image, str]],
         device: torch.device,
-    ) -> str:
-        """Generate answer using the model's generate_answer method."""
-        # If model is wrapped with DDP, unwrap it for generation to avoid hook conflicts
-        # This is safe because generation uses no_grad() and doesn't compute gradients
-        if hasattr(model, 'module'):
-            # Model is wrapped with DDP or other wrapper
-            unwrapped_model = model.module
-        else:
-            unwrapped_model = model
-        
-        return unwrapped_model.generate_answer(
-            processor=processor,
-            samples=(image, question),
-            max_new_tokens=self.max_new_tokens,
-            temperature=self.temperature,
-            do_sample=self.do_sample,
-            num_beams=self.num_beams,
-            device=device,
+    ) -> list[str]:
+        """
+        Generate answers for a batch of samples using the model's generate method.
+
+        Args:
+            model: The model to use for generation
+            processor: The processor to use for tokenization
+            samples: List of (image, question) tuples
+            device: Device to run generation on
+
+        Returns:
+            List of generated answer strings
+        """
+        if not samples:
+            return []
+
+        # Process batch: (image, question, None) for generation mode
+        batch = [(image, question, None) for image, question in samples]
+        inputs = processor(
+            batch=batch,
+            return_tensors="pt",
         )
-    
+
+        # Move inputs to device
+        input_ids = inputs["input_ids"].to(device)
+        pixel_values = inputs["pixel_values"].to(device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        # Generate for entire batch
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature if self.do_sample else None,
+                do_sample=self.do_sample,
+                num_beams=self.num_beams if not self.do_sample else 1,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id,
+            )
+
+        # Decode all generated sequences (assistant responses only)
+        generated_texts = processor.batch_decode(
+            output_ids,
+            assistant_only=True,
+            skip_special_tokens=True,
+        )
+
+        return [text.strip() for text in generated_texts]
+
     def _is_rank0(self, args: TrainingArguments) -> bool:
         """Check if current process is rank 0 (main process)."""
         # If distributed training is not initialized, we're on rank 0
@@ -301,7 +369,7 @@ class GenerationCallback(TrainerCallback):
             return True
         # In distributed training, check local_rank
         return args.local_rank == 0
-    
+
     def on_train_begin(
         self,
         args: TrainingArguments,
@@ -314,10 +382,10 @@ class GenerationCallback(TrainerCallback):
         # Only run on main process (rank 0)
         if not self._is_rank0(args):
             return
-        
+
         # Run generation at step 0
         self._run_generation(args, state, model=model, **kwargs)
-    
+
     def on_train_end(
         self,
         args: TrainingArguments,
@@ -330,15 +398,15 @@ class GenerationCallback(TrainerCallback):
         # Only run on main process (rank 0)
         if not self._is_rank0(args):
             return
-        
+
         # Skip if the final step is already covered by eval_interval
         # (e.g., if eval_interval=200 and final step=1000, on_log already ran at step 1000)
         if state.global_step > 0 and state.global_step % self.eval_interval == 0:
             return
-        
+
         # Run generation at final step (only if not already done by on_log)
         self._run_generation(args, state, model=model, **kwargs)
-    
+
     def on_log(
         self,
         args: TrainingArguments,
@@ -351,18 +419,18 @@ class GenerationCallback(TrainerCallback):
         # Only run on main process (rank 0)
         if not self._is_rank0(args):
             return
-        
+
         # Check if we should evaluate at this step
         # Skip step 0 (handled in on_train_begin)
         if state.global_step == 0:
             return
-        
+
         # Check if we should evaluate at this step based on interval
         if state.global_step % self.eval_interval != 0:
             return
-        
+
         self._run_generation(args, state, model=model, **kwargs)
-    
+
     def _run_generation(
         self,
         args: TrainingArguments,
@@ -371,24 +439,39 @@ class GenerationCallback(TrainerCallback):
         **kwargs,
     ):
         """Internal method to run generation and log to wandb."""
-        
+
         # Skip if wandb is not initialized
         if not wandb.run:
             return
-        
+
         # Get model from kwargs if not provided
         if model is None:
             model = kwargs.get("model")
-        
+
         if model is None:
             print(">>> [GenerationCallback] Warning: Model not found, skipping generation.")
             return
-        
-        print(f">>> [GenerationCallback] Generating predictions at step {state.global_step}...")
-        
-        try:
-            processor = self.processor
 
+        # Get processor - try from self first, then from Trainer
+        processor = self.processor
+        if processor is None:
+            trainer = kwargs.get("trainer")
+            if trainer is not None and hasattr(trainer, "processing_class"):
+                processor = trainer.processing_class
+            elif (
+                trainer is not None
+                and hasattr(trainer, "data_collator")
+                and hasattr(trainer.data_collator, "processor")
+            ):
+                processor = trainer.data_collator.processor
+
+        if processor is None:
+            print(">>> [GenerationCallback] Warning: Processor not found, skipping generation.")
+            return
+
+        print(f">>> [GenerationCallback] Generating predictions at step {state.global_step}...")
+
+        try:
             # Decide where to get eval samples from
             eval_samples = self.eval_samples
 
@@ -396,93 +479,124 @@ class GenerationCallback(TrainerCallback):
             if eval_samples is None:
                 eval_dataset = self.eval_dataset
                 if eval_dataset is None:
+                    # Try to get from Trainer
+                    trainer = kwargs.get("trainer")
+                    if trainer is not None and hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
+                        eval_dataset = trainer.eval_dataset
+                        # If it's an IterableDataset, try to get the underlying dataset
+                        if hasattr(eval_dataset, "dataset"):
+                            eval_dataset = eval_dataset.dataset
+
+                if eval_dataset is None:
                     print(">>> [GenerationCallback] Warning: No eval_dataset or eval_samples; skipping generation.")
                     return
 
-            if eval_samples is None:
                 # Try to sample from eval_dataset (supports HF Dataset with __len__/__getitem__)
                 try:
                     if hasattr(eval_dataset, "__getitem__") and hasattr(eval_dataset, "__len__"):
-                        eval_samples = self._sample_from_dataset(
-                            eval_dataset, self.num_samples
-                        )
+                        eval_samples = self._sample_from_dataset(eval_dataset, self.num_samples)
                     else:
                         print(">>> [GenerationCallback] Warning: eval_dataset is not indexable; skipping generation.")
                         return
                 except Exception as e:
                     print(f">>> [GenerationCallback] Error sampling eval_dataset: {e}")
                     import traceback
+
                     traceback.print_exc()
                     return
-            
+
             if not eval_samples:
                 print(">>> [GenerationCallback] Warning: No eval samples found.")
                 return
-            
+
             # Get device and unwrap model - use unwrapped model to avoid DDP issues
             # CRITICAL: Unwrap DDP model to prevent hook conflicts during generation
-            if hasattr(model, 'module'):
-                unwrapped_model = model.module
-            else:
-                unwrapped_model = model
+            unwrapped_model = model.module if hasattr(model, "module") else model
             device = next(unwrapped_model.parameters()).device
-            
+
             # Generate predictions
             # CRITICAL: Ensure we're in eval mode and using no_grad context
             # to prevent interference with DDP hooks during training
             original_training = unwrapped_model.training
-            
+
             try:
                 unwrapped_model.eval()
-                table_data = []
+                # Prepare all samples for batch processing
+                from siq_vl.dataset import _to_pil_rgb
+
+                batch_samples = []
+                sample_metadata = []
                 for i, sample in enumerate(eval_samples):
                     try:
-                        # Convert image to PIL if needed
-                        from siq_vl.dataset import _to_pil_rgb
                         image = _to_pil_rgb(sample["image"])
                         question = sample["question"]
-                        ground_truth = sample["answer"]
-                        
-                        # Generate answer with explicit no_grad to prevent gradient computation
-                        with torch.no_grad():
-                            generated = self._generate_answer_simple(
-                                unwrapped_model, processor, image, question, device
-                            )
-                        
-                        # Get wandb image (reused if already uploaded)
-                        wandb_img = self._get_wandb_image(image)
-                        
-                        table_data.append([
-                            wandb_img,
-                            question,
-                            ground_truth,
-                            generated,
-                        ])
-                        
-                        if (i + 1) % 5 == 0:
-                            print(f">>> [GenerationCallback] Generated {i + 1}/{len(eval_samples)} samples...")
-                            
+                        ground_truth = sample.get("answer", "")
+
+                        batch_samples.append((image, question))
+                        sample_metadata.append(
+                            {
+                                "image": image,
+                                "question": question,
+                                "ground_truth": ground_truth,
+                                "index": i,
+                            }
+                        )
                     except Exception as e:
-                        print(f">>> [GenerationCallback] Error generating for sample {i}: {e}")
+                        print(f">>> [GenerationCallback] Error preparing sample {i}: {e}")
                         continue
+
+                if not batch_samples:
+                    print(">>> [GenerationCallback] Warning: No valid samples to generate.")
+                    return
+
+                print(f">>> [GenerationCallback] Generating answers for {len(batch_samples)} samples in batch...")
+
+                # Generate answers for entire batch
+                try:
+                    generated_texts = self._generate_answer_batch(unwrapped_model, processor, batch_samples, device)
+                except Exception as e:
+                    print(f">>> [GenerationCallback] Error during batch generation: {e}")
+                    import traceback
+
+                    traceback.print_exc()
+                    return
+
+                # Build table data from batch results
+                table_data = []
+                for metadata, generated in zip(sample_metadata, generated_texts, strict=False):
+                    # Get wandb image (reused if already uploaded)
+                    wandb_img = self._get_wandb_image(metadata["image"])
+
+                    table_data.append(
+                        [
+                            wandb_img,
+                            metadata["question"],
+                            metadata["ground_truth"],
+                            generated,
+                        ]
+                    )
             finally:
                 # Restore original training mode
                 unwrapped_model.train(original_training)
-            
+
             # Create wandb table
             table = wandb.Table(
                 columns=["Image", "Question", "Ground Truth", "Generated Answer"],
                 data=table_data,
             )
-            
+
             # Log to wandb
-            wandb.log({
-                f"generation_samples/step_{state.global_step}": table,
-            }, step=state.global_step)
-            
+            wandb.log(
+                {
+                    f"generation_samples/step_{state.global_step}": table,
+                },
+                step=state.global_step,
+            )
+
             print(f">>> [GenerationCallback] Logged {len(table_data)} samples to wandb.")
-            
+
         except Exception as e:
             print(f">>> [GenerationCallback] Error during generation: {e}")
             import traceback
+
             traceback.print_exc()

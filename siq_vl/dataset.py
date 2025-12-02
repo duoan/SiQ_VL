@@ -1,13 +1,12 @@
-import os
-from typing import Iterator, Union
+from collections.abc import Iterator
 
 import numpy as np
-import torch
 from PIL import Image
-from torch.utils.data import IterableDataset, get_worker_info
+import torch
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 
-def _to_pil_rgb(image: Union[str, Image.Image]) -> Image.Image:
+def _to_pil_rgb(image: str | Image.Image) -> Image.Image:
     """
     Normalize any image-like input into a valid 3-channel RGB PIL.Image.
 
@@ -74,139 +73,58 @@ def _to_pil_rgb(image: Union[str, Image.Image]) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
+class VQADataset(Dataset):
+    """
+    Standard Dataset that expands multi-turn conversations into individual samples.
+    Supports DistributedSampler automatically via Trainer's DataLoader.
+    """
+
+    def __init__(self, hf_dataset):
+        """
+        hf_dataset: HuggingFace dataset object
+        """
+        self.dataset = hf_dataset
+        # Pre-expand all samples: build a list of (item_idx, turn_idx) pairs
+        self.samples = []
+        for item_idx in range(len(hf_dataset)):
+            item = hf_dataset[item_idx]
+            num_turns = len(item.get("texts", []))
+            for turn_idx in range(num_turns):
+                self.samples.append((item_idx, turn_idx))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item_idx, turn_idx = self.samples[idx]
+        item = self.dataset[item_idx]
+        image = _to_pil_rgb(item["images"][0])
+        turn = item["texts"][turn_idx]
+        q = turn["user"]
+        a = turn["assistant"]
+
+        return {
+            "image": image,
+            "question": q,
+            "answer": a,
+        }
+
+
 class VQAIterableDataset(IterableDataset):
+    """
+    IterableDataset version (for backward compatibility).
+    Note: This does NOT support DistributedSampler automatically.
+    You need to manually shard the dataset before creating this.
+    """
+
     def __init__(
         self,
         hf_dataset,
-        processor,
-        *,
-        return_raw_data=False,
-        max_length=1024,
-        cache_dir=None,
     ):
         """
         hf_dataset: HuggingFace dataset object
-        processor: Qwen-VL or LLaVA processor
-        max_length: model context
-        cache_dir: store pixel_values + input_ids once per image/turn
         """
         self.dataset = hf_dataset
-        self.processor = processor
-        self.return_raw_data = return_raw_data
-        self.max_length = max_length
-        self.cache_dir = cache_dir
-        self.ignore_index = -100
-
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-            self.pixel_cache = os.path.join(cache_dir, "pixels")
-            self.text_cache = os.path.join(cache_dir, "text")
-            os.makedirs(self.pixel_cache, exist_ok=True)
-            os.makedirs(self.text_cache, exist_ok=True)
-
-        # tokenizer ids
-        # https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/tokenizer_config.json
-        tok = processor.tokenizer
-        self.im_start = tok.convert_tokens_to_ids("<|im_start|>")
-        self.im_end = tok.convert_tokens_to_ids("<|im_end|>")
-        self.assistant_id = tok.encode("assistant", add_special_tokens=False)[0]
-        self.image_token_id = tok.convert_tokens_to_ids("<|image_pad|>")
-
-    def _load_or_process_image(self, idx, image):
-        """pixel cache per image"""
-        if not self.cache_dir:
-            return self.processor(images=image, return_tensors="pt")["pixel_values"][0]
-
-        path = f"{self.pixel_cache}/{idx}.pt"
-        if os.path.exists(path):
-            return torch.load(path)
-
-        pixel = self.processor(images=image, return_tensors="pt")["pixel_values"][0]
-        torch.save(pixel.cpu(), path)
-        return pixel
-
-    def _load_or_process_turn(self, idx, t_idx, q, a):
-        """token cache per text turn"""
-        if not self.cache_dir:
-            msgs = [
-                {
-                    "role": "user",
-                    "content": [{"type": "image"}, {"type": "text", "text": q}],
-                },
-                {"role": "assistant", "content": a},
-            ]
-            enc = self.processor(
-                text=msgs,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.max_length,
-            )
-            return enc.input_ids[0]
-
-        path = f"{self.text_cache}/{idx}_{t_idx}.pt"
-        if os.path.exists(path):
-            return torch.load(path)
-
-        msgs = [
-            {
-                "role": "user",
-                "content": [{"type": "image"}, {"type": "text", "text": q}],
-            },
-            {"role": "assistant", "content": a},
-        ]
-        enc = self.processor(
-            text=msgs, return_tensors="pt", truncation=True, max_length=self.max_length
-        )
-        input_ids = enc.input_ids[0]
-        torch.save(input_ids.cpu(), path)
-        return input_ids
-
-    def _mask_labels(self, input_ids):
-        """
-        Mask all tokens except the assistant's response.
-
-        Sequence structure:
-        <|im_start|>assistant\nThe image depicts...<|im_end|>
-
-        We want to predict only: "The image depicts...", not the formatting tokens.
-        """
-        labels = torch.ones_like(input_ids) * self.ignore_index
-        ids = input_ids.tolist()
-
-        try:
-            for i, x in enumerate(ids):
-                # Find: <|im_start|> followed by assistant token
-                if (
-                    x == self.im_start
-                    and i + 1 < len(ids)
-                    and ids[i + 1] == self.assistant_id
-                ):
-                    # Position breakdown:
-                    # i     : <|im_start|> (151644)
-                    # i+1   : assistant (77091)
-                    # i+2   : \n (198) ← Skip this!
-                    # i+3   : Start of actual answer
-
-                    # Start labeling from i+3 (after <|im_start|>, assistant, and \n)
-                    s = i + 3
-
-                    # Find the end marker
-                    try:
-                        e = ids.index(self.im_end, s)
-                    except ValueError:
-                        e = len(ids)
-
-                    # Set labels for the actual answer content
-                    labels[s:e] = input_ids[s:e]
-                    break
-        except Exception as ex:
-            # If something goes wrong, keep all labels as ignore_index
-            print(f"Warning: Failed to mask labels: {ex}")
-            pass
-
-        # Also mask image tokens (they should never be predicted)
-        labels[input_ids == self.image_token_id] = self.ignore_index
-        return labels
 
     def __iter__(self) -> Iterator:
         worker = get_worker_info()
@@ -220,25 +138,13 @@ class VQAIterableDataset(IterableDataset):
         for i in range(start, len(self.dataset), step):
             item = self.dataset[i]
             image = _to_pil_rgb(item["images"][0])
-            pixel = self._load_or_process_image(i, image)
 
-            for t_idx, turn in enumerate(item["texts"]):
+            for turn in item["texts"]:
                 q = turn["user"]
                 a = turn["assistant"]
 
-                input_ids = self._load_or_process_turn(i, t_idx, q, a)
-                input_ids = input_ids.clone()
-                labels = self._mask_labels(input_ids)
-                out = {
-                    "input_ids": input_ids,
-                    "labels": labels,
-                    "pixel_values": pixel,
+                yield {
+                    "image": image,
+                    "question": q,
+                    "answer": a,
                 }
-                if self.return_raw_data:
-                    yield {
-                        **out,
-                        "question": q,
-                        "answer": a,
-                    }
-                else:
-                    yield out

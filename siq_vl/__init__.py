@@ -1,7 +1,7 @@
 from siq_vl.collator import SiQ_VLDataCollator
-from siq_vl.config import SiQ_VLConfig
-from siq_vl.model import SiQ_VLModel
-from siq_vl.processing import SiQ_VLProcessor
+from siq_vl.model.configuration import SiQ_VLConfig
+from siq_vl.model.modeling import SiQ_VLModel
+from siq_vl.model.processing import SiQ_VLProcessor
 
 __all__ = [
     "SiQ_VLConfig",

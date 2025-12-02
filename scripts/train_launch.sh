@@ -136,6 +136,8 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--fp16"     # Use fp16 if available
             "--logging_steps" "2"
             "--save_steps" "10"
+            "--gen_steps" "10"
+            "--eval_steps" "10"
             "--no_distributed"
         )
     else
@@ -156,6 +158,8 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--fp16"     # Use fp16 if available
             "--logging_steps" "2"
             "--save_steps" "10"
+            "--gen_steps" "10"
+            "--eval_steps" "10"
             "--no_distributed"
         )
     fi
@@ -181,7 +185,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "10"
             "--save_steps" "500"
-            "--gen_eval_interval" "200"
+            "--gen_steps" "200"
             "--push_to_hub"
         )
     else
@@ -200,7 +204,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "20"
             "--save_steps" "1000"
-            "--gen_eval_interval" "1000"
+            "--gen_steps" "1000"
             "--push_to_hub"
         )
     fi
