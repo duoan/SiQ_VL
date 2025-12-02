@@ -697,7 +697,8 @@ def train(args=None):
         # --- Evaluation ---
         eval_strategy="steps",
         eval_steps=args.eval_steps,
-        per_device_eval_batch_size=per_device_train_batch_size,  # Use same batch size for eval
+        # Use same batch size for eval as for training
+        per_device_eval_batch_size=per_device_train_batch_size * gradient_accumulation_steps,
         eval_accumulation_steps=1,  # Accumulate eval results in one go
         # Note: max_eval_samples is handled when creating eval_dataset above
         # --- Learning Rate ---

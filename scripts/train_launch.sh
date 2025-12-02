@@ -184,8 +184,9 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--learning_rate" "1e-3"
             "--bf16"
             "--logging_steps" "10"
-            "--save_steps" "500"
-            "--gen_steps" "200"
+            "--save_steps" "100"
+            "--eval_steps" "100"
+            "--gen_steps" "100"
             "--push_to_hub"
         )
     else
