@@ -162,8 +162,6 @@ class MetricsCallback(TrainerCallback):
         self.start_time = time.time()
         self.total_tokens = 0
 
-        self.perplexity_score = Perplexity()
-
     def on_log(
         self,
         args: TrainingArguments,
@@ -719,8 +717,7 @@ class GenerationCallback(TrainerCallback):
 
                 # Note: We don't delete the metric instances anymore since they're cached for reuse
                 gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                check_cuda_memory_and_clean(force=True, verbose=True)
 
                 rank_zero_info(f">>> [GenerationCallback] Generated metrics: {generated_metrics}")
 
