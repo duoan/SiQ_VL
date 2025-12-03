@@ -138,6 +138,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--save_steps" "10"
             "--gen_steps" "10"
             "--eval_steps" "10"
+            "--max_eval_samples" "100"
             "--no_distributed"
         )
     else
@@ -160,6 +161,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--save_steps" "10"
             "--gen_steps" "10"
             "--eval_steps" "10"
+            "--max_eval_samples" "100"
             "--no_distributed"
         )
     fi
@@ -186,6 +188,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--logging_steps" "10"
             "--save_steps" "100"
             "--eval_steps" "100"
+            "--max_eval_samples" "1024"
             "--gen_steps" "100"
             "--push_to_hub"
         )

@@ -351,7 +351,7 @@ def parse_args():
     parser.add_argument(
         "--max_eval_samples",
         type=int,
-        default=None,
+        default=2,
         help="Maximum number of samples to use for evaluation (None = use all). "
         "Set this to limit eval time if eval dataset is large.",
     )
@@ -620,7 +620,7 @@ def train(args=None):
         print(f">>> Limiting dataset to {args.max_samples} samples")
         concat_raw_dataset = concat_raw_dataset.select(range(min(args.max_samples, len(concat_raw_dataset))))
 
-    splits = concat_raw_dataset.train_test_split(test_size=0.1, shuffle=True)
+    splits = concat_raw_dataset.train_test_split(test_size=args.max_eval_samples, shuffle=True)
     train_raw_dataset = splits["train"]
     eval_raw_dataset = splits["test"]
 
@@ -629,14 +629,7 @@ def train(args=None):
     # No manual sharding needed!
     print(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
     train_dataset = VQADataset(train_raw_dataset)
-    eval_raw_dataset_for_trainer = eval_raw_dataset
-
-    # Limit eval samples if specified to avoid long eval times
-    if args.max_eval_samples is not None and len(eval_raw_dataset) > args.max_eval_samples:
-        print(f">>> Limiting eval dataset to {args.max_eval_samples} samples (from {len(eval_raw_dataset)})")
-        eval_raw_dataset_for_trainer = eval_raw_dataset.select(range(args.max_eval_samples))
-
-    eval_dataset = VQADataset(eval_raw_dataset_for_trainer)
+    eval_dataset = VQADataset(eval_raw_dataset)
 
     print(">>> DEBUG: Train Dataset:", train_dataset)
     print(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
