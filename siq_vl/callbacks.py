@@ -1,10 +1,20 @@
+from contextlib import redirect_stderr, redirect_stdout
 import gc
 import hashlib
+from io import StringIO
+import logging
 import math
+import os
 import time
+import warnings
 
 from PIL import Image
 import torch
+from torchmetrics.multimodal.clip_score import CLIPScore
+from torchmetrics.text.bert import BERTScore
+from torchmetrics.text.rouge import ROUGEScore
+from torchmetrics.utilities.prints import rank_zero_info
+import torchvision.transforms.functional as TF
 from transformers import (
     TrainerCallback,
     TrainerControl,
@@ -13,6 +23,16 @@ from transformers import (
 )
 
 import wandb
+
+# Suppress warnings from transformers/accelerate about model sharding
+warnings.filterwarnings("ignore", message=".*not sharded.*")
+warnings.filterwarnings("ignore", category=UserWarning)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+logging.getLogger("accelerate").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+# Suppress accelerate warnings about sharding (these are printed, not logged)
+os.environ["ACCELERATE_LOG_LEVEL"] = "ERROR"
 
 
 def clean_cuda_memory():
@@ -142,6 +162,8 @@ class MetricsCallback(TrainerCallback):
         self.start_time = time.time()
         self.total_tokens = 0
 
+        self.perplexity_score = Perplexity()
+
     def on_log(
         self,
         args: TrainingArguments,
@@ -211,6 +233,11 @@ class GenerationCallback(TrainerCallback):
         # Cache for wandb images to avoid re-uploading
         self.image_cache: dict[str, wandb.Image] = {}
 
+        # Lazy-loaded metric instances (created on first use)
+        self._bert_score: BERTScore | None = None
+        self._clip_score: CLIPScore | None = None
+        self._rouge_score: ROUGEScore | None = None
+
     def _get_image_hash(self, image: Image.Image) -> str:
         """Generate a hash for an image to use as cache key."""
         # Convert PIL image to bytes for hashing
@@ -228,6 +255,39 @@ class GenerationCallback(TrainerCallback):
             self.image_cache[img_hash] = wandb.Image(image)
         return self.image_cache[img_hash]
 
+    def _get_bert_score(self) -> BERTScore:
+        """Get or create BERTScore instance (lazy loading)."""
+        if self._bert_score is None:
+            # Suppress warnings and print statements during model loading
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                # Redirect stdout/stderr to suppress print statements from accelerate
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self._bert_score = BERTScore(rescale_with_baseline=True)
+        return self._bert_score
+
+    def _get_clip_score(self) -> CLIPScore:
+        """Get or create CLIPScore instance (lazy loading)."""
+        if self._clip_score is None:
+            # Suppress warnings and print statements during model loading
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                # Redirect stdout/stderr to suppress print statements from accelerate
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self._clip_score = CLIPScore()
+        return self._clip_score
+
+    def _get_rouge_score(self) -> ROUGEScore:
+        """Get or create ROUGEScore instance (lazy loading)."""
+        if self._rouge_score is None:
+            # Suppress warnings and print statements during model loading
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                # Redirect stdout/stderr to suppress print statements from accelerate
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self._rouge_score = ROUGEScore()
+        return self._rouge_score
+
     def _sample_from_dataset(self, dataset, num_samples: int) -> list[dict]:
         """Sample fixed examples from the dataset."""
         samples = []
@@ -240,11 +300,11 @@ class GenerationCallback(TrainerCallback):
         try:
             dataset_len = len(dataset)
         except (TypeError, AttributeError):
-            print(">>> [GenerationCallback] Warning: Dataset does not support len(), cannot sample.")
+            rank_zero_info(">>> [GenerationCallback] Warning: Dataset does not support len(), cannot sample.")
             return []
 
         if dataset_len == 0:
-            print(">>> [GenerationCallback] Warning: Dataset is empty.")
+            rank_zero_info(">>> [GenerationCallback] Warning: Dataset is empty.")
             return []
 
         indices = random.sample(range(dataset_len), min(num_samples, dataset_len))
@@ -253,7 +313,7 @@ class GenerationCallback(TrainerCallback):
             try:
                 item = dataset[idx]
             except Exception as e:
-                print(f">>> [GenerationCallback] Warning: Failed to get item {idx} from dataset: {e}")
+                rank_zero_info(f">>> [GenerationCallback] Warning: Failed to get item {idx} from dataset: {e}")
                 continue
 
             # Extract image, question, and answer
@@ -384,7 +444,7 @@ class GenerationCallback(TrainerCallback):
             return
 
         # Run generation at step 0
-        self._run_generation(args, state, model=model, **kwargs)
+        self._run_generation(args, state, model=model, log_step=0, **kwargs)
 
     def on_train_end(
         self,
@@ -405,7 +465,9 @@ class GenerationCallback(TrainerCallback):
             return
 
         # Run generation at final step (only if not already done by on_log)
-        self._run_generation(args, state, model=model, **kwargs)
+        # Save the step value to ensure consistent logging
+        final_step = state.global_step
+        self._run_generation(args, state, model=model, log_step=final_step, **kwargs)
 
     def on_log(
         self,
@@ -413,11 +475,19 @@ class GenerationCallback(TrainerCallback):
         state: TrainerState,
         control: TrainerControl,
         model=None,
+        logs=None,
         **kwargs,
     ):
         """Generate predictions and log to wandb at specified intervals."""
         # Only run on main process (rank 0)
         if not self._is_rank0(args):
+            return
+
+        # CRITICAL: Skip generation if this is an eval log call
+        # After evaluation, Trainer calls on_log with logs containing eval metrics (e.g., 'eval_loss')
+        # This would cause wandb step conflicts because eval metrics are logged with a different step
+        # We should only run generation during training steps, not after eval
+        if logs is not None and any(key.startswith("eval_") for key in logs):
             return
 
         # Check if we should evaluate at this step
@@ -429,16 +499,26 @@ class GenerationCallback(TrainerCallback):
         if state.global_step % self.eval_interval != 0:
             return
 
-        self._run_generation(args, state, model=model, **kwargs)
+        # CRITICAL: Save the step value at the time of on_log call
+        # Generation may take time, and state.global_step may increase during generation
+        # We need to use the step value from when on_log was called, not when generation finishes
+        log_step = state.global_step
+        self._run_generation(args, state, model=model, log_step=log_step, **kwargs)
 
     def _run_generation(
         self,
         args: TrainingArguments,
         state: TrainerState,
         model=None,
+        log_step: int | None = None,
         **kwargs,
     ):
-        """Internal method to run generation and log to wandb."""
+        """Internal method to run generation and log to wandb.
+
+        Args:
+            log_step: The step value to use for wandb logging. If None, uses state.global_step.
+                      This should be the step value from when on_log was called, not the current step.
+        """
 
         # Skip if wandb is not initialized
         if not wandb.run:
@@ -449,7 +529,7 @@ class GenerationCallback(TrainerCallback):
             model = kwargs.get("model")
 
         if model is None:
-            print(">>> [GenerationCallback] Warning: Model not found, skipping generation.")
+            rank_zero_info(">>> [GenerationCallback] Warning: Model not found, skipping generation.")
             return
 
         # Get processor - try from self first, then from Trainer
@@ -466,10 +546,12 @@ class GenerationCallback(TrainerCallback):
                 processor = trainer.data_collator.processor
 
         if processor is None:
-            print(">>> [GenerationCallback] Warning: Processor not found, skipping generation.")
+            rank_zero_info(">>> [GenerationCallback] Warning: Processor not found, skipping generation.")
             return
 
-        print(f">>> [GenerationCallback] Generating predictions at step {state.global_step}...")
+        # Use the saved log_step if provided, otherwise fall back to current state.global_step
+        step_to_log = log_step if log_step is not None else state.global_step
+        rank_zero_info(f">>> [GenerationCallback] Generating predictions at step {step_to_log}...")
 
         try:
             # Decide where to get eval samples from
@@ -488,7 +570,9 @@ class GenerationCallback(TrainerCallback):
                             eval_dataset = eval_dataset.dataset
 
                 if eval_dataset is None:
-                    print(">>> [GenerationCallback] Warning: No eval_dataset or eval_samples; skipping generation.")
+                    rank_zero_info(
+                        ">>> [GenerationCallback] Warning: No eval_dataset or eval_samples; skipping generation."
+                    )
                     return
 
                 # Try to sample from eval_dataset (supports HF Dataset with __len__/__getitem__)
@@ -496,17 +580,19 @@ class GenerationCallback(TrainerCallback):
                     if hasattr(eval_dataset, "__getitem__") and hasattr(eval_dataset, "__len__"):
                         eval_samples = self._sample_from_dataset(eval_dataset, self.num_samples)
                     else:
-                        print(">>> [GenerationCallback] Warning: eval_dataset is not indexable; skipping generation.")
+                        rank_zero_info(
+                            ">>> [GenerationCallback] Warning: eval_dataset is not indexable; skipping generation."
+                        )
                         return
                 except Exception as e:
-                    print(f">>> [GenerationCallback] Error sampling eval_dataset: {e}")
+                    rank_zero_info(f">>> [GenerationCallback] Error sampling eval_dataset: {e}")
                     import traceback
 
                     traceback.print_exc()
                     return
 
             if not eval_samples:
-                print(">>> [GenerationCallback] Warning: No eval samples found.")
+                rank_zero_info(">>> [GenerationCallback] Warning: No eval samples found.")
                 return
 
             # Get device and unwrap model - use unwrapped model to avoid DDP issues
@@ -542,28 +628,108 @@ class GenerationCallback(TrainerCallback):
                             }
                         )
                     except Exception as e:
-                        print(f">>> [GenerationCallback] Error preparing sample {i}: {e}")
+                        rank_zero_info(f">>> [GenerationCallback] Error preparing sample {i}: {e}")
                         continue
 
                 if not batch_samples:
-                    print(">>> [GenerationCallback] Warning: No valid samples to generate.")
+                    rank_zero_info(">>> [GenerationCallback] Warning: No valid samples to generate.")
                     return
 
-                print(f">>> [GenerationCallback] Generating answers for {len(batch_samples)} samples in batch...")
+                rank_zero_info(
+                    f">>> [GenerationCallback] Generating answers for {len(batch_samples)} samples in batch..."
+                )
 
                 # Generate answers for entire batch
                 try:
                     generated_texts = self._generate_answer_batch(unwrapped_model, processor, batch_samples, device)
                 except Exception as e:
-                    print(f">>> [GenerationCallback] Error during batch generation: {e}")
+                    rank_zero_info(f">>> [GenerationCallback] Error during batch generation: {e}")
                     import traceback
 
                     traceback.print_exc()
                     return
 
+                # Calcalte the metrics for the generated texts
+                ground_truths = [metadata["ground_truth"] for metadata in sample_metadata]
+                # Convert PIL images to tensors in the format expected by clip_score: [C, H, W] with values in [0, 1]
+                images = [metadata["image"] for metadata in sample_metadata]
+                images = [image.convert("RGB") if image.mode != "RGB" else image for image in images]
+                # Convert PIL to tensor: (H, W, C) -> (C, H, W), values in [0, 1]
+                images = [TF.pil_to_tensor(image) for image in images]
+
+                # calculate the metrics 1 sample by 1 sample
+                generated_metrics = []
+
+                # Use cached metric instances (lazy-loaded, created once)
+                bert_score = self._get_bert_score()
+                clip_score = self._get_clip_score()
+                rouge_score = self._get_rouge_score()
+
+                for generated_text, ground_truth, image in zip(generated_texts, ground_truths, images, strict=False):
+                    # BERT scores
+                    generated_bert_scores = bert_score(generated_text, ground_truth)
+                    generated_bert_f1 = generated_bert_scores["f1"].detach().cpu().numpy().mean().item()
+                    generated_bert_precision = generated_bert_scores["precision"].detach().cpu().numpy().mean().item()
+                    generated_bert_recall = generated_bert_scores["recall"].detach().cpu().numpy().mean().item()
+
+                    # Rouge scores
+                    """
+                    {'rouge1_fmeasure': tensor(0.7500),
+                    'rouge1_precision': tensor(0.7500),
+                    'rouge1_recall': tensor(0.7500),
+                    'rouge2_fmeasure': tensor(0.),
+                    'rouge2_precision': tensor(0.),
+                    'rouge2_recall': tensor(0.),
+                    'rougeL_fmeasure': tensor(0.5000),
+                    'rougeL_precision': tensor(0.5000),
+                    'rougeL_recall': tensor(0.5000),
+                    'rougeLsum_fmeasure': tensor(0.5000),
+                    'rougeLsum_precision': tensor(0.5000),
+                    'rougeLsum_recall': tensor(0.5000)}
+                    """
+                    generated_rouge_scores = rouge_score(generated_text, ground_truth)
+                    for key, value in generated_rouge_scores.items():
+                        generated_rouge_scores[key] = value.detach().cpu().numpy().mean().item()
+
+                    # Clip scores
+                    generated_img_clip = clip_score(generated_text, image).detach().cpu().numpy().mean().item()
+                    generated_ans_clip = clip_score(generated_text, ground_truth).detach().cpu().numpy().mean().item()
+
+                    generated_metrics.append(
+                        {
+                            "bert_f1": generated_bert_f1,
+                            "bert_precision": generated_bert_precision,
+                            "bert_recall": generated_bert_recall,
+                            "img_clip": generated_img_clip,
+                            "ans_clip": generated_ans_clip,
+                            "rouge1_fmeasure": generated_rouge_scores["rouge1_fmeasure"],
+                            "rouge1_precision": generated_rouge_scores["rouge1_precision"],
+                            "rouge1_recall": generated_rouge_scores["rouge1_recall"],
+                            "rouge2_fmeasure": generated_rouge_scores["rouge2_fmeasure"],
+                            "rouge2_precision": generated_rouge_scores["rouge2_precision"],
+                            "rouge2_recall": generated_rouge_scores["rouge2_recall"],
+                            "rougeL_fmeasure": generated_rouge_scores["rougeL_fmeasure"],
+                            "rougeL_precision": generated_rouge_scores["rougeL_precision"],
+                            "rougeL_recall": generated_rouge_scores["rougeL_recall"],
+                            "rougeLsum_fmeasure": generated_rouge_scores["rougeLsum_fmeasure"],
+                            "rougeLsum_precision": generated_rouge_scores["rougeLsum_precision"],
+                            "rougeLsum_recall": generated_rouge_scores["rougeLsum_recall"],
+                        }
+                    )
+
+                # Note: We don't delete the metric instances anymore since they're cached for reuse
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                rank_zero_info(f">>> [GenerationCallback] Generated metrics: {generated_metrics}")
+
                 # Build table data from batch results
                 table_data = []
-                for metadata, generated in zip(sample_metadata, generated_texts, strict=False):
+
+                for metadata, generated, metrics in zip(
+                    sample_metadata, generated_texts, generated_metrics, strict=False
+                ):
                     # Get wandb image (reused if already uploaded)
                     wandb_img = self._get_wandb_image(metadata["image"])
 
@@ -573,6 +739,23 @@ class GenerationCallback(TrainerCallback):
                             metadata["question"],
                             metadata["ground_truth"],
                             generated,
+                            metrics["bert_f1"],
+                            metrics["bert_precision"],
+                            metrics["bert_recall"],
+                            metrics["img_clip"],
+                            metrics["ans_clip"],
+                            metrics["rouge1_fmeasure"],
+                            metrics["rouge1_precision"],
+                            metrics["rouge1_recall"],
+                            metrics["rouge2_fmeasure"],
+                            metrics["rouge2_precision"],
+                            metrics["rouge2_recall"],
+                            metrics["rougeL_fmeasure"],
+                            metrics["rougeL_precision"],
+                            metrics["rougeL_recall"],
+                            metrics["rougeLsum_fmeasure"],
+                            metrics["rougeLsum_precision"],
+                            metrics["rougeLsum_recall"],
                         ]
                     )
             finally:
@@ -581,22 +764,46 @@ class GenerationCallback(TrainerCallback):
 
             # Create wandb table
             table = wandb.Table(
-                columns=["Image", "Question", "Ground Truth", "Generated Answer"],
+                columns=[
+                    "Image",
+                    "Question",
+                    "Ground Truth",
+                    "Generated Answer",
+                    "BERT F1",
+                    "BERT Precision",
+                    "BERT Recall",
+                    "Image CLIP",
+                    "Answer CLIP",
+                    "ROUGE1 F1",
+                    "ROUGE1 Precision",
+                    "ROUGE1 Recall",
+                    "ROUGE2 F1",
+                    "ROUGE2 Precision",
+                    "ROUGE2 Recall",
+                    "ROUGE L F1",
+                    "ROUGE L Precision",
+                    "ROUGE L Recall",
+                    "ROUGE LSUM F1",
+                    "ROUGE LSUM Precision",
+                    "ROUGE LSUM Recall",
+                ],
                 data=table_data,
             )
 
-            # Log to wandb
+            # Log to wandb using the step value from when on_log was called
+            # Use the saved log_step if provided, otherwise fall back to current state.global_step
+            step_to_log = log_step if log_step is not None else state.global_step
             wandb.log(
                 {
-                    f"generation_samples/step_{state.global_step}": table,
+                    f"generation_samples/step_{step_to_log}": table,
                 },
-                step=state.global_step,
+                step=step_to_log,
             )
 
-            print(f">>> [GenerationCallback] Logged {len(table_data)} samples to wandb.")
+            rank_zero_info(f">>> [GenerationCallback] Logged {len(table_data)} samples to wandb.")
 
         except Exception as e:
-            print(f">>> [GenerationCallback] Error during generation: {e}")
+            rank_zero_info(f">>> [GenerationCallback] Error during generation: {e}")
             import traceback
 
             traceback.print_exc()

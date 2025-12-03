@@ -178,9 +178,11 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "4"
+            "--sub_sets" "coco_colors,sharegpt4v(coco),laion_gpt4v,face_emotion"
+            "--sub_sets_weights" "4,4,1,1"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
-            "--max_steps" "1000"
+            "--max_steps" "5000"
             "--num_proc" "96"
             "--dataloader_num_workers" "4"
             "--learning_rate" "1e-3"

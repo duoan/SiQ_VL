@@ -5,15 +5,13 @@ Processor class for SiQ-VL (Siglip2 + Qwen2).
 from typing import Any
 
 import torch
+from torchmetrics.utilities import rank_zero_info, rank_zero_warn
 from transformers import (
     BatchEncoding,
     ProcessorMixin,
     Qwen2TokenizerFast,
     SiglipImageProcessor,
 )
-from transformers.utils import logging
-
-logger = logging.get_logger(__name__)
 
 
 class SiQ_VLProcessor(ProcessorMixin):
@@ -77,7 +75,7 @@ class SiQ_VLProcessor(ProcessorMixin):
         # Total number of tokens
         num_tokens = reduced_patches_per_dim**2
 
-        print(
+        rank_zero_info(
             f"Image tokenization: {self.image_size}x{self.image_size} image, "
             f"patch_size={self.patch_size}, "
             f"patches={patches_per_dim}x{patches_per_dim}={patches_per_dim**2}, "
@@ -225,7 +223,7 @@ class SiQ_VLProcessor(ProcessorMixin):
                             labels[i, start:end] = seq[start:end]
                             break
                 except Exception as ex:  # pragma: no cover - debug only
-                    print(f"Warning: Failed to mask labels for sample {i}: {ex}")
+                    rank_zero_warn(f"Warning: Failed to mask labels for sample {i}: {ex}")
 
                 # Never predict image tokens
                 labels[i, seq == image_token_id] = -100

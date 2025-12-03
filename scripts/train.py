@@ -6,10 +6,11 @@ import random
 import re
 import shutil
 
-from datasets import concatenate_datasets, load_dataset
+from datasets import load_dataset
 import numpy as np
 import torch
 import torch.distributed as dist
+from torchmetrics.utilities.prints import rank_zero_info
 from transformers import (
     AutoImageProcessor,
     AutoTokenizer,
@@ -162,15 +163,7 @@ def generate_run_name(
     vision_name = extract_model_name(vision_model_path)
     llm_name = extract_model_name(llm_model_path)
 
-    stage = infer_stage_name(output_dir)
-
-    # Generate datetime string (format: YYYYMMDD_HHMMSS)
-    datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Combine: vision_llm_stage_datetime
-    run_name = f"{vision_name}_{llm_name}_{stage}_{datetime_str}"
-
-    return run_name
+    return f"{vision_name}_{llm_name}_{infer_stage_name(output_dir)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
 def seed_everything(seed: int = 42):
@@ -221,6 +214,16 @@ def parse_args():
         type=str,
         default="coco_colors,densefusion_1m,face_emotion,google_landmarks,laion_gpt4v,sharegpt4o,sharegpt4v(coco),sharegpt4v(llava),sharegpt4v(knowledge),sharegpt4v(sam)",
         help="Comma-separated list of dataset subsets",
+    )
+    parser.add_argument(
+        "--sub_sets_weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated sampling weights aligned with sub_sets. "
+            "E.g. for 'coco_colors,sharegpt4v(coco),laion_gpt4v,face_emotion' "
+            "you can pass '4,4,1,1' to downweight laion_gpt4v."
+        ),
     )
 
     # Model configuration
@@ -441,28 +444,28 @@ def train(args=None):
         if dist.is_available() and dist.is_initialized():
             # Already initialized by accelerate launcher
             setup_for_distributed(dist.get_rank() == 0)
-            print(f">>> Using distributed training (rank {dist.get_rank()}/{dist.get_world_size()})")
+            rank_zero_info(f">>> Using distributed training (rank {dist.get_rank()}/{dist.get_world_size()})")
         elif dist.is_available():
             # Try to initialize if not already done (requires proper env vars)
             try:
                 dist.init_process_group("nccl")
                 setup_for_distributed(dist.get_rank() == 0)
-                print(f">>> Initialized distributed training (rank {dist.get_rank()}/{dist.get_world_size()})")
+                rank_zero_info(f">>> Initialized distributed training (rank {dist.get_rank()}/{dist.get_world_size()})")
             except Exception as e:
-                print(f">>> Warning: Failed to initialize distributed training: {e}")
-                print(">>> Continuing without distributed training.")
+                rank_zero_info(f">>> Warning: Failed to initialize distributed training: {e}")
+                rank_zero_info(">>> Continuing without distributed training.")
                 args.use_distributed = False
         else:
-            print(">>> Warning: Distributed training requested but PyTorch distributed not available.")
+            rank_zero_info(">>> Warning: Distributed training requested but PyTorch distributed not available.")
             args.use_distributed = False
     else:
         # Check if already initialized (e.g., by accelerate launcher)
         if dist.is_available() and dist.is_initialized():
             setup_for_distributed(dist.get_rank() == 0)
             args.use_distributed = True
-            print(f">>> Distributed training detected (rank {dist.get_rank()}/{dist.get_world_size()})")
+            rank_zero_info(f">>> Distributed training detected (rank {dist.get_rank()}/{dist.get_world_size()})")
         else:
-            print(">>> Running in single-GPU/non-distributed mode.")
+            rank_zero_info(">>> Running in single-GPU/non-distributed mode.")
             args.use_distributed = False
 
     # ====================================================
@@ -471,6 +474,21 @@ def train(args=None):
     # Path to your FineVision dataset (or the name if on HF Hub)
     DATA_PATH = args.data_path
     SUB_SETS = [subset.strip() for subset in args.sub_sets.split(",")]
+    if args.sub_sets_weights is not None:
+        weight_strs = [w.strip() for w in args.sub_sets_weights.split(",")]
+        if len(weight_strs) != len(SUB_SETS):
+            raise ValueError(
+                f"sub_sets_weights length ({len(weight_strs)}) "
+                f"must match sub_sets length ({len(SUB_SETS)}). "
+                f"sub_sets={SUB_SETS}, sub_sets_weights={weight_strs}"
+            )
+        sub_sets_weights = [float(w) for w in weight_strs]
+    else:
+        sub_sets_weights = [1.0] * len(SUB_SETS)
+
+    rank_zero_info(">>> Using subsets and weights:")
+    for name, w in zip(SUB_SETS, sub_sets_weights, strict=False):
+        rank_zero_info(f"    - {name}: weight={w}")
 
     vision_model_name_or_path = args.vision_model_name_or_path
     llm_model_name_or_path = args.llm_model_name_or_path
@@ -490,19 +508,19 @@ def train(args=None):
     run_root = os.path.join(base_output_dir, f"siq-vl_{vision_name}_{llm_name}")
     OUTPUT_DIR = os.path.join(run_root, stage_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f">>> Using output_dir: {OUTPUT_DIR}")
+    rank_zero_info(f">>> Using output_dir: {OUTPUT_DIR}")
 
     # ====================================================
     # 2. Initialize Processor & Model
     # ====================================================
-    print(">>> Loading Processor & Tokenizer...")
+    rank_zero_info(">>> Loading Processor & Tokenizer...")
     # Load base configs from Hugging Face
     image_processor = AutoImageProcessor.from_pretrained(vision_model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(llm_model_name_or_path)
 
     # Extract image_size and patch_size from vision model path
     image_size, patch_size = extract_vision_config(vision_model_name_or_path)
-    print(f">>> Extracted vision config: image_size={image_size}, patch_size={patch_size}")
+    rank_zero_info(f">>> Extracted vision config: image_size={image_size}, patch_size={patch_size}")
 
     # Initialize our Custom Processor
     processor = SiQ_VLProcessor(
@@ -517,7 +535,7 @@ def train(args=None):
     per_device_train_batch_size = args.per_device_train_batch_size
     gradient_accumulation_steps = args.gradient_accumulation_steps
 
-    print(">>> Loading Model...")
+    rank_zero_info(">>> Loading Model...")
     # Initialize our Custom Model using config
     config = SiQ_VLConfig(
         pretrained_vision_model_path=vision_model_name_or_path,
@@ -543,29 +561,43 @@ def train(args=None):
 
     # Print number of trainable parameters
     trainable_params = sum(p.numel() for p in vl_model.parameters() if p.requires_grad)
-    print(f">>> Trainable Parameters: {trainable_params / 1e6:.2f} M")
+    rank_zero_info(f">>> Trainable Parameters: {trainable_params / 1e6:.2f} M")
 
     # ====================================================
     # 3. Prepare Data
     # ====================================================
-    print(">>> Loading Dataset...")
+    rank_zero_info(">>> Loading Dataset...")
     # Assuming local HF dataset or JSON
     # If JSON: raw_dataset = load_dataset("json", data_files=DATA_PATH, split="train")
     # If saved HF dataset:
 
     all_raw_datasets = []
+    all_raw_datasets: list = []
+    all_weights: list[float] = []
 
-    for subset in SUB_SETS:
+    for subset, weight in zip(SUB_SETS, sub_sets_weights, strict=False):
+        rank_zero_info(f">>> Loading subset '{subset}' (weight={weight})...")
         raw_dataset = load_dataset(DATA_PATH, name=subset, split="train", num_proc=args.num_proc)
         all_raw_datasets.append(raw_dataset)
+        all_weights.append(weight)
 
-    # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets
-    random.shuffle(all_raw_datasets)
-    concat_raw_dataset = concatenate_datasets(all_raw_datasets)
+    from datasets.combine import interleave_datasets
+
+    total_weight = sum(all_weights)
+    probabilities = [weight / total_weight for weight in all_weights]
+    rank_zero_info(">>> Building weighted mixture dataset with probabilities:")
+    for name, probability in zip(SUB_SETS, probabilities, strict=False):
+        rank_zero_info(f"    - {name}: probability={probability:.4f}")
+
+    concat_raw_dataset = interleave_datasets(
+        all_raw_datasets,
+        probabilities=probabilities,
+        seed=args.seed,
+    )
 
     # Limit dataset size if specified (for quick testing / controlling total samples)
     if args.max_samples is not None:
-        print(f">>> Limiting dataset to {args.max_samples} samples")
+        rank_zero_info(f">>> Limiting dataset to {args.max_samples} samples")
         concat_raw_dataset = concat_raw_dataset.select(range(min(args.max_samples, len(concat_raw_dataset))))
 
     splits = concat_raw_dataset.train_test_split(test_size=args.max_eval_samples, shuffle=True)
@@ -575,18 +607,18 @@ def train(args=None):
     # Use VQADataset (standard Dataset) instead of VQAIterableDataset
     # This allows Trainer's DataLoader to automatically use DistributedSampler
     # No manual sharding needed!
-    print(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
+    rank_zero_info(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
     train_dataset = VQADataset(train_raw_dataset)
     eval_dataset = VQADataset(eval_raw_dataset)
 
-    print(">>> DEBUG: Train Dataset:", train_dataset)
-    print(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
-    print(">>> DEBUG: Eval Dataset:", eval_dataset)
-    print(f">>> DEBUG: Eval Dataset Length: {len(eval_dataset)}")
+    rank_zero_info(f">>> DEBUG: Train Dataset: {train_dataset}")
+    rank_zero_info(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
+    rank_zero_info(f">>> DEBUG: Eval Dataset: {eval_dataset}")
+    rank_zero_info(f">>> DEBUG: Eval Dataset Length: {len(eval_dataset)}")
     if len(train_dataset) > 0:
-        print(">>> DEBUG: Train Dataset Sample:", train_dataset[0])
+        rank_zero_info(f">>> DEBUG: Train Dataset Sample: {train_dataset[0]}")
     if len(eval_dataset) > 0:
-        print(">>> DEBUG: Eval Dataset Sample:", eval_dataset[0])
+        rank_zero_info(f">>> DEBUG: Eval Dataset Sample: {eval_dataset[0]}")
 
     # ----------------------------------------------------
     # Auto-calculate max_steps from max_samples & global batch
@@ -602,12 +634,11 @@ def train(args=None):
         # (before sharding, so we get the total dataset size)
         effective_samples = len(concat_raw_dataset)
         max_steps = (effective_samples + global_batch_size - 1) // global_batch_size
-        print(
-            f">>> Auto-calculated max_steps={max_steps} "
-            f"(effective_samples={effective_samples}, global_batch_size={global_batch_size})"
+        rank_zero_info(
+            f">>> Auto-calculated max_steps={max_steps} (effective_samples={effective_samples}, global_batch_size={global_batch_size})"
         )
     else:
-        print(f">>> Using user-specified max_steps={max_steps}")
+        rank_zero_info(f">>> Using user-specified max_steps={max_steps}")
 
     # Initialize Collator
     data_collator = SiQ_VLDataCollator(processor=processor, return_raw_data=True)
@@ -621,12 +652,12 @@ def train(args=None):
         llm_model_path=llm_model_name_or_path,
         output_dir=OUTPUT_DIR,
     )
-    print(f">>> Generated run name: {run_name}")
+    rank_zero_info(f">>> Generated run name: {run_name}")
 
     # Explicitly set wandb project name via environment variable
     # This ensures wandb uses the correct project name when initialized by Trainer
     os.environ["WANDB_PROJECT"] = "siq-vl"
-    print(">>> Setting WANDB_PROJECT to: siq-vl")
+    rank_zero_info(">>> Setting WANDB_PROJECT to: siq-vl")
 
     # Prepare Hub model ID if push_to_hub is enabled
     hub_model_id = None
@@ -638,7 +669,7 @@ def train(args=None):
         #   siq-vl_{vision_backbone}_{llm_backbone}_{stage}
         default_repo_name = f"siq-vl_{vision_name}_{llm_name}_{stage_name}"
         hub_model_id = args.hub_model_id or default_repo_name
-        print(f">>> Will push to Hub model id: {hub_model_id}")
+        rank_zero_info(f">>> Will push to Hub model id: {hub_model_id}")
 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -728,19 +759,19 @@ def train(args=None):
         callbacks=callbacks,
     )
 
-    print(">>> DEBUG: Checking Labels...")
+    rank_zero_info(">>> DEBUG: Checking Labels...")
     batch = next(iter(trainer.get_train_dataloader()))
     input_ids = batch["input_ids"][0]
     labels = batch["labels"][0]
     for i in range(len(input_ids)):
         if labels[i] != -100:
-            print(f"Token: {tokenizer.decode([input_ids[i]])} | Label: {labels[i].item()}")
-    print("input_ids:\n", input_ids, "\n")
-    print("labels:\n", [label.item() for label in labels], "\n")
-    print("Question:\n", batch["questions"][0], "\n")
-    print("Answer:\n", batch["answers"][0], "\n")
+            rank_zero_info(f"Token: {tokenizer.decode([input_ids[i]])} | Label: {labels[i].item()}")
+    rank_zero_info(f"input_ids:\n {input_ids} \n")
+    rank_zero_info(f"labels:\n {[label.item() for label in labels]} \n")
+    rank_zero_info(f"Question:\n {batch['questions'][0]} \n")
+    rank_zero_info(f"Answer:\n {batch['answers'][0]} \n")
 
-    print(">>> Start Training...")
+    rank_zero_info(">>> Start Training...")
     trainer.train()
     # Trainer automatically saves the final model to OUTPUT_DIR and pushes to Hub if enabled
 
@@ -749,7 +780,7 @@ def train(args=None):
     # ====================================================
     # Copy custom modeling.py and configuration.py to output directory
     # so that others can use AutoModel.from_pretrained() to load the model
-    print(">>> Saving custom model code files...")
+    rank_zero_info(">>> Saving custom model code files...")
     model_code_dir = os.path.join(OUTPUT_DIR, "siq_vl", "model")
     os.makedirs(model_code_dir, exist_ok=True)
 
@@ -765,9 +796,9 @@ def train(args=None):
         dst_file = os.path.join(model_code_dir, file_name)
         if os.path.exists(src_file):
             shutil.copy2(src_file, dst_file)
-            print(f">>> Copied {file_name} to {dst_file}")
+            rank_zero_info(f">>> Copied {file_name} to {dst_file}")
         else:
-            print(f">>> Warning: {src_file} not found, skipping...")
+            rank_zero_info(f">>> Warning: {src_file} not found, skipping...")
 
     # Create __init__.py if it doesn't exist
     init_file = os.path.join(model_code_dir, "__init__.py")
@@ -783,7 +814,7 @@ def train(args=None):
         with open(parent_init_file, "w") as f:
             f.write("")
 
-    print(">>> Done!")
+    rank_zero_info(">>> Done!")
 
 
 if __name__ == "__main__":
