@@ -13,6 +13,8 @@ from transformers import (
     SiglipImageProcessor,
 )
 
+SYSTEM_PROMPT = "You are a vision-language assistant. Use the image and the text to answer user's question."
+
 
 class SiQ_VLProcessor(ProcessorMixin):
     # Attributes required by ProcessorMixin for save_pretrained/from_pretrained to work
@@ -144,11 +146,20 @@ class SiQ_VLProcessor(ProcessorMixin):
 
         # 2. Build ChatML-style messages per sample (so tokenization stays consistent with Qwen)
         msg_batch = []
+
         for q, a in zip(questions, answers, strict=False):
             q = q if q is not None else "Describe this image."
+
+            msgs = [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                }
+            ]
+
             if a is None:
                 # Generation: only user turn
-                msgs = [
+                msgs.append(
                     {
                         "role": "user",
                         "content": [
@@ -156,19 +167,26 @@ class SiQ_VLProcessor(ProcessorMixin):
                             {"type": "text", "text": q},
                         ],
                     }
-                ]
+                )
             else:
                 # Supervised: user + assistant
-                msgs = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": q},
-                        ],
-                    },
-                    {"role": "assistant", "content": a},
-                ]
+                msgs.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": q},
+                            ],
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": a},
+                            ],
+                        },
+                    ]
+                )
             msg_batch.append(msgs)
 
         # 3. Apply chat_template and tokenize (same behavior as Qwen chat)
@@ -298,7 +316,7 @@ if __name__ == "__main__":
     print(f"Labels: {inputs.labels[0]}")
     print(f"Attention Mask shape: {inputs.attention_mask.shape}")
     print(f"Attention Mask: {inputs.attention_mask[0]}")
-    print(f"Decoded Prompt: \n{processor.decode(inputs.input_ids[0])}")
+    print(f"Decoded Prompt: \n{processor.decode(inputs.input_ids[0], assistant_only=False)}")
 
     # -- test question only
     print("--- test image + question only ---")
