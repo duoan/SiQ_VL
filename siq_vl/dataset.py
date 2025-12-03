@@ -85,11 +85,12 @@ class VQADataset(Dataset):
     training epochs.
     """
 
-    def __init__(self, hf_dataset):
+    def __init__(self, hf_dataset, is_fixed: bool = False):
         """
         hf_dataset: HuggingFace dataset object
         """
         self.dataset = hf_dataset
+        self.is_fixed = is_fixed
 
     def __len__(self):
         return len(self.dataset)
@@ -110,7 +111,8 @@ class VQADataset(Dataset):
         # Randomly select one turn from this item
         # Each epoch will see a different random turn, allowing coverage of all turns
         # across multiple training epochs
-        turn_idx = random.randint(0, len(texts) - 1)
+        turn_idx = 0 if self.is_fixed else random.randint(0, len(texts) - 1)
+
         turn = texts[turn_idx]
         q = turn.get("user", "")
         a = turn.get("assistant", "")

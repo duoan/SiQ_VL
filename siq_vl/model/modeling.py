@@ -30,12 +30,18 @@ class SiQ_VLMultiModalityProjector(nn.Module):
         super().__init__()
         self.vision_pixel_shuffle_factor = vision_pixel_shuffle_factor
         input_dim = vision_hidden_size * (vision_pixel_shuffle_factor**2)
-        self.proj = nn.Linear(input_dim, language_model_hidden_size, bias=False)
+        self.in_proj = nn.Linear(input_dim, language_model_hidden_size, bias=False)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(language_model_hidden_size),
+            nn.Linear(language_model_hidden_size, 2 * language_model_hidden_size),
+            nn.GELU(),
+            nn.Linear(2 * language_model_hidden_size, language_model_hidden_size),
+        )
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
+        if isinstance(module, (nn.Linear, nn.LayerNorm)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
@@ -72,8 +78,9 @@ class SiQ_VLMultiModalityProjector(nn.Module):
 
     def forward(self, x):
         x = self._pixel_shuffle(x)
-        x = self.proj(x)
-        return x
+        base = self.in_proj(x)
+        out = self.mlp(base)
+        return base + out  # residual
 
 
 class SiQ_VLModel(Qwen2ForCausalLM):

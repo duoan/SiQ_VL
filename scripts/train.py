@@ -609,7 +609,7 @@ def train(args=None):
     # No manual sharding needed!
     rank_zero_info(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
     train_dataset = VQADataset(train_raw_dataset)
-    eval_dataset = VQADataset(eval_raw_dataset)
+    eval_dataset = VQADataset(eval_raw_dataset, is_fixed=True)
 
     rank_zero_info(f">>> DEBUG: Train Dataset: {train_dataset}")
     rank_zero_info(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
@@ -691,6 +691,7 @@ def train(args=None):
         learning_rate=args.learning_rate,
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
+        weight_decay=0.01,  # prevent overfitting
         max_steps=max_steps,
         max_grad_norm=1.0,  # Clip gradients to prevent instability
         # --- Precision & Memory ---
