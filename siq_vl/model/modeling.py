@@ -110,26 +110,13 @@ class SiQ_VLModel(Qwen2ForCausalLM):
         """
         super().__init__(config)
 
-        self.vision_model = SiglipVisionModel.from_pretrained(config.pretrained_vision_model_path)
+        self.vision_model = None  # will be set in post_init
 
         self.mm_projector = SiQ_VLMultiModalityProjector(
             self.config.vision_hidden_size,
             self.config.vision_pixel_shuffle_factor,
             self.config.language_model_hidden_size,  # type: ignore
         )
-        if self.config.freeze_vision_encoder:
-            for param in self.vision_model.parameters():
-                param.requires_grad_(False)
-            self.vision_model.eval()
-            # Only check for NaN if not on meta device
-            for name, param in self.vision_model.named_parameters():
-                if param.device.type != "meta" and torch.isnan(param).any():
-                    logger.warning(f"NaN detected in vision model parameter: {name}")
-
-        if self.config.freeze_language_model:
-            for param in self.model.parameters():
-                param.requires_grad_(False)
-            self.model.eval()
 
         # Store token IDs from config
         self.language_model_ignore_index = config.language_model_ignore_index
@@ -228,7 +215,36 @@ __all__ = ["SiQ_VLModel"]
 
 AutoModelForCausalLM.register(config_class=SiQ_VLConfig, model_class=SiQ_VLModel)
 
-# test code
+
+def get_init_vl_model_for_stage_1(config: SiQ_VLConfig) -> SiQ_VLModel:
+    """
+    Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
+    Args:
+        config: SiQ_VLConfig instance.
+
+    Returns:
+        SiQ_VLModel instance.
+    """
+    vl_model = SiQ_VLModel.from_pretrained(
+        pretrained_model_name_or_path=config.pretrained_language_model_path,
+        config=config,
+        trust_remote_code=True,
+    )
+    vl_model.vision_model = SiglipVisionModel.from_pretrained(config.pretrained_vision_model_path)
+
+    if config.freeze_vision_encoder:
+        for param in vl_model.vision_model.parameters():
+            param.requires_grad_(False)
+        vl_model.vision_model.eval()
+
+    if config.freeze_language_model:
+        for param in vl_model.model.parameters():
+            param.requires_grad_(False)
+        vl_model.model.eval()
+
+    return vl_model
+
+
 if __name__ == "__main__":
     config = SiQ_VLConfig(
         pretrained_vision_model_path="google/siglip2-base-patch16-224",
@@ -242,7 +258,8 @@ if __name__ == "__main__":
         language_model_ignore_index=-100,
     )
 
-    model = SiQ_VLModel(config=config)
+    model = get_init_vl_model_for_stage_1(config)
+
     processor = SiQ_VLProcessor(
         image_processor=SiglipImageProcessor.from_pretrained(config.pretrained_vision_model_path),
         tokenizer=Qwen2TokenizerFast.from_pretrained(config.pretrained_language_model_path),

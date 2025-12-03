@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import random
 import re
+import shutil
 
 from datasets import concatenate_datasets, load_dataset
 import numpy as np
@@ -23,6 +24,8 @@ from siq_vl.callbacks import (
 )
 from siq_vl.collator import SiQ_VLDataCollator
 from siq_vl.dataset import VQADataset
+from siq_vl.model.configuration import SiQ_VLConfig
+from siq_vl.model.modeling import SiQ_VLModel, get_init_vl_model_for_stage_1
 from siq_vl.model.processing import SiQ_VLProcessor
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -516,10 +519,6 @@ def train(args=None):
 
     print(">>> Loading Model...")
     # Initialize our Custom Model using config
-    # Option 1: Use config-based initialization (recommended)
-    from siq_vl.model.configuration import SiQ_VLConfig
-    from siq_vl.model.modeling import SiQ_VLModel
-
     config = SiQ_VLConfig(
         pretrained_vision_model_path=vision_model_name_or_path,
         pretrained_language_model_path=llm_model_name_or_path,
@@ -527,75 +526,23 @@ def train(args=None):
         vision_pixel_shuffle_factor=args.pixel_shuffle_factor,
     )
 
-    model = SiQ_VLModel(config=config)
-
-    # ----------------------------------------------------
-    # Optionally load weights from the latest Stage 1 checkpoint
-    # ----------------------------------------------------
-    # Convention:
-    #   - Stage 1 output_root: ./checkpoints/siq_vlm_stage1
-    #   - Stage 2 output_root: ./checkpoints/siq_vlm_stage2
-    #   - Within each root, we create a backbone-specific subdir:
-    #         {vision_name}__{llm_name}
-    #   - We detect "stage 2" based on the project name containing "stage_2".
-    #     In that case, we auto-load the latest Stage 1 checkpoint that matches
-    #     the current backbone configuration.
-    if stage_name == "stage2":
-
-        def _resolve_latest_stage1_checkpoint(path: str) -> str | None:
-            if not os.path.isdir(path):
-                return None
-
-            # Prefer a top-level pytorch_model.bin if it exists
-            top_level_bin = os.path.join(path, "pytorch_model.bin")
-            if os.path.isfile(top_level_bin):
-                return top_level_bin
-
-            # Otherwise, look for checkpoint-* subdirectories
-            checkpoint_dirs = [
-                d for d in os.listdir(path) if d.startswith("checkpoint-") and os.path.isdir(os.path.join(path, d))
-            ]
-            if not checkpoint_dirs:
-                return None
-
-            def _step_from_name(name: str) -> int:
-                try:
-                    return int(name.split("-")[-1])
-                except Exception:
-                    return -1
-
-            checkpoint_dirs.sort(key=_step_from_name)
-            latest_dir = checkpoint_dirs[-1]
-            candidate = os.path.join(path, latest_dir, "pytorch_model.bin")
-            return candidate if os.path.isfile(candidate) else None
-
-        # Prefer the new layout final checkpoint:
-        #   {output_dir}/siq-vl_{vision}_{llm}/stage1/final
-        stage1_dir_new = os.path.join(run_root, "stage1", "final")
-
-        ckpt_file = _resolve_latest_stage1_checkpoint(stage1_dir_new)
-        if ckpt_file is not None:
-            print(f">>> Initializing model weights from Stage 1 checkpoint: {ckpt_file}")
-            state_dict = torch.load(ckpt_file, map_location="cpu")
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-
-            if missing_keys:
-                print(f">>> Warning: Missing keys when loading checkpoint ({len(missing_keys)}):")
-                print(missing_keys[:20])
-            if unexpected_keys:
-                print(f">>> Warning: Unexpected keys when loading checkpoint ({len(unexpected_keys)}):")
-                print(unexpected_keys[:20])
+    if stage_name == "stage1":
+        vl_model = get_init_vl_model_for_stage_1(config)
+    elif stage_name == "stage2":
+        vl_model = SiQ_VLModel.from_pretrained(
+            config.pretrained_language_model_path, config=config, trust_remote_code=True
+        )
+        if args.freeze_llm:
+            for param in vl_model.model.parameters():
+                param.requires_grad_(False)
+            vl_model.model.eval()
         else:
-            print(
-                f">>> Warning: No matching Stage 1 checkpoint found in {stage1_dir_new}. "
-                f"Stage 2 will start from the base backbones."
-            )
-
-    # Enable Gradient Checkpointing (Critical for VRAM efficiency)
-    # model.llm.gradient_checkpointing_enable()
+            for param in vl_model.model.parameters():
+                param.requires_grad_(True)
+            vl_model.model.train()
 
     # Print number of trainable parameters
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in vl_model.parameters() if p.requires_grad)
     print(f">>> Trainable Parameters: {trainable_params / 1e6:.2f} M")
 
     # ====================================================
@@ -772,7 +719,7 @@ def train(args=None):
         callbacks.append(SmartGPUCleanCallback())
 
     trainer = Trainer(
-        model=model,
+        model=vl_model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -796,6 +743,45 @@ def train(args=None):
     print(">>> Start Training...")
     trainer.train()
     # Trainer automatically saves the final model to OUTPUT_DIR and pushes to Hub if enabled
+
+    # ====================================================
+    # 6. Save custom model code files for AutoModel.from_pretrained()
+    # ====================================================
+    # Copy custom modeling.py and configuration.py to output directory
+    # so that others can use AutoModel.from_pretrained() to load the model
+    print(">>> Saving custom model code files...")
+    model_code_dir = os.path.join(OUTPUT_DIR, "siq_vl", "model")
+    os.makedirs(model_code_dir, exist_ok=True)
+
+    # Get the source directory of siq_vl.model
+    import siq_vl.model as model_module
+
+    source_model_dir = os.path.dirname(model_module.__file__)
+
+    # Copy necessary files
+    files_to_copy = ["modeling.py", "configuration.py", "processing.py"]
+    for file_name in files_to_copy:
+        src_file = os.path.join(source_model_dir, file_name)
+        dst_file = os.path.join(model_code_dir, file_name)
+        if os.path.exists(src_file):
+            shutil.copy2(src_file, dst_file)
+            print(f">>> Copied {file_name} to {dst_file}")
+        else:
+            print(f">>> Warning: {src_file} not found, skipping...")
+
+    # Create __init__.py if it doesn't exist
+    init_file = os.path.join(model_code_dir, "__init__.py")
+    if not os.path.exists(init_file):
+        with open(init_file, "w") as f:
+            f.write("")
+
+    # Also create parent __init__.py
+    siq_vl_dir = os.path.join(OUTPUT_DIR, "siq_vl")
+    os.makedirs(siq_vl_dir, exist_ok=True)
+    parent_init_file = os.path.join(siq_vl_dir, "__init__.py")
+    if not os.path.exists(parent_init_file):
+        with open(parent_init_file, "w") as f:
+            f.write("")
 
     print(">>> Done!")
 

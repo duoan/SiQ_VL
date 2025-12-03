@@ -4,8 +4,8 @@ Standalone generation/inference script for SiQ-VL model.
 """
 
 import argparse
-import sys
 import os
+import sys
 
 # Add parent directory to path to import siq_vl
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,7 +16,7 @@ from siq_vl.model import load_model_from_checkpoint
 def main():
     """Main function for standalone inference."""
     parser = argparse.ArgumentParser(description="Run inference with SiQ-VL model")
-    
+
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -64,16 +64,16 @@ def main():
         action="store_true",
         help="Disable sampling (use greedy decoding)",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load model and processor
     model, processor = load_model_from_checkpoint(args.checkpoint, device=args.device)
-    
+
     # Generate answer
     print(f"\n>>> Question: {args.question}")
     print(">>> Generating answer...")
-    
+
     answer = model.generate_answer(
         processor=processor,
         samples=(args.image, args.question),
@@ -82,10 +82,9 @@ def main():
         do_sample=not args.no_sample,
         num_beams=args.num_beams,
     )
-    
+
     print(f"\n>>> Answer: {answer}\n")
 
 
 if __name__ == "__main__":
     main()
-

@@ -13,9 +13,8 @@ Example:
 
 import argparse
 import os
-import shutil
 import re
-from typing import Optional
+import shutil
 
 from huggingface_hub import HfApi
 
@@ -26,7 +25,7 @@ def infer_stage_name_from_path(path: str) -> str:
     Looks for 'stage1', 'stage_1', 'stage-1', etc. in any path component.
     """
 
-    def _infer(s: str) -> Optional[str]:
+    def _infer(s: str) -> str | None:
         s = s.lower()
         m = re.search(r"stage[_\\s-]?(\\d+)", s)
         if m:
@@ -44,9 +43,9 @@ def infer_stage_name_from_path(path: str) -> str:
 
 def publish_to_hub(
     checkpoint_dir: str,
-    hub_model_id: Optional[str] = None,
-    wandb_run_url: Optional[str] = None,
-    wandb_run_id: Optional[str] = None,
+    hub_model_id: str | None = None,
+    wandb_run_url: str | None = None,
+    wandb_run_id: str | None = None,
 ) -> None:
     """
     Core publishing logic that can be reused from scripts or other modules.
@@ -174,10 +173,7 @@ def publish_to_hub(
             print(f">>> Copying project README.md into checkpoint dir: {dst_readme}")
             shutil.copy2(src_readme, dst_readme)
         else:
-            print(
-                ">>> Warning: No project README.md found at project root; "
-                "model card on Hub may be empty."
-            )
+            print(">>> Warning: No project README.md found at project root; model card on Hub may be empty.")
 
     commit_message = f"Add {stage_name} checkpoint for {backbone_dir}"
     if wandb_run_url:
@@ -273,5 +269,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
