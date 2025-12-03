@@ -719,8 +719,6 @@ class GenerationCallback(TrainerCallback):
                 gc.collect()
                 check_cuda_memory_and_clean(force=True, verbose=True)
 
-                rank_zero_info(f">>> [GenerationCallback] Generated metrics: {generated_metrics}")
-
                 # Build table data from batch results
                 table_data = []
 
