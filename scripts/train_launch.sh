@@ -138,7 +138,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--save_steps" "10"
             "--gen_steps" "10"
             "--eval_steps" "10"
-            "--max_eval_samples" "100"
+            "--max_eval_samples" "16"
             "--no_distributed"
         )
     else
@@ -161,7 +161,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--save_steps" "10"
             "--gen_steps" "10"
             "--eval_steps" "10"
-            "--max_eval_samples" "100"
+            "--max_eval_samples" "16"
             "--no_distributed"
         )
     fi
