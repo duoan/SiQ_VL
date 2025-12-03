@@ -14,6 +14,7 @@ from torchmetrics.utilities.prints import rank_zero_info
 from transformers import (
     AutoImageProcessor,
     AutoTokenizer,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
 )
@@ -684,6 +685,9 @@ def train(args=None):
         # Use same batch size for eval as for training
         per_device_eval_batch_size=per_device_train_batch_size * gradient_accumulation_steps,
         eval_accumulation_steps=1,  # Accumulate eval results in one go
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         # Note: max_eval_samples is handled when creating eval_dataset above
         # --- Learning Rate ---
         # Project alignment using 1e-3
@@ -745,7 +749,11 @@ def train(args=None):
         num_beams=args.gen_num_beams,
     )
 
-    callbacks = [generation_callback, MetricsCallback()]
+    callbacks = [
+        generation_callback,
+        MetricsCallback(),
+        EarlyStoppingCallback(early_stopping_patience=5, early_stopping_threshold=0.01),
+    ]
 
     if torch.cuda.is_available():
         callbacks.append(SmartGPUCleanCallback())
