@@ -7,7 +7,6 @@ import re
 
 from datasets import concatenate_datasets, load_dataset
 import numpy as np
-from publish_to_hub import publish_to_hub
 import torch
 import torch.distributed as dist
 from transformers import (
@@ -18,6 +17,8 @@ from transformers import (
 )
 
 from siq_vl.callbacks import (
+    GenerationCallback,
+    MetricsCallback,
     SmartGPUCleanCallback,
 )
 from siq_vl.collator import SiQ_VLDataCollator
@@ -680,6 +681,18 @@ def train(args=None):
     os.environ["WANDB_PROJECT"] = "siq-vl"
     print(">>> Setting WANDB_PROJECT to: siq-vl")
 
+    # Prepare Hub model ID if push_to_hub is enabled
+    hub_model_id = None
+    if getattr(args, "push_to_hub", False):
+        # Derive stage name like 'stage1' / 'stage2'
+        stage_name = infer_stage_name(base_output_dir)
+        # Default repo id (single underscores between logical segments),
+        # with a "siq-vl" prefix:
+        #   siq-vl_{vision_backbone}_{llm_backbone}_{stage}
+        default_repo_name = f"siq-vl_{vision_name}_{llm_name}_{stage_name}"
+        hub_model_id = args.hub_model_id or default_repo_name
+        print(f">>> Will push to Hub model id: {hub_model_id}")
+
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         run_name=run_name,
@@ -726,6 +739,10 @@ def train(args=None):
         remove_unused_columns=False,
         label_names=["labels"],  # Explicitly tell Trainer which column is the label
         save_safetensors=False,
+        # --- Hugging Face Hub ---
+        push_to_hub=getattr(args, "push_to_hub", False),
+        hub_model_id=hub_model_id,
+        hub_strategy="end",  # Only push at the end of training
         # --- accelerator config ---
         accelerator_config={
             "dispatch_batches": False,
@@ -738,18 +755,18 @@ def train(args=None):
     # ====================================================
     # Initialize generation callback for periodic evaluation
     # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
-    # generation_callback = GenerationCallback(
-    #     processor=processor,
-    #     eval_dataloader=eval_dataloader,
-    #     num_samples=args.gen_samples,
-    #     eval_interval=args.gen_steps,
-    #     max_new_tokens=args.gen_max_new_tokens,
-    #     temperature=args.gen_temperature,
-    #     do_sample=True,
-    #     num_beams=args.gen_num_beams,
-    # )
+    generation_callback = GenerationCallback(
+        processor=processor,
+        eval_dataset=eval_dataset,
+        num_samples=args.gen_samples,
+        eval_interval=args.gen_steps,
+        max_new_tokens=args.gen_max_new_tokens,
+        temperature=args.gen_temperature,
+        do_sample=True,
+        num_beams=args.gen_num_beams,
+    )
 
-    callbacks = []
+    callbacks = [generation_callback, MetricsCallback()]
 
     if torch.cuda.is_available():
         callbacks.append(SmartGPUCleanCallback())
@@ -778,56 +795,7 @@ def train(args=None):
 
     print(">>> Start Training...")
     trainer.train()
-
-    # ====================================================
-    # 6. Save Final Model
-    # ====================================================
-    print(">>> Saving Final Model...")
-    # Save the final, consolidated state under a dedicated "final" subfolder.
-    final_dir = os.path.join(OUTPUT_DIR, "final")
-    os.makedirs(final_dir, exist_ok=True)
-    trainer.save_model(final_dir)
-    processor.save_pretrained(final_dir)
-
-    # ====================================================
-    # 7. (Optional) Push to Hugging Face Hub
-    # ====================================================
-    if getattr(args, "push_to_hub", False):
-        print(">>> Pushing checkpoint to Hugging Face Hub...")
-
-        # Derive stage name like 'stage1' / 'stage2' to match publish_to_hub convention
-        stage_name = infer_stage_name(base_output_dir)
-
-        # Default repo id (single underscores between logical segments),
-        # with a "siq-vl" prefix:
-        #   siq-vl_{vision_backbone}_{llm_backbone}_{stage}
-        default_repo_name = f"siq-vl_{vision_name}_{llm_name}_{stage_name}"
-        hub_model_id = args.hub_model_id or default_repo_name
-
-        print(f">>> Using Hub model id: {hub_model_id}")
-
-        # Try to read current W&B run (if available) to enrich commit message & tag
-        wandb_run = None
-        wandb_url = None
-        wandb_run_id = None
-        try:
-            import wandb  # type: ignore
-
-            wandb_run = wandb.run
-            if wandb_run is not None:
-                wandb_url = getattr(wandb_run, "url", None)
-                wandb_run_id = getattr(wandb_run, "id", None)
-        except Exception as e:  # pragma: no cover - defensive
-            print(f">>> Warning: Could not access wandb run info: {e}")
-
-        # Delegate actual upload logic to scripts.publish_to_hub.publish_to_hub.
-        # We always publish the "final" state rather than intermediate checkpoints.
-        publish_to_hub(
-            checkpoint_dir=final_dir,
-            hub_model_id=hub_model_id,
-            wandb_run_url=wandb_url,
-            wandb_run_id=wandb_run_id,
-        )
+    # Trainer automatically saves the final model to OUTPUT_DIR and pushes to Hub if enabled
 
     print(">>> Done!")
 
