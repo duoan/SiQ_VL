@@ -2,12 +2,10 @@ import argparse
 import builtins
 from datetime import datetime
 import os
-import random
 import re
 import shutil
 
 from datasets import load_dataset
-import numpy as np
 import torch
 import torch.distributed as dist
 from torchmetrics.utilities.prints import rank_zero_info
@@ -15,6 +13,7 @@ from transformers import (
     EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 
 from siq_vl.callbacks import (
@@ -163,26 +162,6 @@ def generate_run_name(
     return f"{vision_model_name}_{text_model_name}_{infer_stage_name(output_dir)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
-def seed_everything(seed: int = 42):
-    """
-    Set random seeds for reproducibility across all libraries.
-
-    Args:
-        seed: Random seed value (default: 42)
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # For deterministic behavior (may slow down training)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Set environment variable for Python hash randomization
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    print(f">>> Set random seed to {seed} for reproducibility")
-
-
 def setup_for_distributed(is_master):
     """
     Disable printing when not in master process.
@@ -235,6 +214,12 @@ def parse_args():
         type=str,
         default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Path or name of the text model",
+    )
+    parser.add_argument(
+        "--stage_1_checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to the stage 1 checkpoint (default: None)",
     )
     parser.add_argument(
         "--freeze_text_model",
@@ -469,7 +454,7 @@ def train(args=None):
         args = parse_args()
 
     # Set random seeds for reproducibility
-    seed_everything(args.seed)
+    set_seed(args.seed)
 
     # Initialize distributed training only if explicitly requested and environment is set up
     # (e.g., by accelerate launcher)
@@ -554,15 +539,19 @@ def train(args=None):
     rank_zero_info(">>> Loading Model and Processor...")
     # Initialize our Custom Model using config
 
+    default_repo_name = f"siq-vl_{vision_name}_{text_name}_{stage_name}"
+
     if stage_name == "stage1":
         vl_model, vl_processor = get_stage1_model_and_processor(
             pretrained_vision_model_path=vision_model_name_or_path,
             pretrained_text_model_path=text_model_name_or_path,
         )
     elif stage_name == "stage2":
+        stage_1_checkpoint_path = args.stage_1_checkpoint_path
+        if stage_1_checkpoint_path is None:
+            stage_1_checkpoint_path = default_repo_name
         vl_model, vl_processor = get_stage2_model_and_processor(
-            stage_1_model_path=stage_1_model_path,
-            stage_1_processor_path=stage_1_processor_path,
+            stage_1_checkpoint_path=stage_1_checkpoint_path,
             use_lora=args.use_lora,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -669,12 +658,6 @@ def train(args=None):
     # Prepare Hub model ID if push_to_hub is enabled
     hub_model_id = None
     if getattr(args, "push_to_hub", False):
-        # Derive stage name like 'stage1' / 'stage2'
-        stage_name = infer_stage_name(base_output_dir)
-        # Default repo id (single underscores between logical segments),
-        # with a "siq-vl" prefix:
-        #   siq-vl_{vision_backbone}_{text_backbone}_{stage}
-        default_repo_name = f"siq-vl_{vision_name}_{text_name}_{stage_name}"
         hub_model_id = args.hub_model_id or default_repo_name
         rank_zero_info(f">>> Will push to Hub model id: {hub_model_id}")
 
