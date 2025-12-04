@@ -1,49 +1,78 @@
+from typing import ClassVar
+
 from PIL import Image
 import torch
 import torch.nn as nn
+from torchmetrics.utilities.prints import rank_zero_info
 from transformers import (
     AutoModelForCausalLM,
     Cache,
+    GenerationMixin,
+    PreTrainedModel,
     Qwen2ForCausalLM,
     Qwen2TokenizerFast,
     SiglipImageProcessor,
     SiglipVisionModel,
 )
+from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import logging
 from transformers.utils.generic import TransformersKwargs
 
-from siq_vl.model.configuration import SiQ_VLConfig
+from siq_vl.model.configuration import (
+    SiQ_VLConfig,
+    SiQ_VLProjectorConfig,
+    SiQ_VLTextConfig,
+    SiQ_VLVisionConfig,
+    get_siq_vl_config,
+)
 from siq_vl.model.processing import SiQ_VLProcessor
 
 logger = logging.get_logger(__name__)
 
 
-class SiQ_VLMultiModalityProjector(nn.Module):
+class SiQ_VLProjector(PreTrainedModel):
+    """
+    SiQ-VL projector module.
+    This module is used to project the vision features into the language model embedding space.
+    It consists of a pixel shuffle operation, a linear projection and a MLP.
+    The pixel shuffle operation is used to compress the vision features into a lower dimension.
+    The linear projection is used to project the vision features into the language model embedding space.
+    The MLP is used to further transform the language model embeddings.
+    The output of the MLP is added to the input of the linear projection to form the final output.
+    """
+
+    config: SiQ_VLProjectorConfig = None
+
     def __init__(
         self,
-        vision_hidden_size,
-        vision_pixel_shuffle_factor,
-        language_model_hidden_size,
+        config: SiQ_VLProjectorConfig = None,
     ):
-        super().__init__()
-        self.vision_pixel_shuffle_factor = vision_pixel_shuffle_factor
-        input_dim = vision_hidden_size * (vision_pixel_shuffle_factor**2)
-        self.in_proj = nn.Linear(input_dim, language_model_hidden_size, bias=False)
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(language_model_hidden_size),
-            nn.Linear(language_model_hidden_size, 2 * language_model_hidden_size),
-            nn.GELU(),
-            nn.Linear(2 * language_model_hidden_size, language_model_hidden_size),
-        )
+        super().__init__(config)
+        self.config = config
+        self.vision_pixel_shuffle_factor = config.vision_pixel_shuffle_factor
+        input_dim = config.vision_hidden_size * (config.vision_pixel_shuffle_factor**2)
+        self.gate_proj = nn.Linear(input_dim, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(input_dim, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.text_hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
         self.apply(self._init_weights)
 
+        self.post_init()
+
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.LayerNorm)):
+        """
+        Custom initialization to align the multi-modality projector's output distribution
+        with the language model's embedding distribution.
+        """
+        if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
     # https://github.com/huggingface/smollm/blob/main/vision/m4/models/vllama3/modeling_vllama3.py#L1281
     def _pixel_shuffle(self, x):
@@ -72,78 +101,97 @@ class SiQ_VLMultiModalityProjector(nn.Module):
 
         x = x.reshape(bsz, h_out, self.vision_pixel_shuffle_factor, w_out, self.vision_pixel_shuffle_factor, embed_dim)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-        x = x.reshape(bsz, h_out * w_out, embed_dim * self.vision_pixel_shuffle_factor**2)
-
-        return x
+        return x.reshape(bsz, h_out * w_out, embed_dim * self.vision_pixel_shuffle_factor**2)
 
     def forward(self, x):
         x = self._pixel_shuffle(x)
-        base = self.in_proj(x)
-        out = self.mlp(base)
-        return base + out  # residual
+        return self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
 
 
-class SiQ_VLModel(Qwen2ForCausalLM):
+class SiQ_VLVisionModel(SiglipVisionModel):
     """
-    SiQ-VL model combining SigLIP vision encoder with Qwen language model.
-
-    This model inherits from PreTrainedModel which provides the methods:
-    - save_pretrained() and from_pretrained() for saving/loading
-    - get_input_embeddings() and set_input_embeddings()
-    - and a few others generic methods
-
-    See the documentation for all the methods available.
+    SiQ-VL vision model.
     """
 
-    config_class = SiQ_VLConfig
-    model_type = "siq_vl"
-    base_model_prefix = "siq_vl"
+    config: SiQ_VLVisionConfig = None
 
-    # CRITICAL: Tell Trainer we don't accept loss kwargs
-    # This ensures Trainer properly normalizes loss for gradient accumulation
-    # See: https://github.com/huggingface/transformers/blob/main/src/transformers/trainer.py#L4060-4064
-    accepts_loss_kwargs = False
-
-    def __init__(
-        self,
-        config: SiQ_VLConfig = None,
-    ):
-        """
-        Initialize SiQ_VLModel.
-
-        Args:
-            config: SiQ_VLConfig instance. If None, will be created from other args.
-            gradient_accumulation_steps: Gradient accumulation steps (for compatibility)
-        """
+    def __init__(self, config: SiQ_VLVisionConfig = None):
         super().__init__(config)
+        self.config = config
 
-        self.vision_model = None  # will be set in post_init
 
-        self.mm_projector = SiQ_VLMultiModalityProjector(
-            self.config.vision_hidden_size,
-            self.config.vision_pixel_shuffle_factor,
-            self.config.language_model_hidden_size,  # type: ignore
+class SiQ_VLPreTrainedModel(PreTrainedModel):
+    """
+    SiQ-VL pre-trained model.
+    """
+
+    config: SiQ_VLConfig = None
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules: ClassVar[list[str]] = ["SiQ_VLTextModel", "SiQ_VLVisionModel", "SiQ_VLProjector"]
+    _skip_keys_device_placement: ClassVar[list[str]] = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+
+
+class SiQ_VLTextModel(Qwen2ForCausalLM):
+    config: SiQ_VLTextConfig = None
+
+    def __init__(self, config: SiQ_VLTextConfig = None):
+        super().__init__(config)
+        self.config = config
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
+
+
+class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
+    def __init__(self, config: SiQ_VLConfig = None):
+        super().__init__(config)
+        self.config = config
+        self.text_model = SiQ_VLTextModel(config.text_config)
+        self.vocab_size = config.text_config.vocab_size
+        self.vision_model = SiQ_VLVisionModel(config.vision_config)
+        self.projector = SiQ_VLProjector(config.projector_config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def freez_text_model(self):
+        for param in self.text_model.parameters():
+            param.requires_grad_(False)
+        self.text_model.eval()
+
+    def unfreez_text_model(self):
+        for param in self.text_model.parameters():
+            param.requires_grad_(True)
+        self.text_model.eval()
+
+    def freez_vision_model(self):
+        for param in self.vision_model.parameters():
+            param.requires_grad_(False)
+        self.vision_model.eval()
+
+    def print_trainable_parameters(self):
+        """
+        Print the number of trainable parameters for each submodel and the total number of trainable parameters.
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        vision_params = sum(p.numel() for p in self.vision_model.parameters())
+        text_params = sum(p.numel() for p in self.text_model.parameters())
+        projector_params = sum(p.numel() for p in self.projector.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        rank_zero_info(
+            f"Total model parameters: {total_params:,} | "
+            f"Vision model parameters: {vision_params:,} ({vision_params / total_params * 100:.2f}%) | "
+            f"Text model parameters: {text_params:,} ({text_params / total_params * 100:.2f}%) | "
+            f"Projector parameters: {projector_params:,} ({projector_params / total_params * 100:.2f}%) | "
+            f"Trainable model parameters: {trainable_params:,}, ({trainable_params / total_params * 100:.2f}%)"
         )
-
-        # Store token IDs from config
-        self.language_model_ignore_index = config.language_model_ignore_index
-        self.language_model_image_token_id = config.language_model_image_token_id
-        self.language_model_vision_start_id = config.language_model_vision_start_id
-        self.language_model_vision_end_id = config.language_model_vision_end_id
-
-        self.mm_projector.apply(self._init_mm_projector_weights)
-
-        super().post_init()
-
-    def _init_mm_projector_weights(self, m):
-        """
-        Custom initialization to align the multi-modality projector's output distribution
-        with the language model's embedding distribution.
-        """
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, mean=0.0, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
 
     def forward(
         self,
@@ -179,11 +227,11 @@ class SiQ_VLModel(Qwen2ForCausalLM):
         if past_key_values is None and pixel_values is not None:
             vision_outputs = self.vision_model(pixel_values)
             vision_features = vision_outputs.last_hidden_state
-            vision_token_embeddings = self.mm_projector(vision_features)
+            vision_token_embeddings = self.projector(vision_features)
 
-            token_embeddings = self.get_input_embeddings()(input_ids)
+            token_embeddings = self.text_model.get_input_embeddings()(input_ids)
             # find the positions of <|image_pad|> tokens
-            image_token_positions = (input_ids == self.language_model_image_token_id).nonzero(as_tuple=True)
+            image_token_positions = (input_ids == self.config.image_token_index).nonzero(as_tuple=True)
 
             if image_token_positions[0].numel() > 0:
                 batch_size, num_image_tokens, hidden = vision_token_embeddings.shape
@@ -203,78 +251,141 @@ class SiQ_VLModel(Qwen2ForCausalLM):
                 token_embeddings[image_token_positions] = vision_token_embeddings_flat
         else:
             # During generation with KV cache, only process new text tokens
-            token_embeddings = self.get_input_embeddings()(input_ids)
+            token_embeddings = self.text_model.get_input_embeddings()(input_ids)
 
-        return super().forward(
+        return self.text_model(
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=token_embeddings,
-            labels=labels,
+            inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
-            logits_to_keep=logits_to_keep,
             **kwargs,
         )
 
 
-__all__ = ["SiQ_VLModel"]
+__all__ = [
+    "SiQ_VLForCausalLM",
+    "SiQ_VLPreTrainedModel",
+    "SiQ_VLProjector",
+    "SiQ_VLTextModel",
+    "SiQ_VLVisionModel",
+]
 
-AutoModelForCausalLM.register(config_class=SiQ_VLConfig, model_class=SiQ_VLModel)
+AutoModelForCausalLM.register(config_class=SiQ_VLConfig, model_class=SiQ_VLForCausalLM)
 
 
-def get_init_vl_model_for_stage_1(config: SiQ_VLConfig) -> SiQ_VLModel:
+def get_stage1_model_and_processor(
+    pretrained_vision_model_path: str = "google/siglip2-base-patch16-224",
+    pretrained_text_model_path: str = "Qwen/Qwen2.5-0.5B-Instruct",
+) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
     Args:
-        config: SiQ_VLConfig instance.
+        pretrained_vision_model_path: Path to the pretrained vision model.
+        pretrained_text_model_path: Path to the pretrained text model.
 
     Returns:
-        SiQ_VLModel instance.
+        SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
     """
-    vl_model = SiQ_VLModel.from_pretrained(
-        pretrained_model_name_or_path=config.pretrained_language_model_path,
-        config=config,
-        trust_remote_code=True,
+    print("Initializing SiQ-VL model for stage 1...")
+    config = get_siq_vl_config(
+        text_model_name_or_path=pretrained_text_model_path,
+        vision_model_name_or_path=pretrained_vision_model_path,
     )
-    vl_model.vision_model = SiglipVisionModel.from_pretrained(config.pretrained_vision_model_path)
+    print("Config: \n", config)
 
-    if config.freeze_vision_encoder:
-        for param in vl_model.vision_model.parameters():
-            param.requires_grad_(False)
-        vl_model.vision_model.eval()
+    model = SiQ_VLForCausalLM(config)
+    model.text_model = SiQ_VLTextModel.from_pretrained(pretrained_text_model_path)
+    model.vision_model = SiQ_VLVisionModel.from_pretrained(pretrained_vision_model_path)
 
-    if config.freeze_language_model:
-        for param in vl_model.model.parameters():
-            param.requires_grad_(False)
-        vl_model.model.eval()
+    model.freez_vision_model()
+    model.freez_text_model()
 
-    return vl_model
+    model.print_trainable_parameters()
+
+    processor = SiQ_VLProcessor(
+        image_processor=SiglipImageProcessor.from_pretrained(pretrained_vision_model_path),
+        tokenizer=Qwen2TokenizerFast.from_pretrained(pretrained_text_model_path),
+        image_size=model.vision_model.config.image_size,
+        patch_size=model.vision_model.config.patch_size,
+        pixel_shuffle_factor=model.projector.config.vision_pixel_shuffle_factor,
+    )
+
+    return model, processor
+
+
+def get_stage2_model_and_processor(
+    stage_1_checkpoint_path: str = "outputs/checkpoints/siq_vl_stage1",
+    use_lora: bool = False,
+    lora_r: int = 64,  # Rank of the update matrices
+    lora_alpha: int = 16,  # Alpha parameter for LoRA scaling
+    lora_dropout: float = 0.05,  # Dropout probability for the LoRA update matrices
+    lora_target_modules: list[str] | None = None,
+) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
+    """
+    Get the stage 2 SiQ-VL model and processor.
+    Args:
+        stage_1_checkpoint_path: Path to the stage 1 checkpoint.
+        use_lora: Whether to use LoRA to train the model.
+        lora_r: Rank of the LoRA update matrices.
+        lora_alpha: Alpha parameter for LoRA scaling.
+        lora_dropout: Dropout probability for the LoRA update matrices.
+        lora_target_modules: Target modules for the LoRA update matrices.
+    """
+    model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path)
+    processor = SiQ_VLProcessor.from_pretrained(stage_1_checkpoint_path)
+
+    model.unfreez_text_model()
+    model.freez_vision_model()
+
+    if use_lora:
+        # apply lora to the text model
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        if lora_target_modules is None:
+            # Target the attention and MLP modules of the transformer layers
+            lora_target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+
+        model.text_model = get_peft_model(
+            model.text_model,
+            LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
+                task_type=TaskType.CAUSAL_LM,
+                bias="none",  # Don't train bias terms for the LoRA update matrices
+            ),
+        )
+
+    model.print_trainable_parameters()
+
+    print(model.config)
+    print(model.text_model.config)
+    print(model.vision_model.config)
+    print(model.projector.config)
+
+    return model, processor
 
 
 if __name__ == "__main__":
-    config = SiQ_VLConfig(
-        pretrained_vision_model_path="google/siglip2-base-patch16-224",
-        pretrained_language_model_path="Qwen/Qwen2.5-0.5B-Instruct",
-        vision_hidden_size=768,
-        vision_pixel_shuffle_factor=2,
-        language_model_hidden_size=768,
-        language_model_image_token_id=151655,
-        language_model_vision_start_id=151652,
-        language_model_vision_end_id=151653,
-        language_model_ignore_index=-100,
-    )
+    print("=" * 100)
+    print("Stage 1")
+    print("=" * 100)
 
-    model = get_init_vl_model_for_stage_1(config)
+    stage_1_model, stage_1_processor = get_stage1_model_and_processor()
 
-    processor = SiQ_VLProcessor(
-        image_processor=SiglipImageProcessor.from_pretrained(config.pretrained_vision_model_path),
-        tokenizer=Qwen2TokenizerFast.from_pretrained(config.pretrained_language_model_path),
-        image_size=config.vision_image_size,
-        patch_size=config.vision_patch_size,
-        pixel_shuffle_factor=config.vision_pixel_shuffle_factor,
-    )
-    inputs = processor(
+    inputs = stage_1_processor(
         batch=[
             (Image.open("image.png"), "Describe this image.", "The image shows a beautiful sunset."),
             (Image.open("image.png"), "How many people are in the image?", "There are 2 people in the image."),
@@ -285,7 +396,7 @@ if __name__ == "__main__":
     print("pixel_values min and max:", inputs.pixel_values.min(), inputs.pixel_values.max())
     print("pixel_values shape:", inputs.pixel_values.shape)
 
-    outputs = model(
+    outputs = stage_1_model(
         input_ids=inputs.input_ids,
         pixel_values=inputs.pixel_values,
         attention_mask=inputs.attention_mask,
@@ -294,9 +405,9 @@ if __name__ == "__main__":
     print(outputs)
 
     print("Generating...")
-    model.eval()
+    stage_1_model.eval()
     with torch.no_grad():
-        output_ids = model.generate(
+        output_ids = stage_1_model.generate(
             input_ids=inputs.input_ids,
             pixel_values=inputs.pixel_values,
             attention_mask=inputs.attention_mask,
@@ -304,4 +415,56 @@ if __name__ == "__main__":
             max_new_tokens=64,
         )
 
-    print(processor.batch_decode(output_ids, assistant_only=True, skip_special_tokens=True))
+    print(stage_1_processor.batch_decode(output_ids, assistant_only=True, skip_special_tokens=True))
+
+    stage_1_model.save_pretrained("outputs/checkpoints/siq_vl_stage1")
+    stage_1_processor.save_pretrained("outputs/checkpoints/siq_vl_stage1")
+    del stage_1_model, stage_1_processor
+
+    print("Model and processor saved to outputs/checkpoints/siq_vl_stage1")
+
+    print("=" * 100)
+    print("Stage 2")
+    print("=" * 100)
+
+    stage_2_model, stage_2_processor = get_stage2_model_and_processor(
+        stage_1_checkpoint_path="outputs/checkpoints/siq_vl_stage1",
+        use_lora=True,
+    )
+
+    inputs = stage_2_processor(
+        batch=[
+            (Image.open("image.png"), "Describe this image.", "The image shows a beautiful sunset."),
+            (Image.open("image.png"), "How many people are in the image?", "There are 2 people in the image."),
+        ],
+        return_tensors="pt",
+    )
+
+    print("pixel_values min and max:", inputs.pixel_values.min(), inputs.pixel_values.max())
+    print("pixel_values shape:", inputs.pixel_values.shape)
+
+    outputs = stage_2_model(
+        input_ids=inputs.input_ids,
+        pixel_values=inputs.pixel_values,
+        attention_mask=inputs.attention_mask,
+        labels=inputs.labels,
+    )
+    print(outputs)
+
+    print("Generating...")
+    stage_2_model.eval()
+    with torch.no_grad():
+        output_ids = stage_2_model.generate(
+            input_ids=inputs.input_ids,
+            pixel_values=inputs.pixel_values,
+            attention_mask=inputs.attention_mask,
+            do_sample=True,
+            max_new_tokens=64,
+        )
+    print(stage_2_processor.batch_decode(output_ids, assistant_only=True, skip_special_tokens=True))
+
+    stage_2_model.save_pretrained("outputs/checkpoints/siq_vl_stage2")
+    stage_2_processor.save_pretrained("outputs/checkpoints/siq_vl_stage2")
+    del stage_2_model, stage_2_processor
+
+    print("Model and processor saved to outputs/checkpoints/siq_vl_stage2")

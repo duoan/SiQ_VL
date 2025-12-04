@@ -12,8 +12,6 @@ import torch
 import torch.distributed as dist
 from torchmetrics.utilities.prints import rank_zero_info
 from transformers import (
-    AutoImageProcessor,
-    AutoTokenizer,
     EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
@@ -26,9 +24,7 @@ from siq_vl.callbacks import (
 )
 from siq_vl.collator import SiQ_VLDataCollator
 from siq_vl.dataset import VQADataset
-from siq_vl.model.configuration import SiQ_VLConfig
-from siq_vl.model.modeling import SiQ_VLModel, get_init_vl_model_for_stage_1
-from siq_vl.model.processing import SiQ_VLProcessor
+from siq_vl.model.modeling import get_stage1_model_and_processor, get_stage2_model_and_processor
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -154,17 +150,17 @@ def infer_stage_name(output_dir: str | None = None) -> str:
 
 def generate_run_name(
     vision_model_path: str,
-    llm_model_path: str,
+    text_model_path: str,
     output_dir: str | None = None,
 ) -> str:
     """
     Generate a run name from model names, stage, and datetime.
-    Format: {vision_model}_{llm_model}_{stage}_{datetime}
+    Format: {vision_model}_{text_model}_{stage}_{datetime}
     """
-    vision_name = extract_model_name(vision_model_path)
-    llm_name = extract_model_name(llm_model_path)
+    vision_model_name = extract_model_name(vision_model_path)
+    text_model_name = extract_model_name(text_model_path)
 
-    return f"{vision_name}_{llm_name}_{infer_stage_name(output_dir)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    return f"{vision_model_name}_{text_model_name}_{infer_stage_name(output_dir)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
 def seed_everything(seed: int = 42):
@@ -235,22 +231,58 @@ def parse_args():
         help="Path or name of the vision model",
     )
     parser.add_argument(
-        "--llm_model_name_or_path",
+        "--text_model_name_or_path",
         type=str,
         default="Qwen/Qwen2.5-0.5B-Instruct",
-        help="Path or name of the LLM model",
+        help="Path or name of the text model",
     )
     parser.add_argument(
-        "--freeze_llm",
+        "--freeze_text_model",
         action="store_true",
         default=True,
-        help="Freeze the LLM model (default: True)",
+        help="Freeze the text model (default: True)",
     )
     parser.add_argument(
-        "--no_freeze_llm",
-        dest="freeze_llm",
+        "--no_freeze_text_model",
+        dest="freeze_text_model",
         action="store_false",
-        help="Do not freeze the LLM model",
+        help="Do not freeze the text model",
+    )
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        default=False,
+        help="Use LoRA to train the model (default: False)",
+    )
+    parser.add_argument(
+        "--no_use_lora",
+        dest="use_lora",
+        action="store_false",
+        help="Do not use LoRA to train the model",
+    )
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=64,
+        help="Rank of the LoRA update matrices (default: 64)",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="Alpha parameter for LoRA scaling (default: 16)",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.05,
+        help="Dropout probability for the LoRA update matrices (default: 0.05)",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=list[str],
+        default=None,
+        help="Target modules for the LoRA update matrices (default: None)",
     )
     parser.add_argument(
         "--pixel_shuffle_factor",
@@ -263,10 +295,10 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints",
+        default="./outputs",
         help=(
-            "Root directory for checkpoints. The final path is computed as "
-            "'{output_dir}/siq-vl_{vision_backbone}_{llm_backbone}/{stage}'."
+            "Root directory for outputs. The final path is computed as "
+            "'{output_dir}/siq-vl_{vision_backbone}_{text_backbone}/{stage}'."
         ),
     )
 
@@ -425,7 +457,7 @@ def parse_args():
         help=(
             "Optional explicit Hub model id (e.g. 'org/siq_vl-...'). "
             "If not provided, a name of the form "
-            "'siq_vl-{vision}__{llm}-{stage}' will be used."
+            "'siq_vl-{vision}__{text}-{stage}' will be used."
         ),
     )
 
@@ -492,21 +524,21 @@ def train(args=None):
         rank_zero_info(f"    - {name}: weight={w}")
 
     vision_model_name_or_path = args.vision_model_name_or_path
-    llm_model_name_or_path = args.llm_model_name_or_path
+    text_model_name_or_path = args.text_model_name_or_path
 
     # Backbone identifiers (used both for output_dir and for naming).
     vision_name = extract_model_name(vision_model_name_or_path)
-    llm_name = extract_model_name(llm_model_name_or_path)
+    text_name = extract_model_name(text_model_name_or_path)
 
     # Infer stage name once so we can use it consistently for paths and Hub IDs
     stage_name = infer_stage_name(args.output_dir)
 
     # New local checkpoint layout:
-    #   {output_dir}/siq-vl_{vision_backbone}_{llm_backbone}/{stage}
+    #   {output_dir}/siq-vl_{vision_backbone}_{text_backbone}/{stage}
     # e.g.:
     #   ./checkpoints/siq-vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct/stage1
     base_output_dir = args.output_dir
-    run_root = os.path.join(base_output_dir, f"siq-vl_{vision_name}_{llm_name}")
+    run_root = os.path.join(base_output_dir, generate_run_name(vision_model_name_or_path, text_model_name_or_path))
     OUTPUT_DIR = os.path.join(run_root, stage_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rank_zero_info(f">>> Using output_dir: {OUTPUT_DIR}")
@@ -514,55 +546,29 @@ def train(args=None):
     # ====================================================
     # 2. Initialize Processor & Model
     # ====================================================
-    rank_zero_info(">>> Loading Processor & Tokenizer...")
-    # Load base configs from Hugging Face
-    image_processor = AutoImageProcessor.from_pretrained(vision_model_name_or_path)
-    tokenizer = AutoTokenizer.from_pretrained(llm_model_name_or_path)
-
-    # Extract image_size and patch_size from vision model path
-    image_size, patch_size = extract_vision_config(vision_model_name_or_path)
-    rank_zero_info(f">>> Extracted vision config: image_size={image_size}, patch_size={patch_size}")
-
-    # Initialize our Custom Processor
-    processor = SiQ_VLProcessor(
-        image_processor,
-        tokenizer,
-        image_size=image_size,
-        patch_size=patch_size,
-        pixel_shuffle_factor=args.pixel_shuffle_factor,
-    )
 
     # Define training hyperparameters before model initialization
     per_device_train_batch_size = args.per_device_train_batch_size
     gradient_accumulation_steps = args.gradient_accumulation_steps
 
-    rank_zero_info(">>> Loading Model...")
+    rank_zero_info(">>> Loading Model and Processor...")
     # Initialize our Custom Model using config
-    config = SiQ_VLConfig(
-        pretrained_vision_model_path=vision_model_name_or_path,
-        pretrained_language_model_path=llm_model_name_or_path,
-        freeze_language_model=args.freeze_llm,
-        vision_pixel_shuffle_factor=args.pixel_shuffle_factor,
-    )
 
     if stage_name == "stage1":
-        vl_model = get_init_vl_model_for_stage_1(config)
-    elif stage_name == "stage2":
-        vl_model = SiQ_VLModel.from_pretrained(
-            config.pretrained_language_model_path, config=config, trust_remote_code=True
+        vl_model, vl_processor = get_stage1_model_and_processor(
+            pretrained_vision_model_path=vision_model_name_or_path,
+            pretrained_text_model_path=text_model_name_or_path,
         )
-        if args.freeze_llm:
-            for param in vl_model.model.parameters():
-                param.requires_grad_(False)
-            vl_model.model.eval()
-        else:
-            for param in vl_model.model.parameters():
-                param.requires_grad_(True)
-            vl_model.model.train()
-
-    # Print number of trainable parameters
-    trainable_params = sum(p.numel() for p in vl_model.parameters() if p.requires_grad)
-    rank_zero_info(f">>> Trainable Parameters: {trainable_params / 1e6:.2f} M")
+    elif stage_name == "stage2":
+        vl_model, vl_processor = get_stage2_model_and_processor(
+            stage_1_model_path=stage_1_model_path,
+            stage_1_processor_path=stage_1_processor_path,
+            use_lora=args.use_lora,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
+        )
 
     # ====================================================
     # 3. Prepare Data
@@ -642,7 +648,7 @@ def train(args=None):
         rank_zero_info(f">>> Using user-specified max_steps={max_steps}")
 
     # Initialize Collator
-    data_collator = SiQ_VLDataCollator(processor=processor, return_raw_data=True)
+    data_collator = SiQ_VLDataCollator(processor=vl_processor, return_raw_data=True)
 
     # ====================================================
     # 4. Training Arguments
@@ -650,7 +656,7 @@ def train(args=None):
     # Generate run name from model names, stage, and datetime
     run_name = generate_run_name(
         vision_model_path=vision_model_name_or_path,
-        llm_model_path=llm_model_name_or_path,
+        text_model_path=text_model_name_or_path,
         output_dir=OUTPUT_DIR,
     )
     rank_zero_info(f">>> Generated run name: {run_name}")
@@ -739,7 +745,7 @@ def train(args=None):
     # Initialize generation callback for periodic evaluation
     # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
     generation_callback = GenerationCallback(
-        processor=processor,
+        processor=vl_processor,
         eval_dataset=eval_dataset,
         num_samples=args.gen_samples,
         eval_interval=args.gen_steps,
@@ -764,7 +770,7 @@ def train(args=None):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        processing_class=processor,
+        processing_class=vl_processor,
         callbacks=callbacks,
     )
 
@@ -774,7 +780,7 @@ def train(args=None):
     labels = batch["labels"][0]
     for i in range(len(input_ids)):
         if labels[i] != -100:
-            rank_zero_info(f"Token: {tokenizer.decode([input_ids[i]])} | Label: {labels[i].item()}")
+            rank_zero_info(f"Token: {vl_processor.decode([input_ids[i]])} | Label: {labels[i].item()}")
     rank_zero_info(f"input_ids:\n {input_ids} \n")
     rank_zero_info(f"labels:\n {[label.item() for label in labels]} \n")
     rank_zero_info(f"Question:\n {batch['questions'][0]} \n")

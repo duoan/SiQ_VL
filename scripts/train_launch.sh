@@ -100,16 +100,16 @@ echo ">>> Using Python: $PYTHON_CMD"
 
 # Stage-specific base parameters
 if [[ "$STAGE" == "1" ]]; then
-    # Stage 1: freeze LLM, train projector
+    # Stage 1: freeze text model, train projector
     BASE_ARGS=(
-        "--freeze_llm"
+        "--freeze_text_model"
         "--output_dir" "./checkpoints"
         # Keep default project name from train.py ("siq-vl")
     )
 else
-    # Stage 2: unfreeze LLM, full finetuning
+    # Stage 2: unfreeze text model, full finetuning
     BASE_ARGS=(
-        "--no_freeze_llm"
+        "--no_freeze_text_model"
         "--output_dir" "./checkpoints"
     )
 fi
@@ -121,7 +121,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
     if [[ "$STAGE" == "1" ]]; then
         MAC_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-base-patch16-224"
-            "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "2"
             "--sub_sets" "sharegpt4v(knowledge)"  # Only use knowledge subset for quick testing
@@ -144,7 +144,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
     else
         MAC_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-base-patch16-224"
-            "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "2"
             "--sub_sets" "sharegpt4v(knowledge)"  # Quick VQA-like subset
@@ -175,7 +175,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
     if [[ "$STAGE" == "1" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
-            "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "4"
             "--sub_sets" "coco_colors,sharegpt4v(coco),laion_gpt4v,face_emotion"
@@ -198,7 +198,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         # Stage 2: large-scale finetuning with ~1M VQA samples, auto max_steps
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
-            "--llm_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "4" 
             "--per_device_train_batch_size" "4"

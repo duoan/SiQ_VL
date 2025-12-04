@@ -7,10 +7,13 @@ import argparse
 import os
 import sys
 
+from PIL import Image
+from transformers import AutoProcessor
+
 # Add parent directory to path to import siq_vl
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from siq_vl.model import load_model_from_checkpoint
+from siq_vl.model.modeling import SiQ_VLModel
 
 
 def main():
@@ -68,21 +71,20 @@ def main():
     args = parser.parse_args()
 
     # Load model and processor
-    model, processor = load_model_from_checkpoint(args.checkpoint, device=args.device)
+    vl_model = SiQ_VLModel.from_pretrained(args.checkpoint)
+    vl_model.to(args.device)
+    vl_model.eval()
 
-    # Generate answer
-    print(f"\n>>> Question: {args.question}")
-    print(">>> Generating answer...")
-
-    answer = model.generate_answer(
-        processor=processor,
-        samples=(args.image, args.question),
+    processor = AutoProcessor.from_pretrained(args.checkpoint)
+    inputs = processor(batch=[(args.question, Image.open(args.image), None)])
+    output_ids = vl_model.generate(
+        **inputs,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
-        do_sample=not args.no_sample,
         num_beams=args.num_beams,
+        do_sample=not args.no_sample,
     )
-
+    answer = processor.batch_decode(output_ids, assistant_only=True, skip_special_tokens=True)
     print(f"\n>>> Answer: {answer}\n")
 
 

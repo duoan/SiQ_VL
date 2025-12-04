@@ -2,6 +2,8 @@
 Processor class for SiQ-VL (Siglip2 + Qwen2).
 """
 
+import json
+import os
 from typing import Any
 
 import torch
@@ -27,9 +29,9 @@ class SiQ_VLProcessor(ProcessorMixin):
         image_processor: SiglipImageProcessor,
         tokenizer: Qwen2TokenizerFast,
         *,
-        image_size: int = 384,
-        patch_size: int = 14,
-        pixel_shuffle_factor: int = 3,
+        image_size: int = 224,
+        patch_size: int = 16,
+        pixel_shuffle_factor: int = 2,
     ):
         """
         Initializes the SiQ_VLProcessor.
@@ -273,14 +275,51 @@ class SiQ_VLProcessor(ProcessorMixin):
 
     def decode(self, output_ids: torch.Tensor, assistant_only: bool = True, *args, **kwargs):
         """Helper to decode a single sequence of token IDs."""
+        # Convert to tensor if it's a list or other type
+        if not isinstance(output_ids, torch.Tensor):
+            output_ids = torch.tensor(output_ids)
+
         if assistant_only:
-            start_index = (output_ids == self._assistant_token_id).nonzero(as_tuple=True)[0] + 2
-            output_ids = output_ids[start_index:]
+            # Find assistant token indices
+            assistant_indices = (output_ids == self._assistant_token_id).nonzero(as_tuple=True)[0]
+            if len(assistant_indices) > 0:
+                start_index = assistant_indices[0] + 2
+                output_ids = output_ids[start_index:]
         return self.tokenizer.decode(output_ids, *args, **kwargs)
 
     @property
     def model_input_names(self):
         return ["input_ids", "attention_mask", "pixel_values"]
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """
+        Load processor from pretrained, ensuring custom attributes are loaded from processor_config.json.
+        """
+        # Load processor_config.json first to get custom attributes
+        from transformers.utils import PROCESSOR_NAME, cached_file
+
+        processor_config_file = cached_file(
+            pretrained_model_name_or_path,
+            PROCESSOR_NAME,
+            _raise_exceptions_for_missing_entries=False,
+        )
+
+        # Extract custom attributes from processor_config.json and pass as kwargs
+        if processor_config_file and os.path.exists(processor_config_file):
+            with open(processor_config_file, encoding="utf-8") as f:
+                processor_config = json.load(f)
+
+            # Pass custom attributes as kwargs if they exist in config and not already in kwargs
+            if "image_size" in processor_config and "image_size" not in kwargs:
+                kwargs["image_size"] = processor_config["image_size"]
+            if "patch_size" in processor_config and "patch_size" not in kwargs:
+                kwargs["patch_size"] = processor_config["patch_size"]
+            if "pixel_shuffle_factor" in processor_config and "pixel_shuffle_factor" not in kwargs:
+                kwargs["pixel_shuffle_factor"] = processor_config["pixel_shuffle_factor"]
+
+        # Load using parent method with updated kwargs
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 
 
 __all__ = ["SiQ_VLProcessor"]
