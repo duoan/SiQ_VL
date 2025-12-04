@@ -715,6 +715,7 @@ def train(args=None):
         save_total_limit=2,  # Keep only the last 2 checkpoints to save disk space
         report_to="wandb",
         project="siq-vl",
+        disable_tqdm=False,  # Enable progress bar display
         # --- CRITICAL FIX FOR LOSS REPORTING ---
         # The issue: Trainer was summing losses across gradient accumulation steps
         # instead of averaging them, causing reported loss to be 4x higher

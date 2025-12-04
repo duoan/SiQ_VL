@@ -249,9 +249,9 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
                 # Ensure dtype match to avoid RuntimeError
                 vision_token_embeddings_flat = vision_token_embeddings_flat.to(dtype=token_embeddings.dtype)
                 token_embeddings[image_token_positions] = vision_token_embeddings_flat
-        else:
-            # During generation with KV cache, only process new text tokens
-            token_embeddings = self.text_model.get_input_embeddings()(input_ids)
+            # Use custom embeddings instead of input_ids when we've processed vision
+            inputs_embeds = token_embeddings
+            input_ids = None
 
         return self.text_model(
             input_ids=input_ids,
@@ -259,6 +259,7 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            labels=labels,
             use_cache=use_cache,
             cache_position=cache_position,
             **kwargs,
@@ -289,12 +290,12 @@ def get_stage1_model_and_processor(
     Returns:
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
     """
-    print("Initializing SiQ-VL model for stage 1...")
+    rank_zero_info("Initializing SiQ-VL model for stage 1...")
     config = get_siq_vl_config(
         text_model_name_or_path=pretrained_text_model_path,
         vision_model_name_or_path=pretrained_vision_model_path,
     )
-    print("Config: \n", config)
+    rank_zero_info(f"Config: \n{config}")
 
     model = SiQ_VLForCausalLM(config)
     model.text_model = SiQ_VLTextModel.from_pretrained(pretrained_text_model_path)
@@ -341,6 +342,7 @@ def get_stage2_model_and_processor(
     model.freez_vision_model()
 
     if use_lora:
+        rank_zero_info("Applying LoRA to the text model...")
         # apply lora to the text model
         from peft import LoraConfig, TaskType, get_peft_model
 
@@ -370,10 +372,10 @@ def get_stage2_model_and_processor(
 
     model.print_trainable_parameters()
 
-    print(model.config)
-    print(model.text_model.config)
-    print(model.vision_model.config)
-    print(model.projector.config)
+    rank_zero_info(model.config)
+    rank_zero_info(model.text_model.config)
+    rank_zero_info(model.vision_model.config)
+    rank_zero_info(model.projector.config)
 
     return model, processor
 
