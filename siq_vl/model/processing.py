@@ -371,7 +371,6 @@ class SiQ_VLProcessor(ProcessorMixin):
                         ],
                     }
                 )
-            print(msgs)
             msg_batch.append(msgs)
 
         # -------------------------------------------------------
@@ -391,8 +390,6 @@ class SiQ_VLProcessor(ProcessorMixin):
             )
             for msgs, ans in zip(normalized_msg_batch, answers, strict=False)
         ]
-
-        print(f"Formatted Texts: \n{formatted_texts[0]}")
 
         text_outputs = self.tokenizer(
             formatted_texts,
