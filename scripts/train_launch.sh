@@ -157,6 +157,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--learning_rate" "2e-5"
             "--no_bf16"  # MacBook typically doesn't support bf16
             "--fp16"     # Use fp16 if available
+            "--use_lora"
             "--logging_steps" "2"
             "--save_steps" "10"
             "--gen_steps" "10"

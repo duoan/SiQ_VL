@@ -11,10 +11,8 @@ from transformers import (
     PreTrainedModel,
     Qwen2ForCausalLM,
     Qwen2TokenizerFast,
-    SiglipImageProcessor,
     SiglipVisionModel,
 )
-from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import logging
@@ -53,10 +51,7 @@ class SiQ_VLProjector(PreTrainedModel):
         self.config = config
         self.vision_pixel_shuffle_factor = config.vision_pixel_shuffle_factor
         input_dim = config.vision_hidden_size * (config.vision_pixel_shuffle_factor**2)
-        self.gate_proj = nn.Linear(input_dim, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(input_dim, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.text_hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.mlp = nn.Linear(input_dim, config.text_hidden_size, bias=False)
         self.apply(self._init_weights)
 
         self.post_init()
@@ -70,9 +65,6 @@ class SiQ_VLProjector(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
 
     # https://github.com/huggingface/smollm/blob/main/vision/m4/models/vllama3/modeling_vllama3.py#L1281
     def _pixel_shuffle(self, x):
@@ -104,8 +96,10 @@ class SiQ_VLProjector(PreTrainedModel):
         return x.reshape(bsz, h_out * w_out, embed_dim * self.vision_pixel_shuffle_factor**2)
 
     def forward(self, x):
+        # 1. pixel shuffle: [batch_size, L, D] -> [batch_size, L/r^2, D*r^2]
         x = self._pixel_shuffle(x)
-        return self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
+        # 2. Simple MLP
+        return self.mlp(x)
 
 
 class SiQ_VLVisionModel(SiglipVisionModel):
@@ -225,30 +219,40 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         # Process vision inputs only on the first forward pass (when past_key_values is None)
         # During generation with KV cache, we only process new tokens, not images
         if past_key_values is None and pixel_values is not None:
+            # 1. Vision Forward
+            # pixel_values shape: (Total_Tiles, C, H, W)
             vision_outputs = self.vision_model(pixel_values)
             vision_features = vision_outputs.last_hidden_state
+
+            # 2. Projector
+            # vision_token_embeddings shape: (Total_Tiles, Tokens_Per_Tile, Text_Dim)
             vision_token_embeddings = self.projector(vision_features)
 
+            # 3. Flatten All Vision Tokens
+            # vision_token_embeddings_flat shape: (Total_Vision_Tokens, Text_Dim)
+            vision_token_embeddings_flat = vision_token_embeddings.view(-1, vision_token_embeddings.size(-1))
+
+            # 4. Text Embeddings
             token_embeddings = self.text_model.get_input_embeddings()(input_ids)
+
+            # 5. Replacement
             # find the positions of <|image_pad|> tokens
             image_token_positions = (input_ids == self.config.image_token_index).nonzero(as_tuple=True)
 
-            if image_token_positions[0].numel() > 0:
-                batch_size, num_image_tokens, hidden = vision_token_embeddings.shape
-                expected = batch_size * num_image_tokens
-                actual = image_token_positions[0].numel()
-                if actual != expected:
-                    raise ValueError(
-                        f"Number of <|image_pad|> tokens ({actual}) "
-                        f"!= batch_size * num_image_tokens from vision encoder ({expected}). "
-                        "Please check processor image_size/patch_size/pixel_shuffle_factor "
-                        "and vision_pixel_shuffle_factor in config."
-                    )
-                vision_token_embeddings_flat = vision_token_embeddings.reshape(expected, hidden)
-                # replace the <|image_pad|> tokens with the vision token embeddings
-                # Ensure dtype match to avoid RuntimeError
-                vision_token_embeddings_flat = vision_token_embeddings_flat.to(dtype=token_embeddings.dtype)
-                token_embeddings[image_token_positions] = vision_token_embeddings_flat
+            num_placeholders = image_token_positions[0].numel()
+            num_vision_tokens = vision_token_embeddings_flat.shape[0]
+
+            if num_placeholders != num_vision_tokens:
+                raise ValueError(
+                    f"Shape Mismatch! \n"
+                    f"Text has {num_placeholders} image placeholders.\n"
+                    f"Vision Encoder produced {num_vision_tokens} tokens.\n"
+                    f"Check Processor logic regarding 'tokens_per_tile' calculation."
+                )
+
+            vision_token_embeddings_flat = vision_token_embeddings_flat.to(dtype=token_embeddings.dtype)
+            token_embeddings[image_token_positions] = vision_token_embeddings_flat
+
             # Use custom embeddings instead of input_ids when we've processed vision
             inputs_embeds = token_embeddings
             input_ids = None
@@ -307,10 +311,9 @@ def get_stage1_model_and_processor(
     model.print_trainable_parameters()
 
     processor = SiQ_VLProcessor(
-        image_processor=SiglipImageProcessor.from_pretrained(pretrained_vision_model_path),
         tokenizer=Qwen2TokenizerFast.from_pretrained(pretrained_text_model_path),
-        image_size=model.vision_model.config.image_size,
-        patch_size=model.vision_model.config.patch_size,
+        vit_image_size=model.vision_model.config.image_size,
+        vit_patch_size=model.vision_model.config.patch_size,
         pixel_shuffle_factor=model.projector.config.vision_pixel_shuffle_factor,
     )
 

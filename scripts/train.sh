@@ -11,7 +11,7 @@ STAGE=1 bash "$SCRIPT_DIR/train_launch.sh" "$@" || {
 }
 echo "Training Stage 1 completed."
 
-print "Training Stage 2..."
+echo "Training Stage 2..."
 STAGE=2 bash "$SCRIPT_DIR/train_launch.sh" "$@" || {
     echo "Training Stage 2 failed."
     exit 1
