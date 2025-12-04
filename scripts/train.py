@@ -741,7 +741,41 @@ def train(args=None):
     )
 
     # ====================================================
-    # 5. Start Training
+    # 5. Save custom model code files for AutoModel.from_pretrained()
+    # ====================================================
+    # Copy custom modeling.py and configuration.py to output directory
+    # so that others can use AutoModel.from_pretrained() to load the model
+
+    # Get the source directory of siq_vl.model
+    import siq_vl.model as model_module
+
+    source_model_dir = os.path.dirname(model_module.__file__)
+
+    # Copy necessary files directly to the OUTPUT_DIR (which is the checkpoint folder)
+    rank_zero_info(">>> Saving custom model code files to checkpoint directory...")
+    files_to_copy = ["modeling.py", "configuration.py", "processing.py", "README.md"]
+
+    for file_name in files_to_copy:
+        if file_name == "README.md":
+            src_file = os.path.join(os.getcwd(), file_name)
+        else:
+            src_file = os.path.join(source_model_dir, file_name)
+
+        dst_file = os.path.join(OUTPUT_DIR, file_name)
+
+        if os.path.exists(src_file):
+            shutil.copy2(src_file, dst_file)
+            rank_zero_info(f">>> Copied {file_name} to {dst_file}")
+        else:
+            src_file_alt = os.path.join(os.path.dirname(source_model_dir), file_name)
+            if os.path.exists(src_file_alt):
+                shutil.copy2(src_file_alt, dst_file)
+                rank_zero_info(f">>> Copied {file_name} from parent to {dst_file}")
+            else:
+                rank_zero_info(f">>> Warning: {src_file} not found, skipping...")
+
+    # ====================================================
+    # 6. Start Training
     # ====================================================
     # Initialize generation callback for periodic evaluation
     # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
@@ -789,56 +823,6 @@ def train(args=None):
 
     rank_zero_info(">>> Start Training...")
     trainer.train()
-    # Trainer automatically saves the final model to OUTPUT_DIR and pushes to Hub if enabled
-
-    # ====================================================
-    # 6. Save custom model code files for AutoModel.from_pretrained()
-    # ====================================================
-    # Copy custom modeling.py and configuration.py to output directory
-    # so that others can use AutoModel.from_pretrained() to load the model
-    rank_zero_info(">>> Saving custom model code files...")
-    model_code_dir = os.path.join(OUTPUT_DIR, "siq_vl", "model")
-    os.makedirs(model_code_dir, exist_ok=True)
-
-    # Get the source directory of siq_vl.model
-    import siq_vl.model as model_module
-
-    source_model_dir = os.path.dirname(model_module.__file__)
-
-    # Copy necessary files
-    files_to_copy = ["modeling.py", "configuration.py", "processing.py"]
-    for file_name in files_to_copy:
-        src_file = os.path.join(source_model_dir, file_name)
-        dst_file = os.path.join(model_code_dir, file_name)
-        if os.path.exists(src_file):
-            shutil.copy2(src_file, dst_file)
-            rank_zero_info(f">>> Copied {file_name} to {dst_file}")
-        else:
-            rank_zero_info(f">>> Warning: {src_file} not found, skipping...")
-
-    # Create __init__.py if it doesn't exist
-    init_file = os.path.join(model_code_dir, "__init__.py")
-    if not os.path.exists(init_file):
-        with open(init_file, "w") as f:
-            f.write("")
-
-    # Also create parent __init__.py
-    siq_vl_dir = os.path.join(OUTPUT_DIR, "siq_vl")
-    os.makedirs(siq_vl_dir, exist_ok=True)
-    parent_init_file = os.path.join(siq_vl_dir, "__init__.py")
-    if not os.path.exists(parent_init_file):
-        with open(parent_init_file, "w") as f:
-            f.write("")
-
-    from huggingface_hub import upload_folder
-
-    upload_folder(
-        folder_path=model_code_dir,
-        repo_id=hub_model_id,
-        repo_type="model",
-        commit_message="Add custom model code files",
-    )
-
     rank_zero_info(">>> Done!")
 
 

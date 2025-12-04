@@ -261,7 +261,19 @@ class GenerationCallback(TrainerCallback):
                 warnings.filterwarnings("ignore")
                 # Redirect stdout/stderr to suppress print statements from accelerate
                 with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-                    self._bert_score = BERTScore(rescale_with_baseline=True)
+                    # NOTE:
+                    # Some BERTScore backbone models (e.g. RoBERTa-based) only support
+                    # sequences up to 512/514 tokens. Without truncation, very long
+                    # generated answers can cause shape mismatches inside the model
+                    # (e.g. attention_mask length > token_type_ids buffer length).
+                    # We explicitly enable truncation at 512 tokens to avoid:
+                    #   RuntimeError: The expanded size of the tensor (640) must match
+                    #   the existing size (514) at non-singleton dimension 1.
+                    self._bert_score = BERTScore(
+                        rescale_with_baseline=True,
+                        max_length=512,
+                        truncation=True,
+                    )
         return self._bert_score
 
     def _get_clip_score(self) -> CLIPScore:
