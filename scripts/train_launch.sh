@@ -239,7 +239,7 @@ else
     if [[ "$STAGE" == "1" ]]; then
         DEFAULT_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-base-patch16-224"
-            "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_steps" "1000"
@@ -254,7 +254,7 @@ else
     else
         DEFAULT_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-base-patch16-224"
-            "--llm_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--num_proc" "8"

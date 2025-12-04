@@ -673,8 +673,8 @@ def train(args=None):
         stage_name = infer_stage_name(base_output_dir)
         # Default repo id (single underscores between logical segments),
         # with a "siq-vl" prefix:
-        #   siq-vl_{vision_backbone}_{llm_backbone}_{stage}
-        default_repo_name = f"siq-vl_{vision_name}_{llm_name}_{stage_name}"
+        #   siq-vl_{vision_backbone}_{text_backbone}_{stage}
+        default_repo_name = f"siq-vl_{vision_name}_{text_name}_{stage_name}"
         hub_model_id = args.hub_model_id or default_repo_name
         rank_zero_info(f">>> Will push to Hub model id: {hub_model_id}")
 
@@ -829,6 +829,15 @@ def train(args=None):
     if not os.path.exists(parent_init_file):
         with open(parent_init_file, "w") as f:
             f.write("")
+
+    from huggingface_hub import upload_folder
+
+    upload_folder(
+        folder_path=model_code_dir,
+        repo_id=hub_model_id,
+        repo_type="model",
+        commit_message="Add custom model code files",
+    )
 
     rank_zero_info(">>> Done!")
 
