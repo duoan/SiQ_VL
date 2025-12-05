@@ -141,6 +141,9 @@ class SmartGPUCleanCallback(TrainerCallback):
                 verbose=is_rank0 and self.verbose,
             )
 
+            if torch.mps.is_available():
+                torch.mps.empty_cache()
+
 
 class MetricsCallback(TrainerCallback):
     """

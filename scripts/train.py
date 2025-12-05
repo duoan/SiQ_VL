@@ -585,10 +585,15 @@ def train(args=None):
     for name, probability in zip(SUB_SETS, probabilities, strict=False):
         rank_zero_info(f"    - {name}: probability={probability:.4f}")
 
+    rank_zero_info(f">>> DEBUG: All weights: {all_weights}")
+    rank_zero_info(f">>> DEBUG: Probabilities: {probabilities}")
+    rank_zero_info(f">>> DEBUG: All raw datasets: {len(all_raw_datasets)}")
+
     concat_raw_dataset = interleave_datasets(
         all_raw_datasets,
         probabilities=probabilities,
         seed=args.seed,
+        stopping_strategy="all_exhausted",
     )
 
     # Limit dataset size if specified (for quick testing / controlling total samples)
@@ -777,10 +782,8 @@ def train(args=None):
         generation_callback,
         MetricsCallback(),
         EarlyStoppingCallback(early_stopping_patience=5, early_stopping_threshold=0.01),
+        SmartGPUCleanCallback(interval=20 if torch.cuda.is_available() else 2),
     ]
-
-    if torch.cuda.is_available():
-        callbacks.append(SmartGPUCleanCallback())
 
     trainer = Trainer(
         model=vl_model,
