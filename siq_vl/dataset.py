@@ -1,9 +1,7 @@
 from collections.abc import Iterator
 import random
 
-import numpy as np
 from PIL import Image
-import torch
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 
@@ -23,55 +21,18 @@ def _to_pil_rgb(image: str | Image.Image) -> Image.Image:
         # Ensure it's RGB (common case: grayscale → RGB)
         if image.mode != "RGB":
             image = image.convert("RGB")
+        if image.channels != 3:
+            return None
         return image
 
     # Case 2 — It is a file path (string)
     if isinstance(image, str):
         img = Image.open(image).convert("RGB")
+        if img.channels != 3:
+            return None
         return img
 
-    # Case 3 — torch.Tensor or numpy array
-    # Convert to numpy array for unified processing
-    if isinstance(image, torch.Tensor):
-        arr = image.detach().cpu().numpy()
-    else:
-        arr = np.array(image)
-
-    # Ensure the array has at least 3 dimensions
-    # Typical formats are:
-    # - H x W x C  (channels_last)
-    # - C x H x W  (channels_first)
-    if arr.ndim == 3:
-        # If it's channels-first (C, H, W) → convert to (H, W, C)
-        if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
-            arr = np.transpose(arr, (1, 2, 0))
-
-    # If the array is grayscale (H, W) → duplicate into RGB
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-
-    # If the last dimension is single-channel, replicate it 3 times
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = np.repeat(arr, 3, axis=-1)
-
-    # If the last dimension is 4 (RGBA), convert to RGB
-    if arr.ndim == 3 and arr.shape[-1] == 4:
-        # Remove alpha channel
-        arr = arr[:, :, :3]
-
-    # Ensure values are uint8 (required by PIL)
-    if arr.dtype != np.uint8:
-        # Clip out-of-range values and cast
-        arr = np.clip(arr, 0, 255).astype("uint8")
-
-    # Final safety check: ensure we have exactly 3 channels
-    if arr.ndim != 3 or arr.shape[-1] != 3:
-        # If still not RGB, force convert through PIL
-        temp_img = Image.fromarray(arr) if arr.ndim >= 2 else Image.new("RGB", (1, 1))
-        return temp_img.convert("RGB")
-
-    # Convert final array into a proper RGB PIL image
-    return Image.fromarray(arr, mode="RGB")
+    return None
 
 
 class VQADataset(Dataset):
@@ -98,6 +59,10 @@ class VQADataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         image = _to_pil_rgb(item["images"][0])
+        # drop item if image is None
+        if image is None:
+            return None
+
         texts = item.get("texts", [])
 
         if len(texts) == 0:

@@ -92,23 +92,17 @@ graph TB
 │                    [TRAINABLE - All Stages]                                 │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────┐                     │
-│  │         Pixel Shuffle (Factor=3)                   │                     │
-│  │  [729, 1152] → Reshape → [81, 10368]               │                     │
+│  │         Pixel Shuffle (Factor=2, default)          │                     │
+│  │  [729, 1152] → Reshape → [182, 4608]               │                     │
 │  └────────────────────┬───────────────────────────────┘                     │
 │                       │                                                     │
 │                       ▼                                                     │
 │  ┌────────────────────────────────────────────────────┐                     │
-│  │         Linear Projection                          │                     │
-│  │  [81, 10368] → Linear(10368, 896) → [81, 896]      │                     │
-│  └────────────────────┬───────────────────────────────┘                     │
-│                       │                                                     │
-│                       ▼                                                     │
-│  ┌────────────────────────────────────────────────────┐                     │
-│  │         LayerNorm                                  │                     │
-│  │  Normalize to match LLM embedding distribution     │                     │
+│  │         MLP (Linear Projection)                    │                     │
+│  │  [182, 4608] → Linear(4608, 896) → [182, 896]      │                     │
 │  └────────────────────┬───────────────────────────────┘                     │
 │                                                                             │
-│  Output: [Batch, 81, 896]  (compressed vision tokens)                       │
+│  Output: [Batch, 182, 896]  (compressed vision tokens, factor=2 example)    │
 └────────────────────────────────────┬────────────────────────────────────────┘
                                      │
                                      │  ┌───────────────────┐
@@ -140,10 +134,10 @@ graph TB
                               │    Text      │
                               └──────────────┘
 
-Key Dimensions:
-  • Vision Features: [Batch, 729, 1152]  (SigLIP SO400M)
-  • After Pixel Shuffle: [Batch, 81, 10368]
-  • After Projection: [Batch, 81, 896]   (Qwen2.5-0.5B hidden size)
+Key Dimensions (example with pixel_shuffle_factor=2):
+  • Vision Features: [Batch, 729, 1152]  (SigLIP2, 384×384 image, patch_size=14)
+  • After Pixel Shuffle: [Batch, 182, 4608]  (729/4 = 182, 1152×4 = 4608)
+  • After Projection: [Batch, 182, 896]   (Qwen2.5-0.5B hidden size)
   • LLM Output: [Batch, Seq, Vocab]
 ```
 
@@ -172,16 +166,14 @@ Step 2: Projection with Pixel Shuffle
   Vision Features [1, 729, 1152]
     ↓ [Reshape: 27×27 patches]
   [1, 27, 27, 1152]
-    ↓ [Pixel Shuffle: factor=3]
-  [1, 9, 9, 10368]  (1152 × 3² = 10368)
+    ↓ [Pixel Shuffle: factor=2 (default)]
+  [1, 13, 13, 4608]  (1152 × 2² = 4608, rounded to 13×13)
     ↓ [Reshape]
-  [1, 81, 10368]
-    ↓ [Linear Projection: 10368→896]
-  [1, 81, 896]
-    ↓ [LayerNorm]
-  Vision Embeddings [1, 81, 896]
+  [1, 169, 4608]
+    ↓ [MLP: Linear(4608, 896)]
+  Vision Embeddings [1, 169, 896]
     │
-    ├─ 81 tokens (compressed from 729)
+    ├─ 169 tokens (compressed from 729, factor=2)
     └─ 896 = Qwen2.5-0.5B hidden size
 
 Step 3: Text Processing
@@ -190,7 +182,7 @@ Step 3: Text Processing
   Input IDs: [151644, 77091, 198, ..., 151655, ..., 151645]
     │
     ├─ <|im_start|>user\n
-    ├─ <|vision_start|><|image_pad|>×81<|vision_end|>
+    ├─ <|vision_start|><|image_pad|>×169<|vision_end|>
     ├─ Describe this image.
     └─ <|im_end|>
     ↓ [Text Embeddings]
@@ -202,10 +194,10 @@ Step 4: Embedding Fusion
     └─ Find <|image_pad|> positions
        │
        ├─ Prefix: [1, prefix_len, 896]
-       ├─ Image:  [1, 81, 896]  ← Insert here
+       ├─ Image:  [1, 169, 896]  ← Insert here
        └─ Suffix: [1, suffix_len, 896]
     ↓ [Concatenate]
-  Fused Embeddings [1, prefix_len + 81 + suffix_len, 896]
+  Fused Embeddings [1, prefix_len + 169 + suffix_len, 896]
 
 Step 5: LLM Forward Pass
   Fused Embeddings [1, Total_Seq, 896]
@@ -274,10 +266,11 @@ The SiQ-VL model is trained using a multi-stage approach designed to incremental
 **Objective**: Fine-tune the language model component on large-scale visual question answering datasets to enhance visual comprehension and reasoning capabilities.
 
 - **Frozen Components**: Vision encoder (SigLIP)
-- **Trainable Parameters**: Projection module and language model
-- **Training Dataset**: Large-scale VQA datasets including VQAv2, GQA, and TextVQA
+- **Trainable Parameters**: Projection module and language model (supports LoRA or full fine-tuning)
+- **Training Dataset**: FineVision dataset (can be extended to VQAv2, GQA, TextVQA)
 - **Purpose**: Develop enhanced visual understanding and question-answering capabilities
-- **Implementation Status**: Planned for future release
+- **Implementation Status**: Fully implemented
+- **LoRA Support**: Optional LoRA fine-tuning for efficient training (recommended)
 
 ### Stage 3: Supervised Fine-tuning with Chain-of-Thought Reasoning
 
@@ -308,7 +301,7 @@ graph TD
     
     Stage1 --> |Train Projector Only| S1Checkpoint[Checkpoint: Stage 1<br/>Aligned Projector]
     
-    S1Checkpoint --> Stage2[Stage 2: LLM Fine-tuning 🚧]
+    S1Checkpoint --> Stage2[Stage 2: LLM Fine-tuning ✅]
     Stage2 --> |Train Projector + LLM| S2Checkpoint[Checkpoint: Stage 2<br/>VQA Capable]
     
     S2Checkpoint --> Stage3[Stage 3: SFT with CoT 🚧]
@@ -323,7 +316,7 @@ graph TD
     Stage4 -.->|Dataset: Preferences| D4[Human Preferences]
     
     style Stage1 fill:#90EE90
-    style Stage2 fill:#FFD700
+    style Stage2 fill:#90EE90
     style Stage3 fill:#FFD700
     style Stage4 fill:#FFD700
     style Final fill:#87CEEB
@@ -370,20 +363,21 @@ graph TD
                                     │
                                     ▼
     ┌─────────────────────────────────────────────────────────────────────┐
-    │  STAGE 2: LLM Fine-tuning on VQA  [PLANNED]                         │
+    │  STAGE 2: LLM Fine-tuning on VQA  [IMPLEMENTED]                     │
     ├─────────────────────────────────────────────────────────────────────┤
     │  Vision Tower: FROZEN                                               │
     │  Projector: TRAINABLE (continue from Stage 1)                       │
-    │  LLM: TRAINABLE (unfrozen)                                          │
+    │  LLM: TRAINABLE (unfrozen, supports LoRA or full fine-tuning)      │
     │                                                                     │
-    │  Dataset: Large VQA Datasets                                        │
-    │  • VQAv2, GQA, TextVQA, etc.                                        │
-    │  • Focus on visual question answering                               │
+    │  Dataset: FineVision (can be extended to VQAv2, GQA, TextVQA)     │
+    │  • Large-scale multimodal instruction-following                     │
+    │  • Focus on visual question answering and understanding            │
     │                                                                     │
     │  Training:                                                          │
-    │  • Learning Rate: 1e-5 to 2e-5 (lower for LLM)                      │
-    │  • Steps: TBD                                                       │
-    │  • Objective: Improve VQA capabilities                              │
+    │  • Learning Rate: 2e-5 (lower for LLM)                             │
+    │  • Steps: Auto-calculated from max_samples and batch size          │
+    │  • Objective: Improve VQA capabilities                             │
+    │  • LoRA: Optional efficient fine-tuning (recommended)              │
     └───────────────────────────────┬─────────────────────────────────────┘
                                     │
                                     ▼
@@ -451,17 +445,18 @@ graph TD
 
 Feature              │ Stage 1        │ Stage 2        │ Stage 3        │ Stage 4
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
-Status               │ Implemented    │ Planned        │ Planned        │ Planned
+Status               │ Implemented    │ Implemented    │ Planned        │ Planned
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
 Trainable Components │ Projector only │ Projector+LLM  │ Projector+LLM  │ Projector+LLM+RL
+                     │                │ (LoRA/Full)    │                │
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
 Frozen Components    │ Vision + LLM   │ Vision only    │ Vision only    │ Vision only
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
-Learning Rate        │ 1e-3           │ 1e-5 to 2e-5   │ 1e-5 to 2e-5   │ TBD
+Learning Rate        │ 1e-3           │ 2e-5           │ 1e-5 to 2e-5   │ TBD
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
-Training Steps       │ ~1000          │ TBD            │ TBD            │ TBD
+Training Steps       │ ~1000          │ Auto-calc      │ TBD            │ TBD
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
-Primary Dataset      │ FineVision     │ VQA Datasets   │ CoT Reasoning  │ Preferences
+Primary Dataset      │ FineVision     │ FineVision     │ CoT Reasoning  │ Preferences
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
 Objective            │ Alignment      │ VQA            │ Reasoning      │ Alignment
 ─────────────────────┼────────────────┼────────────────┼────────────────┼────────────
@@ -526,7 +521,7 @@ Stage 1 training employs the FineVision dataset, available through HuggingFace, 
 
 ## Training Instructions
 
-> **Note**: Presently, only Stage 1 (Projector Alignment) is fully implemented. Stages 2-4 are planned for future releases.
+> **Note**: Stage 1 (Projector Alignment) and Stage 2 (LLM Fine-tuning) are fully implemented. Stages 3-4 are planned for future releases.
 
 ### Stage 1: Projector Alignment Training
 
@@ -550,12 +545,12 @@ For more control, you can run the training script directly:
 
 ```bash
 python scripts/train.py \
-    --vision_model_name_or_path "google/siglip-so400m-patch14-384" \
-    --llm_model_name_or_path "Qwen/Qwen2.5-0.5B-Instruct" \
+    --vision_model_name_or_path "google/siglip2-base-patch16-224" \
+    --text_model_name_or_path "Qwen/Qwen2.5-0.5B-Instruct" \
     --data_path "HuggingFaceM4/FineVision" \
     --sub_sets "coco_colors,densefusion_1m,sharegpt4v(knowledge)" \
-    --freeze_llm \
-    --output_dir "./checkpoints/siq_vlm_stage1" \
+    --freeze_text_model \
+    --output_dir "./checkpoints" \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 4 \
     --max_steps 1000 \
@@ -563,20 +558,63 @@ python scripts/train.py \
     --bf16
 ```
 
-**Important**: Stage 1 training employs `--freeze_llm` by default, ensuring that only the projection module parameters are updated during this training phase.
+**Important**: Stage 1 training employs `--freeze_text_model` by default, ensuring that only the projection module parameters are updated during this training phase.
+
+### Stage 2: Language Model Fine-tuning
+
+#### Quick Start
+
+The easiest way to start Stage 2 training is using the provided shell script:
+
+```bash
+bash scripts/train_stage_2.sh
+```
+
+This script automatically:
+- Loads the Stage 1 checkpoint
+- Unfreezes the text model for fine-tuning
+- Configures appropriate hyperparameters for Stage 2 training
+- Supports LoRA fine-tuning (recommended for efficiency)
+
+#### Manual Training
+
+For more control, you can run Stage 2 training directly:
+
+```bash
+python scripts/train.py \
+    --stage_1_checkpoint_path "./checkpoints/siq-vl_{vision}_{text}_{datetime}/stage1" \
+    --no_freeze_text_model \
+    --use_lora \
+    --data_path "HuggingFaceM4/FineVision" \
+    --sub_sets "coco_colors,densefusion_1m,sharegpt4v(knowledge)" \
+    --output_dir "./checkpoints" \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 2e-5 \
+    --bf16
+```
+
+**Important**: Stage 2 training requires a Stage 1 checkpoint. The `--stage_1_checkpoint_path` can be auto-inferred from the model names if not specified. Use `--use_lora` for efficient fine-tuning or omit it for full fine-tuning.
 
 ### Training Arguments
 
 #### Model Configuration
-- `--vision_model_name_or_path`: Path or HuggingFace model ID for vision encoder (default: `google/siglip-so400m-patch14-384`)
-- `--llm_model_name_or_path`: Path or HuggingFace model ID for language model (default: `Qwen/Qwen2.5-0.5B-Instruct`)
-- `--freeze_llm`: Freeze the LLM during training (default: True)
-- `--no_freeze_llm`: Unfreeze the LLM for full fine-tuning
-- `--pixel_shuffle_factor`: Manual pixel shuffle factor (auto-calculated if not specified)
+- `--vision_model_name_or_path`: Path or HuggingFace model ID for vision encoder (default: `google/siglip2-base-patch16-224`)
+- `--text_model_name_or_path`: Path or HuggingFace model ID for language model (default: `Qwen/Qwen2.5-0.5B-Instruct`)
+- `--freeze_text_model`: Freeze the text model during training (default: True for Stage 1)
+- `--no_freeze_text_model`: Unfreeze the text model for full fine-tuning (Stage 2)
+- `--stage_1_checkpoint_path`: Path to Stage 1 checkpoint for Stage 2 training (default: auto-inferred)
+- `--pixel_shuffle_factor`: Pixel shuffle factor for the projector (default: 2)
+- `--use_lora`: Use LoRA for efficient fine-tuning (default: False, recommended for Stage 2)
+- `--lora_r`: LoRA rank (default: 64)
+- `--lora_alpha`: LoRA alpha parameter (default: 16)
+- `--lora_dropout`: LoRA dropout rate (default: 0.05)
+- `--lora_target_modules`: Target modules for LoRA (default: None, auto-detected)
 
 #### Dataset Configuration
 - `--data_path`: Path to dataset or HuggingFace dataset name (default: `HuggingFaceM4/FineVision`)
 - `--sub_sets`: Comma-separated list of dataset subsets to use
+- `--sub_sets_weights`: Optional comma-separated sampling weights aligned with sub_sets (e.g., `"4,4,1,1"`)
 - `--max_samples`: Limit dataset size for quick testing
 - `--num_proc`: Number of processes for dataset loading (default: 96)
 - `--dataloader_num_workers`: Number of dataloader workers (default: 4)
@@ -584,20 +622,31 @@ python scripts/train.py \
 #### Training Hyperparameters
 - `--per_device_train_batch_size`: Batch size per device (default: 8)
 - `--gradient_accumulation_steps`: Gradient accumulation steps (default: 4)
-- `--max_steps`: Maximum training steps (default: 1000)
-- `--learning_rate`: Learning rate (default: 1e-3)
+- `--max_steps`: Maximum training steps (default: -1, auto-calculated from max_samples and batch size)
+- `--learning_rate`: Learning rate (default: 1e-3 for Stage 1, 2e-5 for Stage 2)
 - `--bf16`: Use bfloat16 precision (default: True, recommended for Qwen)
 - `--fp16`: Use float16 precision (alternative to bf16)
+- `--no_bf16`: Disable bf16 precision
 
 #### Output Configuration
-- `--output_dir`: Directory to save checkpoints (default: `./checkpoints/siq_vlm_run1`)
+- `--output_dir`: Root directory for outputs. Final path: `{output_dir}/siq-vl_{vision_backbone}_{text_backbone}_{stage}_{datetime}/{stage}` (default: `./checkpoints`)
 - `--logging_steps`: Steps between logging (default: 10)
 - `--save_steps`: Steps between checkpoints (default: 500)
-- `--project`: WandB project name (default: `siq_vl_stage_1`)
+- `--eval_steps`: Steps between evaluation (default: 100)
+- `--max_eval_samples`: Maximum samples for evaluation (default: 2, set higher for meaningful eval)
+- `--gen_steps`: Steps between generation evaluation (default: 100)
+- `--gen_samples`: Number of fixed samples for generation evaluation (default: 20)
+- `--gen_max_new_tokens`: Maximum new tokens for generation (default: 128)
+- `--gen_temperature`: Temperature for generation (default: 0.0)
+- `--gen_num_beams`: Number of beams for generation (default: 1)
 
 #### Distributed Training
 - `--use_distributed`: Enable distributed training (auto-detected if multiple GPUs available)
 - `--no_distributed`: Disable distributed training
+
+#### Hugging Face Hub
+- `--push_to_hub`: Push final checkpoint to Hugging Face Hub (default: False)
+- `--hub_model_id`: Optional explicit Hub model ID (default: auto-generated from model names and stage)
 
 ### Distributed Training
 
@@ -608,7 +657,7 @@ accelerate launch \
     --dispatch_batches=false \
     --split_batches=false \
     scripts/train.py \
-    --freeze_llm \
+    --freeze_text_model \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 4 \
     ...
@@ -619,8 +668,8 @@ accelerate launch \
 You can optionally publish trained checkpoints to the Hugging Face Hub so others can use the models without retraining.
 
 - **Naming convention**: Repos are named as  
-  `siq_vl_{vision_backbone}_{llm_backbone}_{stage}`  
-  For example: `siq_vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`.
+    `siq-vl_{vision_backbone}_{text_backbone}_{stage}`  
+    For example: `siq-vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`.
 
 - **Stage inference**: The stage suffix (e.g., `stage1`, `stage2`) is automatically inferred from your `--project` name and/or `--output_dir`.  
   - Stage 1 runs launched via `scripts/train_stage_1.sh` will typically publish as `..._stage1`.  
@@ -640,9 +689,9 @@ bash scripts/train_stage_1.sh \
 This will:
 
 - Train Stage 1 using the MacBook defaults.
-- Save the final model under `./checkpoints/siq_vlm_stage1/{vision}__{llm}`.
+- Save the final model under `./checkpoints/siq-vl_{vision}_{text}_{stage}_{datetime}/stage1`.
 - Create (or reuse) a Hub repo named like:
-  - `siq_vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`
+  - `siq-vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`
 - Upload all files from the final checkpoint directory.
 - Add a Hub tag `wandb-{run_id}` with a message that includes the W&B run URL.
 
@@ -656,14 +705,14 @@ STAGE=2 bash scripts/train_launch.sh \
 This will:
 
 - Train Stage 2 (full finetuning) using the AWS p4d defaults.
-- Save the final model under `./checkpoints/siq_vlm_stage2/{vision}__{llm}`.
+- Save the final model under `./checkpoints/siq-vl_{vision}_{text}_{stage}_{datetime}/stage2`.
 - Create (or reuse) a Hub repo named like:
-  - `siq_vl_siglip2-so400m-patch16-512_qwen2.5-1.5b-instruct_stage2`
+  - `siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage2`
 - Upload all files from the final checkpoint directory.
 - Add a Hub tag `wandb-{run_id}` with a message that includes the W&B run URL.
 
 > To override the default repo id (for example to push under an organization), pass:
-> `--hub_model_id your-org/siq_vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`.
+> `--hub_model_id your-org/siq-vl_siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage1`.
 
 ## Project Structure
 
@@ -676,9 +725,11 @@ SiQ_VL/
 │   ├── collator.py     # Data collator for batching
 │   └── callbacks.py    # Training callbacks (metrics, GPU cleanup)
 ├── scripts/
-│   ├── train.py        # Main training script (Stage 1)
-│   └── train_stage_1.sh # Convenience script for Stage 1 with auto-configuration
-│   # Future: train_stage_2.py, train_stage_3.py, train_rl.py
+│   ├── train.py        # Main training script (Stage 1 & Stage 2)
+│   ├── train_launch.sh # Unified launcher for Stage 1 & Stage 2
+│   ├── train_stage_1.sh # Convenience script for Stage 1
+│   └── train_stage_2.sh # Convenience script for Stage 2
+│   # Future: train_stage_3.py, train_rl.py
 ├── checkpoints/         # Saved model checkpoints
 │   └── siq_vlm_stage1/ # Stage 1 checkpoints
 └── lmms-eval/          # Evaluation framework (optional)
@@ -687,7 +738,7 @@ SiQ_VL/
 ## Development Roadmap
 
 - [x] **Stage 1**: Projector alignment training (Completed)
-- [ ] **Stage 2**: Language model fine-tuning on large-scale VQA datasets
+- [x] **Stage 2**: Language model fine-tuning with LoRA support (Completed)
 - [ ] **Stage 3**: Supervised fine-tuning with chain-of-thought reasoning
 - [ ] **Stage 4**: Reinforcement learning-based training (RLHF/DPO)
 - [ ] Evaluation scripts and benchmark integration
@@ -703,17 +754,19 @@ SiQ_VL/
 
 ### Projection Module Specifications
 
-- **Architecture Type**: Linear projection layer with pixel shuffle operation
+- **Architecture Type**: MLP (Multi-Layer Perceptron) with pixel shuffle operation
 - **Functional Role**: Transforms vision encoder hidden dimensions to match language model embedding dimensions
-- **Compression Mechanism**: Pixel shuffle operation reduces sequence length (e.g., 729 tokens → 81 tokens for 384×384 pixel images with shuffle factor of 3)
-- **Normalization**: Layer normalization applied for distribution alignment
+- **Compression Mechanism**: Pixel shuffle operation reduces sequence length (e.g., 729 tokens → 182 tokens for 384×384 pixel images with shuffle factor of 2)
+- **Default Pixel Shuffle Factor**: 2 (configurable via `--pixel_shuffle_factor`)
+- **Architecture**: Pixel Shuffle → Linear Projection (no normalization layer)
 
 ### Language Model Specifications
 
 - **Model Architecture**: Qwen2.5 (available in 0.5B, 1.5B, and larger parameter variants)
 - **Training Status**: 
   - **Stage 1**: Parameters remain frozen; only projection module is trained
-  - **Stage 2 and subsequent stages**: Parameters are unfrozen for full fine-tuning
+  - **Stage 2 and subsequent stages**: Parameters are unfrozen for fine-tuning (supports LoRA or full fine-tuning)
+- **LoRA Support**: Stage 2 supports optional LoRA fine-tuning for efficient training (recommended)
 - **Special Token Handling**: Utilizes Qwen's native special tokens including `<|image_pad|>`, `<|vision_start|>`, and `<|vision_end|>`
 
 ## Usage Examples

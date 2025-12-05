@@ -8,7 +8,7 @@ class SiQ_VLDataCollator:
     max_length: int | None = None
     return_raw_data: bool = False
 
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+    def __call__(self, features: list[dict[str, Any] | None]) -> dict[str, Any]:
         # Filter out None
         features = [f for f in features if f is not None]
 
