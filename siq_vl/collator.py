@@ -5,7 +5,7 @@ from typing import Any
 @dataclass
 class SiQ_VLDataCollator:
     processor: Any
-    max_length: int = 1024
+    max_length: int | None = None
     return_raw_data: bool = False
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
@@ -28,7 +28,7 @@ class SiQ_VLDataCollator:
         processed = self.processor(
             batch=batch,
             return_tensors="pt",
-            truncation=True,
+            truncation=self.max_length is not None,
             max_length=self.max_length,
             padding="longest",  # Pad to longest sequence in batch
         )
