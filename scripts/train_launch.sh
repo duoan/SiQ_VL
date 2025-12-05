@@ -188,7 +188,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--max_steps" "5000"
             "--num_proc" "96"
             "--dataloader_num_workers" "4"
-            "--learning_rate" "1e-4"
+            "--learning_rate" "1e-3"
             "--bf16"
             "--logging_steps" "10"
             "--save_steps" "100"
