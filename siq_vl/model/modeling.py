@@ -3,6 +3,7 @@ from typing import ClassVar
 from PIL import Image
 import torch
 import torch.nn as nn
+from torchmetrics.utilities import rank_zero_debug
 from torchmetrics.utilities.prints import rank_zero_info
 from transformers import (
     AutoModelForCausalLM,
@@ -28,6 +29,7 @@ from siq_vl.model.configuration import (
 from siq_vl.model.processing import SiQ_VLProcessor
 
 logger = logging.get_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class SiQ_VLProjector(PreTrainedModel):
@@ -223,20 +225,20 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         if past_key_values is None and pixel_values is not None:
             # 1. Vision Forward
             # pixel_values shape: (Total_Tiles, C, H, W)
-            print("pixel_values shape:", pixel_values.shape)
+            rank_zero_debug("pixel_values shape:", pixel_values.shape)
             vision_outputs = self.vision_model(pixel_values)
             vision_features = vision_outputs.last_hidden_state
-            print("vision_features shape:", vision_features.shape)
-            print("num_image_tokens:", num_image_tokens)
+            rank_zero_debug("vision_features shape:", vision_features.shape)
+            rank_zero_debug("num_image_tokens:", num_image_tokens)
             # 2. Projector
             # vision_token_embeddings shape: (Total_Tiles, Tokens_Per_Tile, Text_Dim)
             vision_token_embeddings = self.projector(vision_features)
-            print("vision_token_embeddings shape:", vision_token_embeddings.shape)
+            rank_zero_debug("vision_token_embeddings shape:", vision_token_embeddings.shape)
 
             # 3. Flatten All Vision Tokens
             # vision_token_embeddings_flat shape: (Total_Vision_Tokens, Text_Dim)
             vision_token_embeddings_flat = vision_token_embeddings.view(-1, vision_token_embeddings.size(-1))
-            print("vision_token_embeddings_flat shape:", vision_token_embeddings_flat.shape)
+            rank_zero_debug("vision_token_embeddings_flat shape:", vision_token_embeddings_flat.shape)
 
             # 4. Text Embeddings
             token_embeddings = self.text_model.get_input_embeddings()(input_ids)
@@ -263,7 +265,7 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
             inputs_embeds = token_embeddings
             input_ids = None
 
-            print("=" * 100)
+            rank_zero_debug("=" * 100)
 
         return self.text_model(
             input_ids=input_ids,
