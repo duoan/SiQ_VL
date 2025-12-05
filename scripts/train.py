@@ -574,27 +574,31 @@ def train(args=None):
     for subset, weight in zip(SUB_SETS, sub_sets_weights, strict=False):
         rank_zero_info(f">>> Loading subset '{subset}' (weight={weight})...")
         raw_dataset = load_dataset(DATA_PATH, name=subset, split="train", num_proc=args.num_proc)
+        rank_zero_info(f">>> DEBUG: Raw dataset {subset} length: {len(raw_dataset)}")
+        rank_zero_info(f">>> DEBUG: Raw dataset {subset} sample: {raw_dataset[0]}")
         all_raw_datasets.append(raw_dataset)
         all_weights.append(weight)
 
-    from datasets.combine import interleave_datasets
+    from datasets.combine import concatenate_datasets
 
-    total_weight = sum(all_weights)
-    probabilities = [weight / total_weight for weight in all_weights]
-    rank_zero_info(">>> Building weighted mixture dataset with probabilities:")
-    for name, probability in zip(SUB_SETS, probabilities, strict=False):
-        rank_zero_info(f"    - {name}: probability={probability:.4f}")
+    concat_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=args.seed)
 
-    rank_zero_info(f">>> DEBUG: All weights: {all_weights}")
-    rank_zero_info(f">>> DEBUG: Probabilities: {probabilities}")
-    rank_zero_info(f">>> DEBUG: All raw datasets: {len(all_raw_datasets)}")
+    # total_weight = sum(all_weights)
+    # probabilities = [weight / total_weight for weight in all_weights]
+    # rank_zero_info(">>> Building weighted mixture dataset with probabilities:")
+    # for name, probability in zip(SUB_SETS, probabilities, strict=False):
+    #     rank_zero_info(f"    - {name}: probability={probability:.4f}")
 
-    concat_raw_dataset = interleave_datasets(
-        all_raw_datasets,
-        probabilities=probabilities,
-        seed=args.seed,
-        stopping_strategy="all_exhausted",
-    )
+    # rank_zero_info(f">>> DEBUG: All weights: {all_weights}")
+    # rank_zero_info(f">>> DEBUG: Probabilities: {probabilities}")
+    # rank_zero_info(f">>> DEBUG: All raw datasets: {len(all_raw_datasets)}")
+
+    # concat_raw_dataset = interleave_datasets(
+    #     all_raw_datasets,
+    #     probabilities=probabilities,
+    #     seed=args.seed,
+    #     stopping_strategy="all_exhausted",
+    # )
 
     # Limit dataset size if specified (for quick testing / controlling total samples)
     if args.max_samples is not None:
@@ -677,7 +681,7 @@ def train(args=None):
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         # Use same batch size for eval as for training
-        per_device_eval_batch_size=per_device_train_batch_size * gradient_accumulation_steps,
+        per_device_eval_batch_size=per_device_train_batch_size,
         eval_accumulation_steps=1,  # Accumulate eval results in one go
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
