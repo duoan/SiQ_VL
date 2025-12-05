@@ -318,6 +318,7 @@ class SiQ_VLProcessor(ProcessorMixin):
         padding: bool | str = "longest",
         truncation: bool = True,
         max_length: int | None = None,
+        is_generation: bool = False,
         **kwargs,
     ) -> BatchEncoding:
         """
@@ -378,7 +379,7 @@ class SiQ_VLProcessor(ProcessorMixin):
                 {"role": "user", "content": user_content},
             ]
 
-            if a is not None:
+            if a is not None and not is_generation:
                 msgs.append(
                     {
                         "role": "assistant",

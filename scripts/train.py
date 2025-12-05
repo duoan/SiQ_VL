@@ -613,7 +613,6 @@ def train(args=None):
     rank_zero_info(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
     train_dataset = VQADataset(train_raw_dataset)
     eval_dataset = VQADataset(eval_raw_dataset, is_fixed=True)
-    test_dataset = VQADataset(eval_raw_dataset, is_fixed=True, is_generation=True)
 
     rank_zero_info(f">>> DEBUG: Train Dataset: {train_dataset}")
     rank_zero_info(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
@@ -772,7 +771,7 @@ def train(args=None):
     # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
     generation_callback = GenerationCallback(
         processor=vl_processor,
-        eval_dataset=test_dataset,
+        eval_dataset=eval_dataset,
         num_samples=args.gen_samples,
         eval_interval=args.gen_steps,
         max_new_tokens=args.gen_max_new_tokens,

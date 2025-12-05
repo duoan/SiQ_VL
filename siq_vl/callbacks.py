@@ -450,6 +450,7 @@ class GenerationCallback(TrainerCallback):
         inputs = processor(
             batch=batch,
             return_tensors="pt",
+            is_generation=True,
         )
 
         # Move inputs to device

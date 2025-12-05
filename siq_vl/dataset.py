@@ -85,13 +85,12 @@ class VQADataset(Dataset):
     training epochs.
     """
 
-    def __init__(self, hf_dataset, is_fixed: bool = False, is_generation: bool = False):
+    def __init__(self, hf_dataset, is_fixed: bool = False):
         """
         hf_dataset: HuggingFace dataset object
         """
         self.dataset = hf_dataset
         self.is_fixed = is_fixed
-        self.is_generation = is_generation
 
     def __len__(self):
         return len(self.dataset)
@@ -121,7 +120,7 @@ class VQADataset(Dataset):
         return {
             "image": image,
             "question": q,
-            "answer": a if not self.is_generation else None,
+            "answer": a,
         }
 
 
