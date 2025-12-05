@@ -201,10 +201,10 @@ class GenerationCallback(TrainerCallback):
         eval_samples: list[dict] | None = None,
         num_samples: int = 20,
         eval_interval: int = 100,
-        max_new_tokens: int = 256,
-        temperature: float = 0.7,
-        do_sample: bool = True,
-        num_beams: int = 2,
+        max_new_tokens: int = 128,
+        temperature: float = 0.0,
+        do_sample: bool = False,  # greedy generation
+        num_beams: int = 1,
     ):
         """
         Args:
@@ -469,6 +469,7 @@ class GenerationCallback(TrainerCallback):
                 temperature=self.temperature if self.do_sample else None,
                 do_sample=self.do_sample,
                 num_beams=self.num_beams if not self.do_sample else 1,
+                repetition_penalty=1.2,
                 pad_token_id=processor.tokenizer.pad_token_id,
                 eos_token_id=processor.tokenizer.eos_token_id,
             )
@@ -786,6 +787,17 @@ class GenerationCallback(TrainerCallback):
                 gc.collect()
                 check_cuda_memory_and_clean(force=True, verbose=True)
 
+                # calculate the average metrics
+                import numpy as np
+
+                average_metrics = {
+                    "gen/bert_f1": np.mean([metrics["bert_f1"] for metrics in generated_metrics]),
+                    "gen/bert_precision": np.mean([metrics["bert_precision"] for metrics in generated_metrics]),
+                    "gen/bert_recall": np.mean([metrics["bert_recall"] for metrics in generated_metrics]),
+                    "gen/img_clip": np.mean([metrics["img_clip"] for metrics in generated_metrics]),
+                    "gen/ans_clip": np.mean([metrics["ans_clip"] for metrics in generated_metrics]),
+                }
+
                 # Build table data from batch results
                 table_data = []
 
@@ -855,12 +867,11 @@ class GenerationCallback(TrainerCallback):
             # Log to wandb using the step value from when on_log was called
             # Use the saved log_step if provided, otherwise fall back to current state.global_step
             step_to_log = log_step if log_step is not None else state.global_step
-            wandb.log(
-                {
-                    f"generation_samples/step_{step_to_log}": table,
-                },
-                step=step_to_log,
-            )
+            log_payload = {
+                f"generation_samples/step_{step_to_log}": table,
+            }
+            log_payload.update(average_metrics)
+            wandb.log(log_payload, step=step_to_log)
 
             rank_zero_info(f">>> [GenerationCallback] Logged {len(table_data)} samples to wandb.")
 

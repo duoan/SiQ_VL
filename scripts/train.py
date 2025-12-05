@@ -206,7 +206,7 @@ def parse_args():
     parser.add_argument(
         "--vision_model_name_or_path",
         type=str,
-        default="google/siglip-so400m-patch14-384",
+        default="google/siglip2-base-patch16-224",
         help="Path or name of the vision model",
     )
     parser.add_argument(
@@ -272,8 +272,8 @@ def parse_args():
     parser.add_argument(
         "--pixel_shuffle_factor",
         type=int,
-        default=1,
-        help="Pixel shuffle factor for the projector (default: 1, no shuffling).",
+        default=2,
+        help="Pixel shuffle factor for the projector (default: 2, no shuffling).",
     )
 
     # Output configuration
@@ -395,20 +395,20 @@ def parse_args():
     parser.add_argument(
         "--gen_max_new_tokens",
         type=int,
-        default=256,
-        help="Maximum number of new tokens to generate (default: 256)",
+        default=128,
+        help="Maximum number of new tokens to generate (default: 128)",
     )
     parser.add_argument(
         "--gen_temperature",
         type=float,
-        default=0.7,
-        help="Temperature for generation sampling (default: 0.7)",
+        default=0.0,
+        help="Temperature for generation sampling (default: 0.0)",
     )
     parser.add_argument(
         "--gen_num_beams",
         type=int,
-        default=2,
-        help="Number of beams for generation beam search (default: 2)",
+        default=1,
+        help="Number of beams for generation beam search (default: 1)",
     )
     parser.add_argument(
         "--seed",
@@ -613,6 +613,7 @@ def train(args=None):
     rank_zero_info(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
     train_dataset = VQADataset(train_raw_dataset)
     eval_dataset = VQADataset(eval_raw_dataset, is_fixed=True)
+    test_dataset = VQADataset(eval_raw_dataset, is_fixed=True, is_generation=True)
 
     rank_zero_info(f">>> DEBUG: Train Dataset: {train_dataset}")
     rank_zero_info(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
@@ -771,12 +772,11 @@ def train(args=None):
     # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
     generation_callback = GenerationCallback(
         processor=vl_processor,
-        eval_dataset=eval_dataset,
+        eval_dataset=test_dataset,
         num_samples=args.gen_samples,
         eval_interval=args.gen_steps,
         max_new_tokens=args.gen_max_new_tokens,
         temperature=args.gen_temperature,
-        do_sample=True,
         num_beams=args.gen_num_beams,
     )
 

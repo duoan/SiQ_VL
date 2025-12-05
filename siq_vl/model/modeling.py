@@ -1,3 +1,4 @@
+import os
 from typing import ClassVar
 
 from PIL import Image
@@ -28,6 +29,7 @@ from siq_vl.model.configuration import (
 )
 from siq_vl.model.processing import SiQ_VLProcessor
 
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 logger = logging.get_logger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -405,7 +407,7 @@ if __name__ == "__main__":
 
     stage_1_model, stage_1_processor = get_stage1_model_and_processor(
         pretrained_vision_model_path="google/siglip2-base-patch16-512",
-        vision_pixel_shuffle_factor=4,
+        vision_pixel_shuffle_factor=2,
     )
 
     inputs = stage_1_processor(
@@ -440,14 +442,23 @@ if __name__ == "__main__":
     print(outputs)
 
     print("Generating...")
+    inputs = stage_1_processor(
+        batch=[
+            (Image.open("image.png"), "Describe this image.", None),
+        ],
+        return_tensors="pt",
+    )
     stage_1_model.eval()
     with torch.no_grad():
         output_ids = stage_1_model.generate(
             input_ids=inputs.input_ids,
             pixel_values=inputs.pixel_values,
             attention_mask=inputs.attention_mask,
-            do_sample=True,
+            do_sample=False,
             max_new_tokens=64,
+            repetition_penalty=1.2,
+            temperature=0.0,
+            num_beams=1,
         )
 
     print(stage_1_processor.batch_decode(output_ids, assistant_only=True, skip_special_tokens=True))
@@ -490,14 +501,23 @@ if __name__ == "__main__":
     print(outputs)
 
     print("Generating...")
+    inputs = stage_2_processor(
+        batch=[
+            (Image.open("image.png"), "Describe this image.", None),
+        ],
+        return_tensors="pt",
+    )
     stage_2_model.eval()
     with torch.no_grad():
         output_ids = stage_2_model.generate(
             input_ids=inputs.input_ids,
             pixel_values=inputs.pixel_values,
             attention_mask=inputs.attention_mask,
-            do_sample=True,
+            do_sample=False,
             max_new_tokens=64,
+            repetition_penalty=1.2,
+            temperature=0.0,
+            num_beams=1,
         )
     print(stage_2_processor.batch_decode(output_ids, assistant_only=True, skip_special_tokens=True))
 

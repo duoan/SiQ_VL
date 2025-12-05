@@ -20,6 +20,7 @@ from transformers import (
     BatchFeature,
     ProcessorMixin,
     Qwen2TokenizerFast,
+    SiglipImageProcessor,
 )
 from transformers.image_utils import ImageInput
 from transformers.utils.constants import IMAGENET_STANDARD_MEAN, IMAGENET_STANDARD_STD
@@ -208,7 +209,7 @@ AutoImageProcessor.register(SiQ_VLImageProcessor, SiQ_VLImageProcessor)
 class SiQ_VLProcessor(ProcessorMixin):
     # Attributes required by ProcessorMixin for save_pretrained/from_pretrained to work
     attributes = ["image_processor", "tokenizer"]  # noqa: RUF012
-    image_processor_class = "SiQ_VLImageProcessor"
+    image_processor_class = "AutoImageProcessor"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
 
     image_pad_token = "<|image_pad|>"
@@ -226,19 +227,20 @@ class SiQ_VLProcessor(ProcessorMixin):
 
     def __init__(
         self,
-        image_processor: SiQ_VLImageProcessor | Qwen2TokenizerFast | None = None,
+        image_processor: AutoImageProcessor | None = None,
         tokenizer: Qwen2TokenizerFast | None = None,
         vit_image_size: int = 224,  # same size as the Siglip image processor
         vit_patch_size: int = 16,
         pixel_shuffle_factor: int = 2,
         system_prompt: str | None = None,
+        enable_dynamic_tiling: bool = False,
         **kwargs,
     ):
         """
         Initializes the SiQ_VLProcessor.
 
         Args:
-            image_processor: The SiQ_VLImageProcessor (for visual inputs). If None, will be created from vit_image_size.
+            image_processor: The AutoImageProcessor (for visual inputs). If None, will be created from vit_image_size.
                 For backward compatibility, if a Qwen2TokenizerFast is passed here, it will be treated as tokenizer.
             tokenizer: The Qwen2TokenizerFast (for text inputs). Required if image_processor is None or is a tokenizer.
             vit_image_size: Image size for the vision encoder (default: 224).
@@ -246,18 +248,26 @@ class SiQ_VLProcessor(ProcessorMixin):
             pixel_shuffle_factor: The pixel shuffle factor used in the projector (default: 2).
             system_prompt: Custom system prompt (default: uses DEFAULT_SYSTEM_PROMPT).
         """
+        if tokenizer is None:
+            raise ValueError("tokenizer must be provided")
+        self.tokenizer = tokenizer
+
         # Handle backward compatibility: if first arg is a tokenizer, treat it as tokenizer
         if isinstance(image_processor, Qwen2TokenizerFast):
             tokenizer = image_processor
             image_processor = None
 
+        self.enable_dynamic_tiling = enable_dynamic_tiling
+
         if image_processor is None:
-            if tokenizer is None:
-                raise ValueError("Either image_processor or tokenizer must be provided")
-            self.image_processor = SiQ_VLImageProcessor(vit_image_size=vit_image_size)
+            if self.enable_dynamic_tiling:
+                print("[SiQ_VLProcessor] Using Custom SiQ_VLImageProcessor (Dynamic Tiling Enabled)")
+                self.image_processor = SiQ_VLImageProcessor(vit_image_size=vit_image_size)
+            else:
+                print("[SiQ_VLProcessor] Using Standard SiglipImageProcessor")
+                self.image_processor = SiglipImageProcessor(size={"height": vit_image_size, "width": vit_image_size})
         else:
             self.image_processor = image_processor
-        self.tokenizer: Qwen2TokenizerFast = tokenizer
 
         super().__init__(image_processor=self.image_processor, tokenizer=self.tokenizer)
 
@@ -331,9 +341,17 @@ class SiQ_VLProcessor(ProcessorMixin):
         # -------------------------------------------------------
         # 1. Image Processing (Tile / AnyRes Logic)
         # -------------------------------------------------------
-        image_features = self.image_processor(images, return_tensors=return_tensors)
+        image_features = self.image_processor(list(images), return_tensors=return_tensors)
         pixel_values = image_features["pixel_values"]
-        num_image_tokens = image_features["num_tiles_per_image"] * self.tokens_per_tile
+        if self.enable_dynamic_tiling:
+            num_tiles_per_image = image_features["num_tiles_per_image"]
+        else:
+            num_tiles_per_image = torch.ones(len(images), dtype=torch.long)
+
+            if isinstance(pixel_values, list):
+                pixel_values = torch.stack(pixel_values)
+
+        num_image_tokens = num_tiles_per_image * self.tokens_per_tile
 
         # -------------------------------------------------------
         # 2. Text Processing (Dynamic Token Insertion)
@@ -518,6 +536,7 @@ class SiQ_VLProcessor(ProcessorMixin):
         output["vit_patch_size"] = self.vit_patch_size
         output["pixel_shuffle_factor"] = self.pixel_shuffle_factor
         output["system_prompt"] = self.system_prompt
+        output["enable_dynamic_tiling"] = self.enable_dynamic_tiling
         return output
 
     @classmethod
@@ -539,7 +558,13 @@ class SiQ_VLProcessor(ProcessorMixin):
             with open(processor_config_file, encoding="utf-8") as f:
                 processor_config = json.load(f)
 
-            for key in ["vit_image_size", "vit_patch_size", "pixel_shuffle_factor", "system_prompt"]:
+            for key in [
+                "vit_image_size",
+                "vit_patch_size",
+                "pixel_shuffle_factor",
+                "system_prompt",
+                "enable_dynamic_tiling",
+            ]:
                 if key in processor_config and key not in kwargs:
                     kwargs[key] = processor_config[key]
 
@@ -560,7 +585,13 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
     # 2. Initialize your Custom Processor
-    processor = SiQ_VLProcessor(tokenizer, vit_image_size=224, vit_patch_size=14, pixel_shuffle_factor=4)
+    processor = SiQ_VLProcessor(
+        tokenizer=tokenizer,
+        vit_image_size=512,
+        vit_patch_size=16,
+        pixel_shuffle_factor=2,
+        enable_dynamic_tiling=False,
+    )
 
     # Dummy image for testing
     raw_image = Image.new("RGB", (4096, 1024), color="red")
@@ -581,7 +612,7 @@ if __name__ == "__main__":
     print(f"Labels: {inputs.labels[0]}")
     print(f"Attention Mask shape: {inputs.attention_mask.shape}")
     print(f"Attention Mask: {inputs.attention_mask[0]}")
-    print(f"Decoded Prompt: \n{processor.decode(inputs.input_ids[0], assistant_only=False)}")
+    print(f"Decoded Prompt: \n{processor.decode(inputs.input_ids[0])}")
 
     # -- test question only
     print("--- test image + question only ---")

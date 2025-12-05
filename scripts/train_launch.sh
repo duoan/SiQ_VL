@@ -139,6 +139,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--gen_steps" "10"
             "--eval_steps" "10"
             "--max_eval_samples" "16"
+            "--gen_samples" "4"
             "--no_distributed"
         )
     else
@@ -163,6 +164,7 @@ if [[ "$HOST_TYPE" == "macbook" ]]; then
             "--gen_steps" "10"
             "--eval_steps" "10"
             "--max_eval_samples" "16"
+            "--gen_samples" "4"
             "--no_distributed"
         )
     fi
@@ -175,10 +177,10 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
 
     if [[ "$STAGE" == "1" ]]; then
         AWS_ARGS=(
-            "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
+            "--vision_model_name_or_path" "google/siglip2-large-patch16-512"
             "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
-            "--pixel_shuffle_factor" "4"
+            "--pixel_shuffle_factor" "2"
             "--sub_sets" "coco_colors,sharegpt4v(coco),laion_gpt4v,face_emotion"
             "--sub_sets_weights" "4,4,1,1"
             "--per_device_train_batch_size" "4"
@@ -191,17 +193,17 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--logging_steps" "10"
             "--save_steps" "100"
             "--eval_steps" "100"
-            "--max_eval_samples" "4096"
+            "--max_eval_samples" "1024"
             "--gen_steps" "100"
             "--push_to_hub"
         )
     else
         # Stage 2: large-scale finetuning with ~1M VQA samples, auto max_steps
         AWS_ARGS=(
-            "--vision_model_name_or_path" "google/siglip2-so400m-patch16-512"
+            "--vision_model_name_or_path" "google/siglip2-large-patch16-512"
             "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
-            "--pixel_shuffle_factor" "4" 
+            "--pixel_shuffle_factor" "2" 
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_samples" "1000000"
