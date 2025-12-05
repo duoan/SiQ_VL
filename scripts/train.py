@@ -579,26 +579,24 @@ def train(args=None):
         all_raw_datasets.append(raw_dataset)
         all_weights.append(weight)
 
-    from datasets.combine import concatenate_datasets
+    from datasets.combine import interleave_datasets
 
-    concat_raw_dataset = concatenate_datasets(all_raw_datasets).shuffle(seed=args.seed)
+    total_weight = sum(all_weights)
+    probabilities = [weight / total_weight for weight in all_weights]
+    rank_zero_info(">>> Building weighted mixture dataset with probabilities:")
+    for name, probability in zip(SUB_SETS, probabilities, strict=False):
+        rank_zero_info(f"    - {name}: probability={probability:.4f}")
 
-    # total_weight = sum(all_weights)
-    # probabilities = [weight / total_weight for weight in all_weights]
-    # rank_zero_info(">>> Building weighted mixture dataset with probabilities:")
-    # for name, probability in zip(SUB_SETS, probabilities, strict=False):
-    #     rank_zero_info(f"    - {name}: probability={probability:.4f}")
+    rank_zero_info(f">>> DEBUG: All weights: {all_weights}")
+    rank_zero_info(f">>> DEBUG: Probabilities: {probabilities}")
+    rank_zero_info(f">>> DEBUG: All raw datasets: {len(all_raw_datasets)}")
 
-    # rank_zero_info(f">>> DEBUG: All weights: {all_weights}")
-    # rank_zero_info(f">>> DEBUG: Probabilities: {probabilities}")
-    # rank_zero_info(f">>> DEBUG: All raw datasets: {len(all_raw_datasets)}")
-
-    # concat_raw_dataset = interleave_datasets(
-    #     all_raw_datasets,
-    #     probabilities=probabilities,
-    #     seed=args.seed,
-    #     stopping_strategy="all_exhausted",
-    # )
+    concat_raw_dataset = interleave_datasets(
+        all_raw_datasets,
+        probabilities=probabilities,
+        seed=args.seed,
+        stopping_strategy="all_exhausted",
+    )
 
     # Limit dataset size if specified (for quick testing / controlling total samples)
     if args.max_samples is not None:

@@ -382,9 +382,56 @@ class GenerationCallback(TrainerCallback):
         processor,
         samples: list[tuple[Image.Image, str]],
         device: torch.device,
+        batch_size: int | None = None,
     ) -> list[str]:
         """
         Generate answers for a batch of samples using the model's generate method.
+        If batch_size is provided, splits the samples into smaller batches to avoid OOM.
+
+        Args:
+            model: The model to use for generation
+            processor: The processor to use for tokenization
+            samples: List of (image, question) tuples
+            device: Device to run generation on
+            batch_size: Maximum batch size per generation call. If None, processes entire batch at once.
+
+        Returns:
+            List of generated answer strings
+        """
+        if not samples:
+            return []
+
+        # If batch_size is not specified or batch is small enough, process all at once
+        if batch_size is None or len(samples) <= batch_size:
+            return self._generate_answer_batch_single(model, processor, samples, device)
+
+        # Split into smaller batches and process sequentially
+        all_generated_texts = []
+        num_batches = math.ceil(len(samples) / batch_size)
+
+        for i in range(0, len(samples), batch_size):
+            batch_samples = samples[i : i + batch_size]
+            rank_zero_info(
+                f">>> [GenerationCallback] Processing batch {i // batch_size + 1}/{num_batches} "
+                f"({len(batch_samples)} samples)..."
+            )
+            batch_texts = self._generate_answer_batch_single(model, processor, batch_samples, device)
+            all_generated_texts.extend(batch_texts)
+
+            # Clean memory after each batch to prevent accumulation
+            clean_cuda_memory()
+
+        return all_generated_texts
+
+    def _generate_answer_batch_single(
+        self,
+        model,
+        processor,
+        samples: list[tuple[Image.Image, str]],
+        device: torch.device,
+    ) -> list[str]:
+        """
+        Generate answers for a single batch of samples (internal helper method).
 
         Args:
             model: The model to use for generation
@@ -652,9 +699,14 @@ class GenerationCallback(TrainerCallback):
                     f">>> [GenerationCallback] Generating answers for {len(batch_samples)} samples in batch..."
                 )
 
-                # Generate answers for entire batch
+                # Generate answers for entire batch (with batch splitting if needed)
                 try:
-                    generated_texts = self._generate_answer_batch(unwrapped_model, processor, batch_samples, device)
+                    batch_size = (
+                        args.per_device_train_batch_size if hasattr(args, "per_device_train_batch_size") else None
+                    )
+                    generated_texts = self._generate_answer_batch(
+                        unwrapped_model, processor, batch_samples, device, batch_size=batch_size
+                    )
                 except Exception as e:
                     rank_zero_info(f">>> [GenerationCallback] Error during batch generation: {e}")
                     import traceback
