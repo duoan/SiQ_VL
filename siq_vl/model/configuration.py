@@ -42,10 +42,9 @@ class SiQ_VLProjectorConfig(PretrainedConfig):
     def __init__(
         self,
         vision_pixel_shuffle_factor: int = 2,
-        vision_hidden_size: int = 768,
-        text_hidden_size: int = 896,
-        intermediate_size: int = 1024,
-        hidden_act: str = "gelu",
+        vision_hidden_size: int = 768,  # default hidden size of SigLIP
+        text_hidden_size: int = 896,  # default hidden size of Qwen2.5-0.5B-Instruct
+        hidden_act: str = "silu",  # default activation function of Qwen2.5-0.5B-Instruct
         *args,
         **kwargs,
     ):
@@ -58,7 +57,6 @@ class SiQ_VLProjectorConfig(PretrainedConfig):
         self.vision_pixel_shuffle_factor = vision_pixel_shuffle_factor
         self.vision_hidden_size = vision_hidden_size
         self.text_hidden_size = text_hidden_size
-        self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
 
 

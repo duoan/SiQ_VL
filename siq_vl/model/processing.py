@@ -57,7 +57,6 @@ class DynamicResize(torch.nn.Module):
         self.t = int(tile_size)
         self.m = int(max_side_len)
         self.interpolation = interpolation
-        print(f"Resize to max side len: {resize_to_max_side_len}")
         self.resize_to_max_side_len = resize_to_max_side_len
 
     # ------------------------------------------------------------
@@ -157,10 +156,10 @@ def get_image_processor(tile_size: int, max_img_size: int, resize_to_max_side_le
 
 
 class SiQ_VLImageProcessor(BaseImageProcessor):
-    def __init__(self, vit_image_size: int = 224, **kwargs):
+    def __init__(self, vit_image_size: int = 224, max_dynamic_patch: int = 2, **kwargs):
         super().__init__(**kwargs)
         self.vit_image_size = vit_image_size
-        self.image_processor = get_image_processor(vit_image_size, vit_image_size * 4)
+        self.image_processor = get_image_processor(vit_image_size, vit_image_size * max_dynamic_patch)
 
     def preprocess(
         self, images: ImageInput, return_tensors: str | torch.TensorType | None = None, **kwargs
@@ -229,11 +228,11 @@ class SiQ_VLProcessor(ProcessorMixin):
         self,
         image_processor: SiQ_VLImageProcessor | Qwen2TokenizerFast | None = None,
         tokenizer: Qwen2TokenizerFast | None = None,
-        *,
         vit_image_size: int = 224,  # same size as the Siglip image processor
         vit_patch_size: int = 16,
         pixel_shuffle_factor: int = 2,
         system_prompt: str | None = None,
+        **kwargs,
     ):
         """
         Initializes the SiQ_VLProcessor.
@@ -268,9 +267,9 @@ class SiQ_VLProcessor(ProcessorMixin):
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
 
         # Calculate the number of image tokens dynamically
-        self.patches_per_dim = vit_image_size // vit_patch_size  # e.g. 384 // 14 = 27
-        self.reduced_dim = self.patches_per_dim // pixel_shuffle_factor  # e.g. 27 // 4 = 6
-        self.tokens_per_tile = self.reduced_dim**2  # e.g. 6^2 = 36
+        num_patches_per_side = vit_image_size // vit_patch_size  # 512//16 = 32
+        reduced_patches_per_side = num_patches_per_side // pixel_shuffle_factor  # 32//4 = 8
+        self.tokens_per_tile = reduced_patches_per_side**2  # 8*8 = 64
 
         self._im_start_token_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -334,27 +333,26 @@ class SiQ_VLProcessor(ProcessorMixin):
         # -------------------------------------------------------
         image_features = self.image_processor(images, return_tensors=return_tensors)
         pixel_values = image_features["pixel_values"]
-        num_tiles_per_image = image_features["num_tiles_per_image"]
+        num_image_tokens = image_features["num_tiles_per_image"] * self.tokens_per_tile
 
         # -------------------------------------------------------
         # 2. Text Processing (Dynamic Token Insertion)
         # -------------------------------------------------------
         msg_batch = []
 
-        for q, a, n_tiles in zip(questions, answers, num_tiles_per_image, strict=False):
+        for i, (q, a) in enumerate(zip(questions, answers, strict=False)):
             q = q if q is not None else "Describe this image."
-            total_image_tokens = n_tiles * self.tokens_per_tile
 
             # Construct placeholder: <|vision_start|><|image_pad|>...<|vision_end|>
             image_placeholder = (
-                self.vision_start_token + self.image_pad_token * total_image_tokens + self.vision_end_token
+                self.vision_start_token + self.image_pad_token * num_image_tokens[i] + self.vision_end_token
             )
 
             user_content = q
             if "<image>" in user_content:
                 user_content = user_content.replace("<image>", image_placeholder)
             else:
-                if n_tiles > 0:
+                if num_image_tokens[i] > 0:
                     user_content = image_placeholder + "\n" + user_content
 
             msgs = [
@@ -402,7 +400,10 @@ class SiQ_VLProcessor(ProcessorMixin):
         data = dict(text_outputs)
         data["pixel_values"] = pixel_values
         # Optional: Pass num_tiles info to model if needed for advanced masking
-        # data["image_sizes"] = torch.tensor(num_tiles_per_image)
+        if isinstance(num_image_tokens, torch.Tensor):
+            data["num_image_tokens"] = num_image_tokens.detach().clone()
+        else:
+            data["num_image_tokens"] = torch.tensor(num_image_tokens)
 
         # -------------------------------------------------------
         # 4. Label Masking (Supervised Mode)
@@ -516,6 +517,7 @@ class SiQ_VLProcessor(ProcessorMixin):
         output["vit_image_size"] = self.vit_image_size
         output["vit_patch_size"] = self.vit_patch_size
         output["pixel_shuffle_factor"] = self.pixel_shuffle_factor
+        output["system_prompt"] = self.system_prompt
         return output
 
     @classmethod
@@ -537,13 +539,9 @@ class SiQ_VLProcessor(ProcessorMixin):
             with open(processor_config_file, encoding="utf-8") as f:
                 processor_config = json.load(f)
 
-            # Pass custom attributes as kwargs if they exist in config and not already in kwargs
-            if "vit_image_size" in processor_config and "vit_image_size" not in kwargs:
-                kwargs["vit_image_size"] = processor_config["vit_image_size"]
-            if "vit_patch_size" in processor_config and "vit_patch_size" not in kwargs:
-                kwargs["vit_patch_size"] = processor_config["vit_patch_size"]
-            if "pixel_shuffle_factor" in processor_config and "pixel_shuffle_factor" not in kwargs:
-                kwargs["pixel_shuffle_factor"] = processor_config["pixel_shuffle_factor"]
+            for key in ["vit_image_size", "vit_patch_size", "pixel_shuffle_factor", "system_prompt"]:
+                if key in processor_config and key not in kwargs:
+                    kwargs[key] = processor_config[key]
 
         # Load using parent method with updated kwargs
         return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
@@ -562,10 +560,10 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
     # 2. Initialize your Custom Processor
-    processor = SiQ_VLProcessor(tokenizer, vit_image_size=224, vit_patch_size=14, pixel_shuffle_factor=2)
+    processor = SiQ_VLProcessor(tokenizer, vit_image_size=224, vit_patch_size=14, pixel_shuffle_factor=4)
 
     # Dummy image for testing
-    raw_image = Image.new("RGB", (384, 384), color="red")
+    raw_image = Image.new("RGB", (4096, 1024), color="red")
 
     # 3. Test image + question + answer
     print("--- test image + question + answer ---")
@@ -577,6 +575,8 @@ if __name__ == "__main__":
     print(f"Input IDs: {inputs.input_ids[0]}")
     print(f"Pixel Values shape: {inputs.pixel_values.shape}")
     print(f"Pixel Values: {inputs.pixel_values[0]}")
+    print(f"Num Image Tokens: {inputs.num_image_tokens.shape}")
+    print(f"Num Image Tokens: {inputs.num_image_tokens}")
     print(f"Labels shape: {inputs.labels.shape}")
     print(f"Labels: {inputs.labels[0]}")
     print(f"Attention Mask shape: {inputs.attention_mask.shape}")
@@ -610,6 +610,8 @@ if __name__ == "__main__":
     )
     print(f"Input IDs shape: {inputs.input_ids.shape}")
     print(f"Pixel Values shape: {inputs.pixel_values.shape}")
+    print(f"Num Image Tokens shape: {inputs.num_image_tokens.shape}")
+    print(f"Num Image Tokens: {inputs.num_image_tokens}")
     print(f"Labels shape: {inputs.labels.shape}")
     print(f"Labels: {inputs.labels[0]}")
     print(f"Attention Mask shape: {inputs.attention_mask.shape}")

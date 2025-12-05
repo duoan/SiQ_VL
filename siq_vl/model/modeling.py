@@ -191,6 +191,7 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         self,
         input_ids: torch.LongTensor | None = None,
         pixel_values: torch.FloatTensor | None = None,
+        num_image_tokens: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
@@ -206,6 +207,7 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         Arguments:
             input_ids: The input text token ids (batch_size, sequence_length).
             pixel_values: The input vision features (batch_size, channels, height, width).
+            num_image_tokens: The number of image tokens for each image in the batch (batch_size).
             attention_mask: The attention mask for the language model (batch_size, sequence_length).
             position_ids: The position ids for the language model (batch_size, sequence_length).
             past_key_values: The past key values from the language model.
@@ -221,16 +223,20 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         if past_key_values is None and pixel_values is not None:
             # 1. Vision Forward
             # pixel_values shape: (Total_Tiles, C, H, W)
+            print("pixel_values shape:", pixel_values.shape)
             vision_outputs = self.vision_model(pixel_values)
             vision_features = vision_outputs.last_hidden_state
-
+            print("vision_features shape:", vision_features.shape)
+            print("num_image_tokens:", num_image_tokens)
             # 2. Projector
             # vision_token_embeddings shape: (Total_Tiles, Tokens_Per_Tile, Text_Dim)
             vision_token_embeddings = self.projector(vision_features)
+            print("vision_token_embeddings shape:", vision_token_embeddings.shape)
 
             # 3. Flatten All Vision Tokens
             # vision_token_embeddings_flat shape: (Total_Vision_Tokens, Text_Dim)
             vision_token_embeddings_flat = vision_token_embeddings.view(-1, vision_token_embeddings.size(-1))
+            print("vision_token_embeddings_flat shape:", vision_token_embeddings_flat.shape)
 
             # 4. Text Embeddings
             token_embeddings = self.text_model.get_input_embeddings()(input_ids)
@@ -256,6 +262,8 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
             # Use custom embeddings instead of input_ids when we've processed vision
             inputs_embeds = token_embeddings
             input_ids = None
+
+            print("=" * 100)
 
         return self.text_model(
             input_ids=input_ids,
@@ -284,6 +292,7 @@ AutoModelForCausalLM.register(config_class=SiQ_VLConfig, model_class=SiQ_VLForCa
 def get_stage1_model_and_processor(
     pretrained_vision_model_path: str = "google/siglip2-base-patch16-224",
     pretrained_text_model_path: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    vision_pixel_shuffle_factor: int = 2,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
@@ -298,6 +307,7 @@ def get_stage1_model_and_processor(
     config = get_siq_vl_config(
         text_model_name_or_path=pretrained_text_model_path,
         vision_model_name_or_path=pretrained_vision_model_path,
+        vision_pixel_shuffle_factor=vision_pixel_shuffle_factor,
     )
     rank_zero_info(f"Config: \n{config}")
 
@@ -340,6 +350,9 @@ def get_stage2_model_and_processor(
     """
     model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path)
     processor = SiQ_VLProcessor.from_pretrained(stage_1_checkpoint_path)
+    rank_zero_info(f"DEBUG - Model pixel_shuffle_factor: {model.projector.config.vision_pixel_shuffle_factor}")
+    rank_zero_info(f"DEBUG - Processor pixel_shuffle_factor: {processor.pixel_shuffle_factor}")
+    rank_zero_info(f"DEBUG - Processor tokens_per_tile: {processor.tokens_per_tile}")
 
     model.unfreez_text_model()
     model.freez_vision_model()
@@ -388,18 +401,33 @@ if __name__ == "__main__":
     print("Stage 1")
     print("=" * 100)
 
-    stage_1_model, stage_1_processor = get_stage1_model_and_processor()
+    stage_1_model, stage_1_processor = get_stage1_model_and_processor(
+        pretrained_vision_model_path="google/siglip2-base-patch16-512",
+        vision_pixel_shuffle_factor=4,
+    )
 
     inputs = stage_1_processor(
         batch=[
             (Image.open("image.png"), "Describe this image.", "The image shows a beautiful sunset."),
             (Image.open("image.png"), "How many people are in the image?", "There are 2 people in the image."),
+            (
+                Image.new("RGB", (4096, 1024), color="blue"),
+                "Describe this image.",
+                "The image shows a beautiful sunset.",
+            ),
+            (
+                Image.new("RGB", (512, 512), color="red"),
+                "Describe this image.",
+                "The image shows a beautiful sunset.",
+            ),
         ],
         return_tensors="pt",
     )
 
     print("pixel_values min and max:", inputs.pixel_values.min(), inputs.pixel_values.max())
     print("pixel_values shape:", inputs.pixel_values.shape)
+    print("num_image_tokens shape:", inputs.num_image_tokens.shape)
+    print("num_image_tokens:", inputs.num_image_tokens)
 
     outputs = stage_1_model(
         input_ids=inputs.input_ids,
@@ -447,10 +475,13 @@ if __name__ == "__main__":
 
     print("pixel_values min and max:", inputs.pixel_values.min(), inputs.pixel_values.max())
     print("pixel_values shape:", inputs.pixel_values.shape)
+    print("num_image_tokens shape:", inputs.num_image_tokens.shape)
+    print("num_image_tokens:", inputs.num_image_tokens)
 
     outputs = stage_2_model(
         input_ids=inputs.input_ids,
         pixel_values=inputs.pixel_values,
+        num_image_tokens=inputs.num_image_tokens,
         attention_mask=inputs.attention_mask,
         labels=inputs.labels,
     )
