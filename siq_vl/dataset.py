@@ -5,32 +5,32 @@ from PIL import Image
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 
-def _to_pil_rgb(image: str | Image.Image) -> Image.Image:
+def _to_pil_rgb(image: str | Image.Image) -> Image.Image | None:
     """
-    Normalize any image-like input into a valid 3-channel RGB PIL.Image.
-
-    SigLIP expects images in channels-first format (C, H, W). However, we should
-    never pass tensors or numpy arrays directly to the model, because unusual
-    shapes like (1, 1, 3) confuse the channel inference logic inside the
-    image processor. This helper ensures a clean, unambiguous PIL RGB image so
-    that SigLIP can safely convert it to (3, H, W) internally.
+    Convert input into a clean 3-channel RGB PIL image.
+    Return None if the image cannot be converted to exactly 3 channels.
     """
 
-    # Case 1 — Already a PIL image
-    if isinstance(image, Image.Image):
-        # Ensure it's RGB (common case: grayscale → RGB)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        if image.channels != 3:
-            return None
-        return image
-
-    # Case 2 — It is a file path (string)
-    if isinstance(image, str):
-        img = Image.open(image).convert("RGB")
-        if img.channels != 3:
+    def ensure_rgb(img: Image.Image) -> Image.Image | None:
+        # Convert grayscale, CMYK, RGBA, etc. to RGB
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        # After conversion, should be exactly 3 bands
+        if len(img.getbands()) != 3:
             return None
         return img
+
+    # Case 1 — PIL Image
+    if isinstance(image, Image.Image):
+        return ensure_rgb(image)
+
+    # Case 2 — file path
+    if isinstance(image, str):
+        try:
+            img = Image.open(image)
+            return ensure_rgb(img)
+        except Exception:
+            return None
 
     return None
 
