@@ -16,12 +16,19 @@ _reject_keywords = [
     "cannot see",
     "can't see",
     "don't have access",
+    "don't have the ability",
     "text-based AI",
     "as an AI",
     "I'm sorry",
+    "I apologize",
     "unable to view",
     "cannot view",
-    "I apologize",
+    "I'm unable to",
+    "I cannot provide",
+    "I don't have the capability",
+    "as a language model",
+    "as a text-based",
+    "I do not have access",
 ]
 
 
