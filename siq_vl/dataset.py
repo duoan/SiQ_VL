@@ -12,6 +12,19 @@ def _to_rgb(pil_image: Image.Image) -> Image.Image:
     return pil_image.convert("RGB")
 
 
+_reject_keywords = [
+    "cannot see",
+    "can't see",
+    "don't have access",
+    "text-based AI",
+    "as an AI",
+    "I'm sorry",
+    "unable to view",
+    "cannot view",
+    "I apologize",
+]
+
+
 class VQADataset(Dataset):
     """
     Standard Dataset that randomly selects one turn per item on each access.
@@ -55,6 +68,10 @@ class VQADataset(Dataset):
         turn = texts[turn_idx]
         q = turn.get("user", "")
         a = turn.get("assistant", "")
+
+        # Reject samples with unwanted keywords in the answer
+        if any(keyword.lower() in a.lower() for keyword in _reject_keywords):
+            return None
 
         return {
             "image": image,
