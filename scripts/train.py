@@ -383,8 +383,8 @@ def parse_args():
     parser.add_argument(
         "--gen_samples",
         type=int,
-        default=20,
-        help="Number of fixed samples to use for generation evaluation (default: 20)",
+        default=40,
+        help="Number of fixed samples to use for generation evaluation (default: 40)",
     )
     parser.add_argument(
         "--gen_steps",
@@ -395,8 +395,8 @@ def parse_args():
     parser.add_argument(
         "--gen_max_new_tokens",
         type=int,
-        default=128,
-        help="Maximum number of new tokens to generate (default: 128)",
+        default=64,
+        help="Maximum number of new tokens to generate (default: 64)",
     )
     parser.add_argument(
         "--gen_temperature",

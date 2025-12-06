@@ -201,8 +201,8 @@ class GenerationCallback(TrainerCallback):
         eval_samples: list[dict] | None = None,
         num_samples: int = 20,
         eval_interval: int = 100,
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
+        max_new_tokens: int = 64,
+        temperature: float = 0.7,
         do_sample: bool = False,  # greedy generation
         num_beams: int = 1,
     ):
@@ -216,10 +216,10 @@ class GenerationCallback(TrainerCallback):
                          If None, will sample from eval_dataset.
             num_samples: Number of samples to use if eval_samples is None (default: 20)
             eval_interval: Evaluate every N steps (default: 100)
-            max_new_tokens: Maximum number of tokens to generate (default: 256)
+            max_new_tokens: Maximum number of tokens to generate (default: 64)
             temperature: Sampling temperature (default: 0.7)
-            do_sample: Whether to use sampling (default: True)
-            num_beams: Number of beams for beam search (default: 2)
+            do_sample: Whether to use sampling (default: False = greedy decoding)
+            num_beams: Number of beams for beam search (default: 1)
         """
         self.processor = processor
         self.eval_dataset = eval_dataset
@@ -471,6 +471,7 @@ class GenerationCallback(TrainerCallback):
                 do_sample=self.do_sample,
                 num_beams=self.num_beams if not self.do_sample else 1,
                 repetition_penalty=1.2,
+                use_cache=False,
                 pad_token_id=processor.tokenizer.pad_token_id,
                 eos_token_id=processor.tokenizer.eos_token_id,
             )
@@ -585,6 +586,15 @@ class GenerationCallback(TrainerCallback):
         # Skip if wandb is not initialized
         if not wandb.run:
             return
+        trainer = kwargs.get("trainer")
+        if trainer is None:
+            rank_zero_info(">>> [GenerationCallback] Warning: Trainer not found, skipping generation.")
+            return
+
+        model = trainer.model
+        if model is None:
+            rank_zero_info(">>> [GenerationCallback] Warning: Model not found in Trainer, skipping generation.")
+            return
 
         # Get model from kwargs if not provided
         if model is None:
@@ -593,6 +603,11 @@ class GenerationCallback(TrainerCallback):
         if model is None:
             rank_zero_info(">>> [GenerationCallback] Warning: Model not found, skipping generation.")
             return
+
+        rank_zero_info(f">>> [DEBUG] Model ID: {id(model)}")
+        rank_zero_info(f">>> [DEBUG] Model type: {type(model)}")
+        if hasattr(model, "module"):
+            rank_zero_info(f">>> [DEBUG] Wrapped model ID: {id(model.module)}")
 
         # Get processor - try from self first, then from Trainer
         processor = self.processor
@@ -660,6 +675,7 @@ class GenerationCallback(TrainerCallback):
             # Get device and unwrap model - use unwrapped model to avoid DDP issues
             # CRITICAL: Unwrap DDP model to prevent hook conflicts during generation
             unwrapped_model = model.module if hasattr(model, "module") else model
+            rank_zero_info(f">>> [DEBUG] Using model: {type(unwrapped_model)}")
             device = next(unwrapped_model.parameters()).device
 
             # Generate predictions
@@ -670,6 +686,12 @@ class GenerationCallback(TrainerCallback):
             try:
                 unwrapped_model.eval()
                 # Prepare all samples for batch processing
+                projector_weight = unwrapped_model.projector.mlp.weight
+                rank_zero_info(f">>> [DEBUG] Projector weight stats at step {step_to_log}:")
+                rank_zero_info(f"    Mean: {projector_weight.mean().item():.6f}")
+                rank_zero_info(f"    Std: {projector_weight.std().item():.6f}")
+                rank_zero_info(f"    Min: {projector_weight.min().item():.6f}")
+                rank_zero_info(f"    Max: {projector_weight.max().item():.6f}")
 
                 batch_samples = []
                 sample_metadata = []

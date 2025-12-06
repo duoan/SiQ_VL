@@ -181,7 +181,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "2"
-            "--sub_sets" "sharegpt4v(coco),laion_gpt4v"
+            "--sub_sets" "sharegpt4v(coco),LLaVA_Instruct_150K"
             "--sub_sets_weights" "1,1"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
