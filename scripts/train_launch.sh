@@ -181,8 +181,8 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
             "--pixel_shuffle_factor" "2"
-            "--sub_sets" "coco_colors,sharegpt4v(coco),laion_gpt4v,face_emotion"
-            "--sub_sets_weights" "4,4,1,1"
+            "--sub_sets" "sharegpt4v(coco),laion_gpt4v"
+            "--sub_sets_weights" "1,1"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_steps" "5000"
@@ -203,7 +203,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--vision_model_name_or_path" "google/siglip2-large-patch16-512"
             "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
             # reduce to 64 image tokens
-            "--pixel_shuffle_factor" "2" 
+            "--pixel_shuffle_factor" "2"
             "--per_device_train_batch_size" "4"
             "--gradient_accumulation_steps" "4"
             "--max_samples" "1000000"
@@ -272,5 +272,3 @@ else
 
     $PYTHON_CMD "$TRAIN_SCRIPT" "${BASE_ARGS[@]}" "${DEFAULT_ARGS[@]}" "$@"
 fi
-
-

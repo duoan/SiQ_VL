@@ -670,13 +670,12 @@ class GenerationCallback(TrainerCallback):
             try:
                 unwrapped_model.eval()
                 # Prepare all samples for batch processing
-                from siq_vl.dataset import _to_pil_rgb
 
                 batch_samples = []
                 sample_metadata = []
                 for i, sample in enumerate(eval_samples):
                     try:
-                        image = _to_pil_rgb(sample["image"])
+                        image = sample["image"]
                         question = sample["question"]
                         ground_truth = sample.get("answer", "")
 

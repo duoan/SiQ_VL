@@ -10,7 +10,7 @@ from typing import Any
 from einops import rearrange
 from PIL import Image
 import torch
-from torchmetrics.utilities import rank_zero_warn
+from torchmetrics.utilities import rank_zero_info, rank_zero_warn
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode, resize
 from transformers import (
@@ -20,9 +20,7 @@ from transformers import (
     BatchFeature,
     ProcessorMixin,
     Qwen2TokenizerFast,
-    SiglipImageProcessor,
 )
-from transformers.image_utils import ImageInput
 from transformers.utils.constants import IMAGENET_STANDARD_MEAN, IMAGENET_STANDARD_STD
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -145,7 +143,7 @@ class GlobalAndSplitImages(torch.nn.Module):
         return torch.cat([global_tile, tiles], dim=0), grid
 
 
-def get_image_processor(tile_size: int, max_img_size: int, resize_to_max_side_len: bool = False):
+def get_dynamic_image_processor(tile_size: int, max_img_size: int, resize_to_max_side_len: bool = False):
     return transforms.Compose(
         [
             DynamicResize(tile_size, max_img_size, resize_to_max_side_len),
@@ -156,40 +154,63 @@ def get_image_processor(tile_size: int, max_img_size: int, resize_to_max_side_le
     )
 
 
+def get_default_image_processor(vit_image_size: int):
+    return transforms.Compose(
+        [
+            transforms.Resize((vit_image_size, vit_image_size), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_STANDARD_MEAN, std=IMAGENET_STANDARD_STD),
+        ]
+    )
+
+
 class SiQ_VLImageProcessor(BaseImageProcessor):
     def __init__(self, vit_image_size: int = 224, max_dynamic_patch: int = 2, **kwargs):
         super().__init__(**kwargs)
         self.vit_image_size = vit_image_size
-        self.image_processor = get_image_processor(vit_image_size, vit_image_size * max_dynamic_patch)
+        self.dynamic_image_processor = get_dynamic_image_processor(vit_image_size, vit_image_size * max_dynamic_patch)
+        self.default_image_processor = get_default_image_processor(vit_image_size)
 
     def preprocess(
-        self, images: ImageInput, return_tensors: str | torch.TensorType | None = None, **kwargs
-    ) -> torch.Tensor:
+        self,
+        images: list["Image.Image"],
+        enable_dynamic_tiling: bool = False,
+        return_tensors: str | torch.TensorType | None = None,
+        **kwargs,
+    ) -> BatchFeature:
         processed_pixel_values = []
         num_tiles_per_image = []
 
-        for img in images:
-            # Load path if string
-            if isinstance(img, str):
-                img = Image.open(img).convert("RGB")
-            elif isinstance(img, Image.Image):
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-            else:
-                raise ValueError(f"Unsupported image type: {type(img)}")
+        if enable_dynamic_tiling:
+            # Use dynamic tiling processor
+            for img in images:
+                # Apply Tile Transform -> (N_tiles, 3, H, W)
+                tiles, _grid = self.dynamic_image_processor(img)
+                processed_pixel_values.append(tiles)
+                num_tiles_per_image.append(tiles.shape[0])
 
-            # Apply Tile Transform -> (N_tiles, 3, H, W)
-            tiles, _grid = self.image_processor(img)
+            # Concatenate all tiles from all images into a single batch tensor
+            # Shape: (Total_Tiles_In_Batch, 3, H, W)
+            pixel_values = torch.cat(processed_pixel_values, dim=0)
+        else:
+            # Use default image processor (simple resize without tiling)
+            for img in images:
+                # Apply default transform -> (3, H, W)
+                processed_img = self.default_image_processor(img)
+                processed_pixel_values.append(processed_img)
+                num_tiles_per_image.append(1)  # Single tile per image
 
-            processed_pixel_values.append(tiles)
-            num_tiles_per_image.append(tiles.shape[0])
+            # Stack all images into a single batch tensor
+            # Shape: (Batch_Size, 3, H, W)
+            pixel_values = torch.stack(processed_pixel_values, dim=0)
 
-        # Concatenate all tiles from all images into a single batch tensor
-        # Shape: (Total_Tiles_In_Batch, 3, H, W)
-        pixel_values = torch.cat(processed_pixel_values, dim=0)
         num_tiles_per_image = torch.tensor(num_tiles_per_image, dtype=torch.long)
         return BatchFeature(
-            data={"pixel_values": pixel_values, "num_tiles_per_image": num_tiles_per_image}, tensor_type=return_tensors
+            data={
+                "pixel_values": pixel_values,
+                "num_tiles_per_image": num_tiles_per_image,
+            },
+            tensor_type=return_tensors,
         )
 
     def to_dict(self):
@@ -197,7 +218,8 @@ class SiQ_VLImageProcessor(BaseImageProcessor):
         output = super().to_dict()
         # Remove the Compose object which is not JSON serializable
         # It will be reconstructed from vit_image_size during __init__
-        output.pop("image_processor", None)
+        output.pop("dynamic_image_processor", None)
+        output.pop("default_image_processor", None)
         return output
 
 
@@ -209,7 +231,7 @@ AutoImageProcessor.register(SiQ_VLImageProcessor, SiQ_VLImageProcessor)
 class SiQ_VLProcessor(ProcessorMixin):
     # Attributes required by ProcessorMixin for save_pretrained/from_pretrained to work
     attributes = ["image_processor", "tokenizer"]  # noqa: RUF012
-    image_processor_class = "AutoImageProcessor"
+    image_processor_class = "SiQ_VLImageProcessor"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
 
     image_pad_token = "<|image_pad|>"
@@ -227,7 +249,7 @@ class SiQ_VLProcessor(ProcessorMixin):
 
     def __init__(
         self,
-        image_processor: AutoImageProcessor | None = None,
+        image_processor: SiQ_VLImageProcessor | None = None,
         tokenizer: Qwen2TokenizerFast | None = None,
         vit_image_size: int = 224,  # same size as the Siglip image processor
         vit_patch_size: int = 16,
@@ -260,12 +282,8 @@ class SiQ_VLProcessor(ProcessorMixin):
         self.enable_dynamic_tiling = enable_dynamic_tiling
 
         if image_processor is None:
-            if self.enable_dynamic_tiling:
-                print("[SiQ_VLProcessor] Using Custom SiQ_VLImageProcessor (Dynamic Tiling Enabled)")
-                self.image_processor = SiQ_VLImageProcessor(vit_image_size=vit_image_size)
-            else:
-                print("[SiQ_VLProcessor] Using Standard SiglipImageProcessor")
-                self.image_processor = SiglipImageProcessor(size={"height": vit_image_size, "width": vit_image_size})
+            rank_zero_info("[SiQ_VLProcessor] Using Custom SiQ_VLImageProcessor (Dynamic Tiling Enabled)")
+            self.image_processor = SiQ_VLImageProcessor(vit_image_size=vit_image_size)
         else:
             self.image_processor = image_processor
 
@@ -342,7 +360,9 @@ class SiQ_VLProcessor(ProcessorMixin):
         # -------------------------------------------------------
         # 1. Image Processing (Tile / AnyRes Logic)
         # -------------------------------------------------------
-        image_features = self.image_processor(list(images), return_tensors=return_tensors)
+        image_features = self.image_processor(
+            list(images), enable_dynamic_tiling=self.enable_dynamic_tiling, return_tensors=return_tensors
+        )
         pixel_values = image_features["pixel_values"]
         if self.enable_dynamic_tiling:
             num_tiles_per_image = image_features["num_tiles_per_image"]
