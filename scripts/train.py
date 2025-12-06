@@ -383,13 +383,13 @@ def parse_args():
     parser.add_argument(
         "--gen_samples",
         type=int,
-        default=40,
-        help="Number of fixed samples to use for generation evaluation (default: 40)",
+        default=20,
+        help="Number of fixed samples to use for generation evaluation (default: 20)",
     )
     parser.add_argument(
         "--gen_steps",
         type=int,
-        default=100,
+        default=500,
         help="Evaluate generation every N steps (default: 100)",
     )
     parser.add_argument(

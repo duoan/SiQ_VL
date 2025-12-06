@@ -194,7 +194,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--save_steps" "100"
             "--eval_steps" "100"
             "--max_eval_samples" "1024"
-            "--gen_steps" "100"
+            "--gen_steps" "500"
             "--push_to_hub"
         )
     else
