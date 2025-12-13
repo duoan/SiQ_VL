@@ -587,14 +587,8 @@ class GenerationCallback(TrainerCallback):
         if not wandb.run:
             return
         trainer = kwargs.get("trainer")
-        if trainer is None:
-            rank_zero_info(">>> [GenerationCallback] Warning: Trainer not found, skipping generation.")
-            return
-
-        model = trainer.model
-        if model is None:
-            rank_zero_info(">>> [GenerationCallback] Warning: Model not found in Trainer, skipping generation.")
-            return
+        if trainer is not None:
+            model = trainer.model
 
         # Get model from kwargs if not provided
         if model is None:

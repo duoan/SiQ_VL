@@ -137,6 +137,12 @@ class SiQ_VLPreTrainedModel(PreTrainedModel):
 
 
 class SiQ_VLTextModel(Qwen2ForCausalLM):
+    """
+    SiQ-VL text model wrapper that uses the actual model from the text_model_name_or_path.
+    This wrapper delegates all forward passes to the underlying model, which could be
+    Qwen2, Qwen3, or any other causal language model.
+    """
+
     config: SiQ_VLTextConfig = None
 
     def __init__(self, config: SiQ_VLTextConfig = None):
@@ -297,6 +303,7 @@ def get_stage1_model_and_processor(
     pretrained_vision_model_path: str = "google/siglip2-base-patch16-224",
     pretrained_text_model_path: str = "Qwen/Qwen2.5-0.5B-Instruct",
     vision_pixel_shuffle_factor: int = 2,
+    enable_dynamic_tiling: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
@@ -329,6 +336,7 @@ def get_stage1_model_and_processor(
         vit_image_size=model.vision_model.config.image_size,
         vit_patch_size=model.vision_model.config.patch_size,
         pixel_shuffle_factor=model.projector.config.vision_pixel_shuffle_factor,
+        enable_dynamic_tiling=enable_dynamic_tiling,
     )
 
     return model, processor
@@ -407,6 +415,7 @@ if __name__ == "__main__":
 
     stage_1_model, stage_1_processor = get_stage1_model_and_processor(
         pretrained_vision_model_path="google/siglip2-base-patch16-512",
+        pretrained_text_model_path="Qwen/Qwen2.5-0.5B-Instruct",
         vision_pixel_shuffle_factor=2,
     )
 

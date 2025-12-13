@@ -103,14 +103,14 @@ if [[ "$STAGE" == "1" ]]; then
     # Stage 1: freeze text model, train projector
     BASE_ARGS=(
         "--freeze_text_model"
-        "--output_dir" "./checkpoints"
+        "--output_dir" "./outputs"
         # Keep default project name from train.py ("siq-vl")
     )
 else
     # Stage 2: unfreeze text model, full finetuning
     BASE_ARGS=(
         "--no_freeze_text_model"
-        "--output_dir" "./checkpoints"
+        "--output_dir" "./outputs"
     )
 fi
 
@@ -178,8 +178,9 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
     if [[ "$STAGE" == "1" ]]; then
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-large-patch16-512"
-            "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
             # reduce to 64 image tokens
+            "--enable_dynamic_tiling"
             "--pixel_shuffle_factor" "2"
             "--sub_sets" "sharegpt4v(coco),LLaVA_Instruct_150K"
             "--sub_sets_weights" "1,1"
@@ -192,6 +193,7 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--bf16"
             "--logging_steps" "10"
             "--save_steps" "100"
+            "--save_total_limit" "100"
             "--eval_steps" "100"
             "--max_eval_samples" "1024"
             "--gen_steps" "500"
@@ -201,8 +203,10 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
         # Stage 2: large-scale finetuning with ~1M VQA samples, auto max_steps
         AWS_ARGS=(
             "--vision_model_name_or_path" "google/siglip2-large-patch16-512"
-            "--text_model_name_or_path" "Qwen/Qwen2.5-1.5B-Instruct"
+            "--text_model_name_or_path" "Qwen/Qwen2.5-0.5B-Instruct"
+            "--stage_1_checkpoint_path" "/home/duoan/workplace/SiQ_VL/outputs/siglip2-large-patch16-512_qwen2.5-0.5b-instruct_stage1_20251207_043846/stage1"  # Load from stage 1 checkpoint on Hugging Face Hub
             # reduce to 64 image tokens
+            "--enable_dynamic_tiling"
             "--pixel_shuffle_factor" "2"
             "--sub_sets" "densefusion_1m,sharegpt4v(coco),LLaVA_Instruct_150K,lvis_instruct4v"
             "--per_device_train_batch_size" "4"
@@ -214,7 +218,11 @@ elif [[ "$HOST_TYPE" == "aws_p4d" ]]; then
             "--logging_steps" "20"
             "--max_steps" "-1"
             "--save_steps" "1000"
+            "--save_total_limit" "100"
             "--gen_steps" "1000"
+            "--max_eval_samples" "1024"
+            "--eval_steps" "100"
+            "--use_lora"
             "--push_to_hub"
         )
     fi

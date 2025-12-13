@@ -275,6 +275,12 @@ def parse_args():
         default=2,
         help="Pixel shuffle factor for the projector (default: 2, no shuffling).",
     )
+    parser.add_argument(
+        "--enable_dynamic_tiling",
+        action="store_true",
+        default=False,
+        help="Using dynamic tiling for variable-size image inputs (default: False)",
+    )
 
     # Output configuration
     parser.add_argument(
@@ -366,6 +372,12 @@ def parse_args():
         type=int,
         default=500,
         help="Number of steps between saving checkpoints",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=3,
+        help="Maximum number of checkpoints to keep (default: 3)",
     )
     parser.add_argument(
         "--eval_steps",
@@ -545,11 +557,13 @@ def train(args=None):
         vl_model, vl_processor = get_stage1_model_and_processor(
             pretrained_vision_model_path=vision_model_name_or_path,
             pretrained_text_model_path=text_model_name_or_path,
+            enable_dynamic_tiling=args.enable_dynamic_tiling,
         )
     elif stage_name == "stage2":
         stage_1_checkpoint_path = args.stage_1_checkpoint_path
         if stage_1_checkpoint_path is None:
-            stage_1_checkpoint_path = default_repo_name
+            stage_1_checkpoint_path = "classtag/" + default_repo_name
+
         vl_model, vl_processor = get_stage2_model_and_processor(
             stage_1_checkpoint_path=stage_1_checkpoint_path,
             use_lora=args.use_lora,
@@ -664,7 +678,7 @@ def train(args=None):
 
     # Prepare Hub model ID if push_to_hub is enabled
     hub_model_id = None
-    if getattr(args, "push_to_hub", False):
+    if args.push_to_hub:
         hub_model_id = args.hub_model_id or default_repo_name
         rank_zero_info(f">>> Will push to Hub model id: {hub_model_id}")
 
@@ -702,7 +716,7 @@ def train(args=None):
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
-        save_total_limit=2,  # Keep only the last 2 checkpoints to save disk space
+        save_total_limit=args.save_total_limit,  # Keep only the last 2 checkpoints to save disk space
         report_to="wandb",
         project="siq-vl",
         disable_tqdm=False,  # Enable progress bar display
@@ -720,7 +734,7 @@ def train(args=None):
         label_names=["labels"],  # Explicitly tell Trainer which column is the label
         save_safetensors=False,
         # --- Hugging Face Hub ---
-        push_to_hub=getattr(args, "push_to_hub", False),
+        push_to_hub=args.push_to_hub,
         hub_model_id=hub_model_id,
         hub_strategy="end",  # Only push at the end of training
         # --- accelerator config ---
@@ -750,6 +764,8 @@ def train(args=None):
             src_file = os.path.join(os.getcwd(), file_name)
         else:
             src_file = os.path.join(source_model_dir, file_name)
+
+        rank_zero_info(f">>> Preparing to copy {src_file}... {OUTPUT_DIR}")
 
         dst_file = os.path.join(OUTPUT_DIR, file_name)
 
@@ -782,7 +798,7 @@ def train(args=None):
     callbacks = [
         generation_callback,
         MetricsCallback(),
-        EarlyStoppingCallback(early_stopping_patience=5, early_stopping_threshold=0.01),
+        EarlyStoppingCallback(early_stopping_patience=10, early_stopping_threshold=1e-4),
         SmartGPUCleanCallback(interval=20 if torch.cuda.is_available() else 2),
     ]
 
@@ -811,6 +827,19 @@ def train(args=None):
     rank_zero_info(">>> Start Training...")
     trainer.train()
     rank_zero_info(">>> Done!")
+    trainer.save_model()
+    if args.push_to_hub:
+        trainer.push_to_hub()
+        trainer.create_model_card(
+            language="en",
+            license="apache-2.0",
+            finetuned_from=f"{vision_model_name_or_path} + {text_model_name_or_path}",
+            dataset_tags=["FineVision"],
+            dataset_args=f"Subsets: {args.sub_sets}",
+            model_name=hub_model_id,
+            tasks="image-text-to-text",
+        )
+    rank_zero_info(f">>> Final model saved to {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
