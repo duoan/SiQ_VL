@@ -1,5 +1,7 @@
 # SiQ-VL: A Vision-Language Model for Multimodal Understanding
 
+[![GitHub](https://img.shields.io/badge/GitHub-duoan/SiQ_VL-black?logo=github&style=flat-square)](https://github.com/duoan/SiQ_VL) [![W&B](https://img.shields.io/badge/-W%26B-?logo=wandb&style=flat-square)](https://wandb.ai/ReproduceAI/siq-vl) [![Hugging Face Stage1](https://img.shields.io/badge/HF-stage1-orange?logo=huggingface&style=flat-square)](https://huggingface.co/classtag/siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage1) [![Hugging Face Stage2](https://img.shields.io/badge/HF-stage2-orange?logo=huggingface&style=flat-square)](https://huggingface.co/classtag/siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage2) [![Tech Report](https://img.shields.io/badge/Tech%20Report-PDF-red?logo=readthedocs&style=flat-square)](SiQ_VL_Tech_Report.pdf)
+
 ## Abstract
 
 SiQ-VL is a vision-language model (VLM) that integrates a SigLIP-based vision encoder with a Qwen2.5 language model through a learnable projection module. The architecture employs a multi-stage training paradigm designed to progressively develop capabilities in multimodal understanding and text generation tasks.
