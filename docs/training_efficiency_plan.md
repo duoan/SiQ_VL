@@ -802,6 +802,33 @@ Our 23% MFU is within the expected range for this workload class.
   - Datasets with high length variance where packing actually reduces total positions
 - **Kept in codebase**: Yes — `siq_vl/packing.py` retained for future long-context training.
 
+### Failed: Custom Triton Flash Attention Kernel (Iteration 9 investigation)
+
+- **Hypothesis**: Since flash-attn package can't be installed (OOM during build) and SDPA
+  can't use flash kernel with a 4D mask, a custom Triton kernel implementing FlashAttention-2
+  with varlen support could enable efficient packing.
+- **What we built**: `siq_vl/kernels/flash_attention.py` — full FlashAttention-2 in Triton:
+  - Forward kernel with online softmax, causal masking, non-power-of-2 head_dim support
+  - Backward kernel with attention recomputation
+  - `flash_attention_varlen()` for packed sequences via cu_seqlens
+- **Correctness**: PASSED (max abs diff 0.016, within bf16 tolerance vs SDPA reference)
+- **Performance**: Our kernel is **3–4x SLOWER** than SDPA on Blackwell:
+  | Config | Our Triton | SDPA | Ratio |
+  |---|---|---|---|
+  | B=16, N=356, D=96 | 0.235ms | 0.058ms | 0.25x |
+  | B=16, N=1024, D=96 | 0.976ms | 0.234ms | 0.24x |
+  | varlen (3 seqs, 1024) | 0.353ms | — | — |
+  | SDPA + 4D mask | — | 0.128ms | — |
+- **Root cause**: SDPA on Blackwell (sm_120) dispatches to `fmha_cutlassF_bf16_aligned`
+  which uses hardware-specific features (wgmma tensor core instructions, TMA async copy,
+  warp-specialized pipeline) that Triton 3.5 cannot generate. Writing a competitive attention
+  kernel for Blackwell requires CUDA C++ with CUTLASS-level optimizations.
+- **Key insight**: Even if the kernel were as fast as SDPA, attention is only **~5% of total
+  step time**. The bottleneck is MLP matmuls (QKV proj, FFN up/down). A 2x faster attention
+  kernel would yield <3% end-to-end improvement.
+- **Kept in codebase**: Yes — valuable for future long-context training (where attention
+  fraction grows quadratically) and non-standard mask patterns.
+
 ### Failed: cudagraphs / reduce-overhead mode (Iteration 8 investigation)
 
 - **Hypothesis**: CUDA graphs capture the entire kernel sequence and replay it without
