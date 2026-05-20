@@ -231,11 +231,12 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         # Process vision inputs only on the first forward pass (when past_key_values is None)
         # During generation with KV cache, we only process new tokens, not images
         if past_key_values is None and pixel_values is not None:
-            # 1. Vision Forward
+            # 1. Vision Forward (wrapped in no_grad since vision encoder is always frozen)
             # pixel_values shape: (Total_Tiles, C, H, W)
             rank_zero_debug("pixel_values shape:", pixel_values.shape)
-            vision_outputs = self.vision_model(pixel_values)
-            vision_features = vision_outputs.last_hidden_state
+            with torch.no_grad():
+                vision_outputs = self.vision_model(pixel_values)
+                vision_features = vision_outputs.last_hidden_state
             rank_zero_debug("vision_features shape:", vision_features.shape)
             rank_zero_debug("num_image_tokens:", num_image_tokens)
             # 2. Projector
@@ -323,8 +324,13 @@ def get_stage1_model_and_processor(
     rank_zero_info(f"Config: \n{config}")
 
     model = SiQ_VLForCausalLM(config)
-    model.text_model = SiQ_VLTextModel.from_pretrained(pretrained_text_model_path)
-    model.vision_model = SiQ_VLVisionModel.from_pretrained(pretrained_vision_model_path)
+    model.text_model = SiQ_VLTextModel.from_pretrained(
+        pretrained_text_model_path, torch_dtype=torch.bfloat16
+    )
+    model.vision_model = SiQ_VLVisionModel.from_pretrained(
+        pretrained_vision_model_path, torch_dtype=torch.bfloat16
+    )
+    model.projector = model.projector.to(torch.bfloat16)
 
     model.freez_vision_model()
     model.freez_text_model()
@@ -360,7 +366,7 @@ def get_stage2_model_and_processor(
         lora_dropout: Dropout probability for the LoRA update matrices.
         lora_target_modules: Target modules for the LoRA update matrices.
     """
-    model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path)
+    model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path, torch_dtype=torch.bfloat16)
     processor = SiQ_VLProcessor.from_pretrained(stage_1_checkpoint_path)
     rank_zero_info(f"DEBUG - Model pixel_shuffle_factor: {model.projector.config.vision_pixel_shuffle_factor}")
     rank_zero_info(f"DEBUG - Processor pixel_shuffle_factor: {processor.pixel_shuffle_factor}")

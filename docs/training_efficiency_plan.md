@@ -224,7 +224,48 @@ Combined targets:
 
 ---
 
-### Iteration 1 — P0.1: Liger Fused LMHead-CE / RMSNorm / SwiGLU (planned)
+### Iteration 1 — P0.0: Fix FP32 dtype + Vision no_grad
+
+- **Date**: 2026-05-19
+- **Branch / Commit**: `master` (this commit)
+- **Hypothesis**: Profiler shows FP32 CUTLASS GEMM kernels consuming 50%+ CUDA time despite
+  bf16 config. Root cause: `from_pretrained()` loads weights in FP32 by default, and HF Trainer's
+  AMP autocast only covers forward — frozen modules may not benefit fully. Additionally,
+  vision_model.forward() builds an autograd graph even when frozen, wasting time and memory.
+- **Change**:
+  - `siq_vl/model/modeling.py::get_stage1_model_and_processor`: load text_model and vision_model
+    with `torch_dtype=torch.bfloat16`, cast projector to bf16
+  - `siq_vl/model/modeling.py::get_stage2_model_and_processor`: load with `torch_dtype=torch.bfloat16`
+  - `siq_vl/model/modeling.py::SiQ_VLForCausalLM.forward`: wrap vision_model forward in
+    `torch.no_grad()` since it is always frozen
+- **How to Reproduce**:
+  ```bash
+  TRACE_NAME=iter_1_bf16_fix bash scripts/profile_baseline.sh
+  ```
+- **Result**:
+  | Metric | Before (Iter 0) | After (Iter 1) | Delta |
+  |---|---|---|---|
+  | avg step time (ms) | 310.7 | 101.1 | **-67% (3.07x faster)** |
+  | p50 step time (ms) | 313.4 | 102.2 | -67% |
+  | tokens / sec | 4,674 | 14,366 | **+207%** |
+  | peak VRAM (GB) | 19.27 | 11.54 | **-40%** |
+  | allocated VRAM (GB) | 8.70 | 4.38 | -50% |
+- **Artifacts**:
+  - Chrome trace: `docs/traces/iter_1_bf16_fix.json`
+  - Summary JSON: `docs/traces/iter_1_bf16_fix_summary.json`
+- **Decision**: Keep
+- **Lessons / Surprises**:
+  - This single fix gave us **3x speedup** — more than any fused kernel could. The lesson: always
+    check actual kernel dispatches, not just your config flags. `bf16=True` in TrainingArguments
+    only controls autocast wrapping, it does NOT control the dtype of loaded model weights.
+  - Memory dropped 40% because bf16 weights are half the size of FP32, and the intermediates
+    (activations, gradients) are also bf16 throughout.
+  - The `torch.no_grad()` on vision forward means no autograd graph is retained for those tensors,
+    further reducing memory and eliminating useless backward graph construction.
+
+---
+
+### Iteration 2 — P0.1: Liger Fused LMHead-CE / RMSNorm / SwiGLU (planned)
 
 - **Date**: TBD
 - **Hypothesis**: Qwen2.5-1.5B has vocab=151,936. The `hidden @ lm_head.T` operation produces
