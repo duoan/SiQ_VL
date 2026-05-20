@@ -600,10 +600,89 @@ Combined targets:
 
 ---
 
-### Iteration 9 — P4: Modal Distributed Training (planned)
+### Iteration 10 — Sample Packing with FlexAttention (Mixed Dataset)
+
+- **Date**: 2025-05-20
+- **Branch / Commit**: `master` (this commit)
+- **Hypothesis**: The previous packing failure (Iter 6) was due to two issues:
+  1. SDPA falling back to slow math kernel with explicit 4D attention masks
+  2. Testing on a single uniform-length dataset subset (sharegpt4v/coco, only 17.4% waste)
+
+  With mixed-dataset training (6 subsets of diverse lengths: 216–1116 tokens, 10.2% waste even
+  with bucketing), packing should be effective — IF we use an attention backend that supports
+  document masking natively without fallback. HuggingFace transformers 4.57+ detects packed
+  sequences from `position_ids` resets and generates efficient block-sparse masks via FlexAttention.
+
+- **Key Discovery**: transformers 4.57.3 has **native packing support**:
+  - When `attention_mask=None` and `position_ids` contains resets (non-monotonic), the framework
+    calls `find_packed_sequence_indices()` to detect document boundaries
+  - With `attn_implementation='flex_attention'`, it creates a compiled `BlockMask` that enforces
+    document-level causal isolation without a dense 4D mask
+  - No SDPA fallback, no quadratic mask materialization
+
+- **Changes**:
+  - `siq_vl/collator.py::PackingCollator`: new packing collator that:
+    - Tokenizes each sample individually (no padding)
+    - Bin-packs samples using first-fit-decreasing into target-length bins
+    - Returns `input_ids`, `labels`, `position_ids` (with resets), `pixel_values`, `num_image_tokens`
+    - Does NOT return `attention_mask` (triggers packed sequence detection)
+  - `siq_vl/model/modeling.py::get_stage1_model_and_processor`:
+    - New `use_packing=True` flag → sets `attn_implementation='flex_attention'` on text model
+
+- **Mixed Dataset Baseline** (bucketed, SDPA, compile max-autotune, bs=12):
+  | Metric | Value |
+  |---|---|
+  | Tok/s (real non-pad) | 25,561 |
+  | Padding waste | 10.2% |
+  | Seq lengths | 216–1116 (mean 456) |
+  | VRAM | 41.4 GB |
+  | Step time | 192.4 ms |
+
+- **Packing Results** (FlexAttention, compile, pack_max=1536, fetch_bs=20):
+  | Config | Tok/s | Step (ms) | VRAM | Waste |
+  |---|---|---|---|---|
+  | compile(dynamic=True) | **26,787** | 297 | 34.0 GB | ~2% real padding |
+  | compile(max-autotune) | 26,560 | 284 | 30.2 GB | ~2% |
+  | compile(default) | 26,530 | 305 | 38.5 GB | ~2% |
+  | pack=2048, fetch=30 | 26,140 | 463 | 49.7 GB | ~3% |
+
+- **Final Result** (best config: pack=1536, compile dynamic, fetch_bs=20):
+  | Metric | Baseline (bucketed) | Packing | Delta |
+  |---|---|---|---|
+  | tokens / sec | 25,561 | **26,787** | **+4.8%** |
+  | padding waste | 10.2% | ~2% | -80% waste |
+  | peak VRAM | 41.4 GB | 34.0 GB | **-18%** |
+  | samples / sec | ~62 | 67.4 | +9% |
+
+- **Decision**: Adopt packing as default for mixed-dataset training. Use
+  `compile(dynamic=True)` for stability with variable bin counts.
+
+- **Lessons**:
+  1. **The key insight**: The Iter 6 packing failure was NOT inherent to packing — it was caused
+     by using an attention backend (SDPA) that can't handle document masks efficiently. HuggingFace
+     now has native packing detection + FlexAttention integration that makes packing "just work".
+  2. **compile(dynamic=True) vs max-autotune**: With packing, bin counts vary per batch (5–7),
+     causing shape changes. `dynamic=True` handles this gracefully while `max-autotune` can trigger
+     CUDA errors when shapes change significantly (intermittent, not always reproducible).
+  3. **The throughput gain is modest (+4.8%)** because the baseline's padding waste was only 10.2%
+     (bucketing already captured most of the variance). The bigger win is **VRAM savings (18%)**
+     which enables longer sequences or larger effective batches.
+  4. **Long sequence support**: With pack_max_length=2048 or 3072, sequences up to that length are
+     handled naturally. Short sequences get packed together, long sequences get their own bin.
+     No OOM even for 2K+ token sequences (tested up to pack=2048 at 49.7GB).
+  5. **FlexAttention requires compile**: Without torch.compile, FlexAttention uses an eager
+     fallback that is significantly more memory-hungry (OOM at 48-sample batches that compile
+     handles fine at ~12 bins).
+  6. **Per-position efficiency is HIGHER with packing**: 0.033ms/position vs 0.039ms/position
+     in baseline — longer sequences amortize kernel launch overhead and improve Tensor Core
+     utilization (larger M dimension in GEMMs).
+
+---
+
+### Iteration 11 — P4: Modal Distributed Training (planned)
 
 - **Date**: TBD
-- **Hypothesis**: Once single-GPU efficiency is maximized (P0–P3), the next multiplier is
+- **Hypothesis**: With single-GPU efficiency at ~27K tok/s (6x over baseline), the next multiplier is
   horizontal scaling. Modal provides on-demand GPU clusters with fast provisioning and
   persistent volumes, making it ideal for elastic distributed training without managing infra.
 - **Architecture**:
@@ -662,7 +741,11 @@ Combined targets:
 | 5 | Length bucketing (group_by_length) | 21,026 | 270.6 | 15.79 GB | 4.50x |
 | 6 | Sample packing (4D mask) | — | — | — | (negative: -54%) |
 | 7 | torch.compile (replaces Liger) | 27,352 | 203.9 | 20.73 GB | 5.85x |
-| **8** | **Batch size 16→20 + compile** | **28,322** | **252.9** | **29.09 GB** | **6.06x** |
+| 8 | Batch size 16→20 + compile | 28,322 | 252.9 | 29.09 GB | 6.06x |
+| **10** | **Packing + FlexAttention (mixed data)** | **26,787** | **297** | **34.0 GB** | **5.73x** ¹ |
+
+¹ Iter 10 measured on mixed-data (6 subsets, high length variance) whereas Iters 0–8 used
+single-subset (sharegpt4v/coco). Apples-to-apples on mixed data: baseline=25,561 → packing=26,787 (+4.8%).
 
 ### MFU (Model FLOPs Utilization) Analysis
 
@@ -800,7 +883,10 @@ Our 23% MFU is within the expected range for this workload class.
   - Using `flash_attn_varlen_func` (which natively handles variable-length sequences with
     `cu_seqlens` without a dense mask) or FlexAttention compiled block masks
   - Datasets with high length variance where packing actually reduces total positions
-- **Kept in codebase**: Yes — `siq_vl/packing.py` retained for future long-context training.
+- **Kept in codebase**: Yes — `siq_vl/packing.py` retained for reference.
+- **Resolution**: Iteration 10 successfully re-implements packing using HuggingFace's native
+  FlexAttention integration (position_ids resets + no attention_mask), achieving +4.8% throughput
+  and -18% VRAM on mixed-dataset training. See `siq_vl/collator.py::PackingCollator`.
 
 ### Failed: Custom Triton Flash Attention Kernel (Iteration 9 investigation)
 
@@ -913,9 +999,10 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 | §3 + §4 (Iter 0) | "Establishing the Baseline" |
 | §4 (Iter 1–3) | "Cheap Wins: fused kernels & unnecessary checkpointing" |
 | §4 (Iter 4–5) | "Squeezing the data side: offline preprocessing & feature cache" |
-| §4 (Iter 6–7) | "The engineering climax: Bucketing → Packing → FlexAttention" |
-| §4 (Iter 8) + §5 | "Last mile: torch.compile, and measurement methodology" |
-| §4 (Iter 9) | "Going horizontal: distributed training on Modal" |
+| §4 (Iter 6–7) | "The engineering climax: Bucketing → torch.compile" |
+| §4 (Iter 8) + §5 | "Last mile: batch tuning and measurement methodology" |
+| §4 (Iter 10) | "Packing done right: FlexAttention + mixed datasets" |
+| §4 (Iter 11) | "Going horizontal: distributed training on Modal" |
 | §6 | "Pitfalls I hit (from the Risk Register)" |
 
 ---
@@ -928,7 +1015,7 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - [ ] **Q1 (Scope)**: Which phase does the first PR target? (P0 only / P0+P1 / P0+P1+P2)
 - [ ] **Q2 (Vision freeze strategy)**: Will Stage 2 ever unfreeze vision? This determines whether SigLIP cache is worthwhile.
 - [ ] **Q3 (Cache format)**: Sharded .pt / safetensors / WebDataset — pick one.
-- [ ] **Q4 (Packing backend)**: FlexAttention / flash-attn varlen — pick one.
+- [x] **Q4 (Packing backend)**: FlexAttention / flash-attn varlen — **FlexAttention chosen** (Iter 10: native HF integration via position_ids resets, no external deps, works with torch.compile).
 - [ ] **Q5 (Liger style)**: Accept monkey-patching transformers internals, or wrap only inside SiQ_VLForCausalLM?
 - [ ] **Q6 (Data scale)**: Final training scale < 500K / 1M–5M / 10M+? This affects how aggressive the cache design should be.
 - [ ] **Q7 (Modal GPU type)**: Which Modal GPU class to target? (A100-80GB / H100 / A10G) — affects FSDP config and cost model.
@@ -941,7 +1028,8 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - `siq_vl/model/modeling.py::SiQ_VLForCausalLM.forward` — vision replacement + LLM forward core
 - `siq_vl/model/modeling.py::SiQ_VLProjector` — pixel shuffle + linear projection
 - `siq_vl/model/processing.py::SiQ_VLProcessor.__call__` — image + text + label processing
-- `siq_vl/collator.py::SiQ_VLDataCollator` — per-batch entry point
+- `siq_vl/collator.py::SiQ_VLDataCollator` — per-batch entry point (standard padding)
+- `siq_vl/collator.py::PackingCollator` — packing with FlexAttention (Iter 10)
 - `siq_vl/dataset.py::VQADataset` — one random turn per sample
 - `scripts/train.py::train` — Trainer assembly + Stage switching
 - `scripts/train_launch.sh` — host detection + accelerate launch

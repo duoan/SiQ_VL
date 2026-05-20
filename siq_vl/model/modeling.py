@@ -337,18 +337,22 @@ def get_stage1_model_and_processor(
     pretrained_text_model_path: str = "Qwen/Qwen2.5-0.5B-Instruct",
     vision_pixel_shuffle_factor: int = 2,
     enable_dynamic_tiling: bool = False,
+    use_packing: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
     Args:
         pretrained_vision_model_path: Path to the pretrained vision model.
         pretrained_text_model_path: Path to the pretrained text model.
+        use_packing: If True, uses flex_attention for efficient packed sequence training.
 
     Returns:
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
     """
     rank_zero_info("Initializing SiQ-VL model for stage 1...")
     _apply_liger_kernel()
+
+    text_attn_impl = "flex_attention" if use_packing else "sdpa"
 
     config = get_siq_vl_config(
         text_model_name_or_path=pretrained_text_model_path,
@@ -359,7 +363,7 @@ def get_stage1_model_and_processor(
 
     model = SiQ_VLForCausalLM(config)
     model.text_model = SiQ_VLTextModel.from_pretrained(
-        pretrained_text_model_path, torch_dtype=torch.bfloat16
+        pretrained_text_model_path, torch_dtype=torch.bfloat16, attn_implementation=text_attn_impl
     )
     model.vision_model = SiQ_VLVisionModel.from_pretrained(
         pretrained_vision_model_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
