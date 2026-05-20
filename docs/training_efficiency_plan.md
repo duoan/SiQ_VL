@@ -438,17 +438,47 @@ Combined targets:
 
 ---
 
-### Iteration 6 — P1.3: Length Bucketing (planned)
+### Iteration 5 — P1.3: Length Bucketing
 
-- **Date**: TBD
-- **Hypothesis**: Intra-batch padding wastes 30–50%. HF Trainer's built-in
+- **Date**: 2025-05-19
+- **Branch / Commit**: `master` (this commit)
+- **Hypothesis**: Intra-batch padding wastes ~17.4% of tokens. HF Trainer's built-in
   `group_by_length=True` groups samples by length during sampling, significantly reducing
   length variance within each batch.
 - **Change**:
-  - Modify `VQADataset` to add a `length` field (estimated via tokenizer = `len(question) + len(answer) + tokens_per_tile × num_tiles + template overhead`)
-  - Add `group_by_length=True`, `length_column_name="length"` to `TrainingArguments`
-- **Expected Result**: step time ↓ 15–25%
-- **Decision**: —
+  - `siq_vl/dataset.py::VQADataset`: add `lengths` property with fast heuristic length
+    estimation (~3.5 chars/token + template overhead + vision tokens)
+  - `scripts/profile_baseline.py`: add `--group_by_length` flag, add `ProfileTrainer` subclass
+    with custom `_get_train_sampler` to pass pre-computed lengths
+  - `scripts/train.py`: add `group_by_length=True` to TrainingArguments, add `SiQVLTrainer`
+    subclass for length-aware sampling
+- **How to Reproduce**:
+  ```bash
+  python scripts/profile_baseline.py --trace_name iter_5_length_bucketing \
+    --per_device_train_batch_size 16 --gradient_accumulation_steps 1 \
+    --no_gradient_checkpointing --group_by_length
+  ```
+- **Result**:
+  | Metric | Iter 3 (random shuffle) | Iter 5 (length bucketing) | Delta |
+  |---|---|---|---|
+  | tokens / sec | 20,284 | **21,026** | **+3.7%** |
+  | avg step time (ms) | 282.9 | 270.6 | -4.3% |
+  | p50 step time (ms) | 281.0 | 270.6 | -3.7% |
+  | peak VRAM (GB) | 16.49 | 15.79 | -4.2% |
+  | padding waste | 17.4% | **4.1%** | **-13.3pp** |
+- **Artifacts**:
+  - Chrome trace: `docs/traces/iter_5_length_bucketing.json`
+  - Summary JSON: `docs/traces/iter_5_length_bucketing_summary.json`
+- **Decision**: Keep. Free optimization with no code complexity or memory cost.
+- **Lessons**:
+  - Padding waste reduced from 17.4% → 4.1%, but tok/s only improved 3.7%. This is because
+    the dataset already has low length variance (CoV=11.5%, range 260–502 tokens).
+  - For datasets with higher length variance (e.g., mixing short captions with long reasoning),
+    bucketing would show much larger gains.
+  - Bucketing also slightly reduces peak VRAM (-4.2%) because the max sequence length within
+    a batch is shorter on average.
+  - The remaining 4.1% padding waste is the floor for this approach — to eliminate it entirely,
+    sample packing is needed (Iteration 7).
 
 ---
 

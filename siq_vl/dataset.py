@@ -46,12 +46,42 @@ class VQADataset(Dataset):
     training epochs.
     """
 
-    def __init__(self, hf_dataset, is_fixed: bool = False):
+    def __init__(self, hf_dataset, is_fixed: bool = False, tokens_per_tile: int = 64):
         """
         hf_dataset: HuggingFace dataset object
+        tokens_per_tile: vision tokens per image tile (for length estimation)
         """
         self.dataset = hf_dataset
         self.is_fixed = is_fixed
+        self._tokens_per_tile = tokens_per_tile
+        self._lengths = None
+
+    @property
+    def lengths(self) -> list[int]:
+        """Approximate token lengths for LengthGroupedSampler (HF Trainer group_by_length)."""
+        if self._lengths is None:
+            self._lengths = self._estimate_lengths()
+        return self._lengths
+
+    def _estimate_lengths(self) -> list[int]:
+        """Fast approximate length estimation using char count heuristic (~3.5 chars/token for English)."""
+        lengths = []
+        chars_per_token = 3.5
+        template_overhead = 80  # system prompt + chat template tokens
+        for i in range(len(self.dataset)):
+            item = self.dataset[i]
+            texts = item.get("texts", [])
+            if not texts:
+                lengths.append(0)
+                continue
+            turn = texts[0]
+            q = turn.get("user", "")
+            a = turn.get("assistant", "")
+            text_tokens = int((len(q) + len(a)) / chars_per_token) + template_overhead
+            # Estimate vision tokens: assume ~4 tiles average for dynamic tiling
+            vision_tokens = 4 * self._tokens_per_tile
+            lengths.append(text_tokens + vision_tokens)
+        return lengths
 
     def __len__(self):
         return len(self.dataset)

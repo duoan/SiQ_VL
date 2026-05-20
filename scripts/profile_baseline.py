@@ -67,6 +67,8 @@ def parse_args():
                         help="Use CUDA stream prefetcher for async H2D data transfer")
     parser.add_argument("--prefetch_factor", type=int, default=4,
                         help="Number of batches to prefetch per worker")
+    parser.add_argument("--group_by_length", action="store_true",
+                        help="Group similar-length sequences to reduce padding waste")
 
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--profile_steps", type=int, default=20)
@@ -188,11 +190,23 @@ def main():
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=args.prefetch_factor if args.dataloader_num_workers > 0 else None,
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
+        group_by_length=args.group_by_length,
         include_tokens_per_second=True,
         include_num_input_tokens_seen=True,
     )
 
-    trainer = Trainer(
+    class ProfileTrainer(Trainer):
+        def _get_train_sampler(self, train_dataset=None):
+            ds = train_dataset if train_dataset is not None else self.train_dataset
+            if self.args.group_by_length and hasattr(ds, "lengths"):
+                from transformers.trainer_pt_utils import LengthGroupedSampler
+                return LengthGroupedSampler(
+                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                    lengths=ds.lengths,
+                )
+            return super()._get_train_sampler(train_dataset)
+
+    trainer = ProfileTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

@@ -714,6 +714,7 @@ def train(args=None):
         dataloader_pin_memory=True,
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
         dataloader_prefetch_factor=4 if args.dataloader_num_workers > 0 else None,
+        group_by_length=True,
         # --- Evaluation ---
         eval_strategy="steps",
         eval_steps=args.eval_steps,
@@ -892,7 +893,18 @@ def train(args=None):
 
         callbacks.append(ProfilerCallback(profiler, args.profile_warmup_steps + args.profile_steps))
 
-    trainer = Trainer(
+    class SiQVLTrainer(Trainer):
+        def _get_train_sampler(self, train_dataset=None):
+            ds = train_dataset if train_dataset is not None else self.train_dataset
+            if self.args.group_by_length and hasattr(ds, "lengths"):
+                from transformers.trainer_pt_utils import LengthGroupedSampler
+                return LengthGroupedSampler(
+                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                    lengths=ds.lengths,
+                )
+            return super()._get_train_sampler(train_dataset)
+
+    trainer = SiQVLTrainer(
         model=vl_model,
         args=training_args,
         train_dataset=train_dataset,
