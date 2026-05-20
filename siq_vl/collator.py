@@ -43,3 +43,38 @@ class SiQ_VLDataCollator:
             result["images"] = images
 
         return result
+
+
+@dataclass
+class CachedVisionDataCollator:
+    """
+    Data collator for pre-cached vision features.
+    Uses processor.process_cached() to skip image processing entirely.
+    """
+
+    processor: Any
+    max_length: int | None = None
+
+    def __call__(self, features: list[dict[str, Any] | None]) -> dict[str, Any]:
+        features = [f for f in features if f is not None]
+
+        if len(features) == 0:
+            raise ValueError("Collator received empty features list!")
+
+        questions = [f["question"] for f in features]
+        answers = [f["answer"] for f in features]
+        vision_features = [f["vision_features"] for f in features]
+        num_tiles = [f["num_tiles"] for f in features]
+
+        processed = self.processor.process_cached(
+            questions=questions,
+            answers=answers,
+            num_tiles_per_image=num_tiles,
+            vision_features=vision_features,
+            return_tensors="pt",
+            truncation=self.max_length is not None,
+            max_length=self.max_length,
+            padding="longest",
+        )
+
+        return dict(processed)

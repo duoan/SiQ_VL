@@ -185,7 +185,6 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         self.vocab_size = config.text_config.vocab_size
         self.vision_model = SiQ_VLVisionModel(config.vision_config)
         self.projector = SiQ_VLProjector(config.projector_config)
-
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -225,6 +224,7 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         self,
         input_ids: torch.LongTensor | None = None,
         pixel_values: torch.FloatTensor | None = None,
+        vision_features: torch.FloatTensor | None = None,
         num_image_tokens: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -241,6 +241,8 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         Arguments:
             input_ids: The input text token ids (batch_size, sequence_length).
             pixel_values: The input vision features (batch_size, channels, height, width).
+            vision_features: Pre-computed vision hidden states (total_tiles, seq_len, hidden_dim).
+                If provided, skips the vision encoder entirely (used with cached features).
             num_image_tokens: The number of image tokens for each image in the batch (batch_size).
             attention_mask: The attention mask for the language model (batch_size, sequence_length).
             position_ids: The position ids for the language model (batch_size, sequence_length).
@@ -254,18 +256,24 @@ class SiQ_VLForCausalLM(SiQ_VLPreTrainedModel, GenerationMixin):
         """
         # Process vision inputs only on the first forward pass (when past_key_values is None)
         # During generation with KV cache, we only process new tokens, not images
-        if past_key_values is None and pixel_values is not None:
-            # 1. Vision Forward (wrapped in no_grad since vision encoder is always frozen)
-            # pixel_values shape: (Total_Tiles, C, H, W)
-            rank_zero_debug("pixel_values shape:", pixel_values.shape)
-            with torch.no_grad():
-                vision_outputs = self.vision_model(pixel_values)
-                vision_features = vision_outputs.last_hidden_state
-            rank_zero_debug("vision_features shape:", vision_features.shape)
+        has_vision = past_key_values is None and (pixel_values is not None or vision_features is not None)
+        if has_vision:
+            # Get vision hidden states: either from cache or by running the encoder
+            if vision_features is not None:
+                # Pre-computed features provided (offline cache path)
+                vision_hidden_states = vision_features
+            else:
+                # Run vision encoder (online path)
+                rank_zero_debug("pixel_values shape:", pixel_values.shape)
+                with torch.no_grad():
+                    vision_outputs = self.vision_model(pixel_values)
+                    vision_hidden_states = vision_outputs.last_hidden_state
+
+            rank_zero_debug("vision_hidden_states shape:", vision_hidden_states.shape)
             rank_zero_debug("num_image_tokens:", num_image_tokens)
             # 2. Projector
             # vision_token_embeddings shape: (Total_Tiles, Tokens_Per_Tile, Text_Dim)
-            vision_token_embeddings = self.projector(vision_features)
+            vision_token_embeddings = self.projector(vision_hidden_states)
             rank_zero_debug("vision_token_embeddings shape:", vision_token_embeddings.shape)
 
             # 3. Flatten All Vision Tokens
@@ -354,7 +362,7 @@ def get_stage1_model_and_processor(
         pretrained_text_model_path, torch_dtype=torch.bfloat16
     )
     model.vision_model = SiQ_VLVisionModel.from_pretrained(
-        pretrained_vision_model_path, torch_dtype=torch.bfloat16
+        pretrained_vision_model_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     model.projector = model.projector.to(torch.bfloat16)
 

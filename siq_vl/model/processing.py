@@ -480,6 +480,99 @@ class SiQ_VLProcessor(ProcessorMixin):
 
         return BatchEncoding(data=data, tensor_type=return_tensors)
 
+    def process_cached(
+        self,
+        questions: list[str],
+        answers: list[str | None],
+        num_tiles_per_image: list[int],
+        vision_features: list[torch.Tensor],
+        return_tensors: str | None = "pt",
+        padding: bool | str = "longest",
+        truncation: bool = True,
+        max_length: int | None = None,
+    ) -> BatchEncoding:
+        """
+        Tokenize and build model inputs using pre-cached vision features.
+        Skips the image processing pipeline entirely.
+        """
+        num_tiles_tensor = torch.tensor(num_tiles_per_image, dtype=torch.long)
+        num_image_tokens = num_tiles_tensor * self.tokens_per_tile
+
+        # Build text with image placeholders (same logic as __call__)
+        msg_batch = []
+        for i, (q, a) in enumerate(zip(questions, answers, strict=False)):
+            q = q if q is not None else "Describe this image."
+            image_placeholder = (
+                self.vision_start_token + self.image_pad_token * num_image_tokens[i] + self.vision_end_token
+            )
+            user_content = q
+            if "<image>" in user_content:
+                user_content = user_content.replace("<image>", image_placeholder)
+            else:
+                if num_image_tokens[i] > 0:
+                    user_content = image_placeholder + "\n" + user_content
+
+            msgs = [
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ]
+            if a is not None:
+                msgs.append({"role": "assistant", "content": [{"type": "text", "text": a}]})
+            msg_batch.append(msgs)
+
+        normalized_msg_batch = []
+        for msgs in msg_batch:
+            normalized_msgs = [{**msg, "content": self._normalize_message_content(msg["content"])} for msg in msgs]
+            normalized_msg_batch.append(normalized_msgs)
+
+        formatted_texts = [
+            self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=(ans is None))
+            for msgs, ans in zip(normalized_msg_batch, answers, strict=False)
+        ]
+
+        text_outputs = self.tokenizer(
+            formatted_texts,
+            return_tensors=return_tensors,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+        )
+
+        # Concatenate vision features: list of (n_tiles, seq_len, dim) -> (total_tiles, seq_len, dim)
+        all_vision_features = torch.cat(vision_features, dim=0)
+
+        data = dict(text_outputs)
+        data["vision_features"] = all_vision_features
+        data["num_image_tokens"] = num_image_tokens
+
+        # Label masking (same as __call__)
+        if any(a is not None for a in answers):
+            input_ids = data["input_ids"]
+            labels = torch.full_like(input_ids, fill_value=-100)
+
+            for i in range(input_ids.size(0)):
+                if answers[i] is None:
+                    continue
+                seq = input_ids[i]
+                ids = seq.tolist()
+                try:
+                    for j, x in enumerate(ids):
+                        if x == self._im_start_token_id and j + 1 < len(ids) and ids[j + 1] == self._assistant_token_id:
+                            start = j + 3
+                            try:
+                                end = ids.index(self._im_end_token_id, start)
+                            except ValueError:
+                                end = len(ids)
+                            labels[i, start:end] = seq[start:end]
+                            break
+                except Exception as ex:
+                    rank_zero_warn(f"Warning: Failed to mask labels for sample {i}: {ex}")
+                labels[i, seq == self._image_pad_token_id] = -100
+
+            data["labels"] = labels
+
+        return BatchEncoding(data=data, tensor_type=return_tensors)
+
     def batch_decode(self, sequences, assistant_only: bool = True, *args, **kwargs):
         """Helper to decode token IDs back to string."""
         if assistant_only:

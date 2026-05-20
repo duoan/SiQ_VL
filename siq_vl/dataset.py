@@ -1,5 +1,8 @@
+import json
+import os
 import random
 
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -82,6 +85,70 @@ class VQADataset(Dataset):
 
         return {
             "image": image,
+            "question": q,
+            "answer": a,
+        }
+
+
+class CachedVQADataset(Dataset):
+    """
+    Dataset that uses pre-extracted vision features instead of raw images.
+    Skips the vision encoder forward pass entirely during training.
+
+    Expects a cache directory produced by scripts/extract_vision_features.py
+    containing shard_*.pt files and a metadata.json.
+    """
+
+    def __init__(self, hf_dataset, cache_dir: str, is_fixed: bool = False):
+        self.dataset = hf_dataset
+        self.is_fixed = is_fixed
+        self.cache_dir = cache_dir
+
+        with open(os.path.join(cache_dir, "metadata.json")) as f:
+            self.metadata = json.load(f)
+
+        self._shard_cache = {}
+        self._shard_size = self.metadata["shard_size"]
+        self._num_shards = self.metadata["num_shards"]
+
+    def _load_shard(self, shard_idx: int) -> dict:
+        if shard_idx not in self._shard_cache:
+            path = os.path.join(self.cache_dir, f"shard_{shard_idx:05d}.pt")
+            self._shard_cache[shard_idx] = torch.load(path, weights_only=False, map_location="cpu")
+        return self._shard_cache[shard_idx]
+
+    def _get_cached_features(self, idx: int):
+        shard_idx = idx // self._shard_size
+        shard = self._load_shard(shard_idx)
+        if idx not in shard:
+            return None
+        return shard[idx]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        texts = item.get("texts", [])
+
+        if len(texts) == 0:
+            return None
+
+        cached = self._get_cached_features(idx)
+        if cached is None:
+            return None
+
+        turn_idx = 0 if self.is_fixed else random.randint(0, len(texts) - 1)
+        turn = texts[turn_idx]
+        q = turn.get("user", "")
+        a = turn.get("assistant", "")
+
+        if any(keyword.lower() in a.lower() for keyword in _reject_keywords):
+            return None
+
+        return {
+            "vision_features": cached["vision_features"],  # (num_tiles, seq_len, hidden_dim)
+            "num_tiles": cached["num_tiles"],
             "question": q,
             "answer": a,
         }

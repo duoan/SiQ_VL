@@ -23,8 +23,8 @@ from torch.profiler import ProfilerActivity, profile, record_function, schedule
 from torchmetrics.utilities.prints import rank_zero_info
 from transformers import Trainer, TrainingArguments, set_seed
 
-from siq_vl.collator import SiQ_VLDataCollator
-from siq_vl.dataset import VQADataset
+from siq_vl.collator import CachedVisionDataCollator, SiQ_VLDataCollator
+from siq_vl.dataset import CachedVQADataset, VQADataset
 from siq_vl.model.modeling import get_stage1_model_and_processor, get_stage2_model_and_processor
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -57,6 +57,11 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--dataloader_num_workers", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=None)
+
+    parser.add_argument("--cached_features_dir", type=str, default=None,
+                        help="Directory with pre-extracted vision features (skips vision encoder)")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true",
+                        help="Disable gradient checkpointing (trades memory for speed)")
 
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--profile_steps", type=int, default=20)
@@ -121,6 +126,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+
+    # When using cached features, offload the vision model from GPU to save VRAM
+    if args.cached_features_dir:
+        model.vision_model.to("cpu")
+        torch.cuda.empty_cache()
+        rank_zero_info(">>> Vision model offloaded to CPU (using cached features)")
+
     rank_zero_info(f">>> Model on {device}")
 
     # ================================================================
@@ -144,13 +156,14 @@ def main():
     if args.max_samples:
         raw_dataset = raw_dataset.select(range(min(args.max_samples, len(raw_dataset))))
 
-    train_dataset = VQADataset(raw_dataset)
+    if args.cached_features_dir:
+        train_dataset = CachedVQADataset(raw_dataset, cache_dir=args.cached_features_dir)
+        data_collator = CachedVisionDataCollator(processor=processor, max_length=args.max_length)
+        rank_zero_info(f">>> Using CACHED vision features from: {args.cached_features_dir}")
+    else:
+        train_dataset = VQADataset(raw_dataset)
+        data_collator = SiQ_VLDataCollator(processor=processor, max_length=args.max_length)
     rank_zero_info(f">>> Dataset size: {len(train_dataset)}")
-
-    # ================================================================
-    # 3. Setup Trainer (minimal config, no eval, no saving)
-    # ================================================================
-    data_collator = SiQ_VLDataCollator(processor=processor, max_length=args.max_length)
 
     total_steps = args.warmup_steps + args.profile_steps
     training_args = TrainingArguments(
@@ -160,7 +173,7 @@ def main():
         max_steps=total_steps,
         dataloader_num_workers=args.dataloader_num_workers,
         bf16=True,
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
         logging_steps=1,
         save_strategy="no",
         eval_strategy="no",
@@ -190,6 +203,10 @@ def main():
     optimizer = trainer.create_optimizer()
     lr_scheduler = trainer.create_scheduler(num_training_steps=total_steps, optimizer=optimizer)
 
+    model_input_keys = [
+        "input_ids", "pixel_values", "vision_features", "attention_mask", "labels", "num_image_tokens"
+    ]
+
     step_times_warmup = []
     data_iter = iter(train_dataloader)
 
@@ -201,9 +218,7 @@ def main():
         t0 = time.perf_counter()
 
         with record_function("forward"):
-            outputs = model(**{k: v for k, v in batch.items() if k in [
-                "input_ids", "pixel_values", "attention_mask", "labels", "num_image_tokens"
-            ]})
+            outputs = model(**{k: v for k, v in batch.items() if k in model_input_keys})
             loss = outputs.loss / args.gradient_accumulation_steps
 
         with record_function("backward"):
@@ -265,9 +280,7 @@ def main():
             t0 = time.perf_counter()
 
             with record_function("forward"):
-                outputs = model(**{k: v for k, v in batch.items() if k in [
-                    "input_ids", "pixel_values", "attention_mask", "labels", "num_image_tokens"
-                ]})
+                outputs = model(**{k: v for k, v in batch.items() if k in model_input_keys})
                 loss = outputs.loss / args.gradient_accumulation_steps
 
             with record_function("backward"):
@@ -353,7 +366,7 @@ def main():
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "dataloader_num_workers": args.dataloader_num_workers,
             "bf16": True,
-            "gradient_checkpointing": True,
+            "gradient_checkpointing": not args.no_gradient_checkpointing,
             "max_samples": args.max_samples,
             "seed": args.seed,
         },
