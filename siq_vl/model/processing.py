@@ -434,6 +434,7 @@ class SiQ_VLProcessor(ProcessorMixin):
             padding=padding,
             truncation=truncation,
             max_length=max_length,
+            pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
         )
 
         data = dict(text_outputs)
@@ -536,6 +537,7 @@ class SiQ_VLProcessor(ProcessorMixin):
             padding=padding,
             truncation=truncation,
             max_length=max_length,
+            pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
         )
 
         # Concatenate vision features: list of (n_tiles, seq_len, dim) -> (total_tiles, seq_len, dim)

@@ -6,6 +6,7 @@ from typing import Any
 class SiQ_VLDataCollator:
     processor: Any
     max_length: int | None = None
+    pad_to_multiple_of: int | None = None
     return_raw_data: bool = False
 
     def __call__(self, features: list[dict[str, Any] | None]) -> dict[str, Any]:
@@ -23,14 +24,13 @@ class SiQ_VLDataCollator:
         # Build batch for processor: list of (image, question, answer) tuples
         batch = list(zip(images, questions, answers, strict=False))
 
-        # Call processor to handle tokenization, image processing, and label generation
-        # Processor uses padding="longest" by default, which will pad to the longest sequence in the batch
         processed = self.processor(
             batch=batch,
             return_tensors="pt",
             truncation=self.max_length is not None,
             max_length=self.max_length,
-            padding="longest",  # Pad to longest sequence in batch
+            padding="longest",
+            pad_to_multiple_of=self.pad_to_multiple_of,
         )
 
         # Processor returns BatchEncoding with input_ids, pixel_values, labels, attention_mask

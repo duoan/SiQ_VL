@@ -557,6 +557,49 @@ Combined targets:
 
 ---
 
+### Iteration 8 — Batch Size Tuning Under torch.compile
+
+- **Date**: 2025-05-19
+- **Branch / Commit**: `master` (this commit)
+- **Hypothesis**: With torch.compile reducing peak VRAM (23.7 GB for bs=16), there's headroom
+  to push batch size higher → better GPU utilization → more tok/s.
+- **Investigation**:
+  | Config | Tok/s | Step (ms) | VRAM |
+  |---|---|---|---|
+  | bs=16, compile | 27,108 | 196 | 23.7 GB |
+  | **bs=20, compile** | **28,032** | **250** | **29.8 GB** |
+  | bs=24, compile | 27,440 | 310 | 38.5 GB |
+  | bs=28, compile | 27,781 | 355 | 43.0 GB |
+  | bs=32, compile | OOM | — | — |
+
+  Also tested:
+  - `reduce-overhead` (cudagraphs): **-20%** — dynamic shapes cause frequent graph re-capture
+  - `pad_to_multiple_of=64`: **-6.6%** — extra padding tokens waste compute; doesn't eliminate
+    recompilation (5 discrete lengths still)
+  - `torch.compile(mode="default")`: same as max-autotune-no-cudagraphs (within noise)
+- **Final Result** (bs=20, compile, bucketing, no Liger):
+  | Metric | Iter 7 (bs=16) | Iter 8 (bs=20) | Delta |
+  |---|---|---|---|
+  | tokens / sec | 27,352 | **28,322** | **+3.5%** |
+  | avg step time (ms) | 203.9 | 252.9 | +24% (but 25% more tokens/step) |
+  | peak VRAM (GB) | 20.73 | 29.09 | +40% |
+- **Artifacts**:
+  - Chrome trace: `docs/traces/iter_8_compile_bs20.json`
+  - Summary JSON: `docs/traces/iter_8_compile_bs20_summary.json`
+- **Decision**: Keep bs=20 as the default for Stage 1 training.
+- **Lessons**:
+  - Diminishing returns above bs=20: torch.compile's recompilation overhead dominates as
+    batch size increases with variable-length sequences.
+  - cudagraphs (`reduce-overhead`) is counterproductive for VL models with dynamic shapes
+    (image tiles vary per sample → seq_len varies per batch).
+  - `pad_to_multiple_of` doesn't help: reduces unique lengths from continuous to ~5 discrete
+    values, but 5 is still too many for graph reuse, and the padding wastes compute.
+  - **This workload is at its single-GPU ceiling** for Stage 1 projector training:
+    MFU=23%, limited by small model + short seqs + projector-only training (4N not 6N).
+    Further gains require: Stage 2 full finetune, longer sequences, or horizontal scaling.
+
+---
+
 ### Iteration 9 — P4: Modal Distributed Training (planned)
 
 - **Date**: TBD
@@ -618,7 +661,8 @@ Combined targets:
 | 4 | DataLoader tuning | — | — | — | (no gain) |
 | 5 | Length bucketing (group_by_length) | 21,026 | 270.6 | 15.79 GB | 4.50x |
 | 6 | Sample packing (4D mask) | — | — | — | (negative: -54%) |
-| **7** | **torch.compile (replaces Liger)** | **27,352** | **203.9** | **20.73 GB** | **5.85x** |
+| 7 | torch.compile (replaces Liger) | 27,352 | 203.9 | 20.73 GB | 5.85x |
+| **8** | **Batch size 16→20 + compile** | **28,322** | **252.9** | **29.09 GB** | **6.06x** |
 
 ### MFU (Model FLOPs Utilization) Analysis
 
@@ -757,6 +801,25 @@ Our 23% MFU is within the expected range for this workload class.
     `cu_seqlens` without a dense mask) or FlexAttention compiled block masks
   - Datasets with high length variance where packing actually reduces total positions
 - **Kept in codebase**: Yes — `siq_vl/packing.py` retained for future long-context training.
+
+### Failed: cudagraphs / reduce-overhead mode (Iteration 8 investigation)
+
+- **Hypothesis**: CUDA graphs capture the entire kernel sequence and replay it without
+  per-kernel launch overhead. With bucketing, shapes should be stable enough.
+- **Result**: **-20%** (244ms vs 204ms for max-autotune-no-cudagraphs).
+- **Root cause**: VL models have inherently dynamic shapes per batch — image tile counts vary
+  per sample, causing sequence lengths to differ between batches. cudagraphs requires
+  re-capturing the graph on every shape change, which is more expensive than the kernel
+  launch overhead it saves.
+
+### Failed: pad_to_multiple_of=64 (Iteration 8 investigation)
+
+- **Hypothesis**: Discretizing sequence lengths to multiples of 64 would enable torch.compile
+  to reuse compiled graphs, reducing recompilation overhead.
+- **Result**: **-6.6%** (26,443 vs 28,322 tok/s).
+- **Root cause**: Still produces 5 distinct lengths (320–576), so recompilation still occurs.
+  Meanwhile, the extra padding tokens (up to 63 per sequence) add wasted compute.
+  The combination of "no graph reuse benefit" + "more wasted tokens" makes it net negative.
 
 ### Failed: Gradient Checkpointing Removal (Iteration 3 investigation)
 
