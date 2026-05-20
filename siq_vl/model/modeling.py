@@ -33,6 +33,30 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 logger = logging.get_logger(__name__)
 logger.setLevel(logging.INFO)
 
+_LIGER_APPLIED = False
+
+
+def _apply_liger_kernel():
+    """Apply Liger-Kernel optimizations to Qwen2 (fused linear-CE, RMSNorm, SwiGLU).
+    Must be called before model instantiation. Safe to call multiple times."""
+    global _LIGER_APPLIED
+    if _LIGER_APPLIED:
+        return
+    try:
+        from liger_kernel.transformers import apply_liger_kernel_to_qwen2
+
+        apply_liger_kernel_to_qwen2(
+            rope=True,
+            cross_entropy=False,
+            fused_linear_cross_entropy=True,
+            rms_norm=True,
+            swiglu=True,
+        )
+        rank_zero_info(">>> Liger-Kernel applied: fused_linear_cross_entropy + RMSNorm + SwiGLU + RoPE")
+        _LIGER_APPLIED = True
+    except ImportError:
+        rank_zero_info(">>> Liger-Kernel not installed, skipping optimizations")
+
 
 class SiQ_VLProjector(PreTrainedModel):
     """
@@ -316,6 +340,8 @@ def get_stage1_model_and_processor(
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
     """
     rank_zero_info("Initializing SiQ-VL model for stage 1...")
+    _apply_liger_kernel()
+
     config = get_siq_vl_config(
         text_model_name_or_path=pretrained_text_model_path,
         vision_model_name_or_path=pretrained_vision_model_path,
@@ -366,6 +392,8 @@ def get_stage2_model_and_processor(
         lora_dropout: Dropout probability for the LoRA update matrices.
         lora_target_modules: Target modules for the LoRA update matrices.
     """
+    _apply_liger_kernel()
+
     model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path, torch_dtype=torch.bfloat16)
     processor = SiQ_VLProcessor.from_pretrained(stage_1_checkpoint_path)
     rank_zero_info(f"DEBUG - Model pixel_shuffle_factor: {model.projector.config.vision_pixel_shuffle_factor}")
