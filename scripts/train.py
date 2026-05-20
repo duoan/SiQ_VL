@@ -711,6 +711,9 @@ def train(args=None):
         per_device_train_batch_size=per_device_train_batch_size,  # Adjust based on VRAM (4-8 for 24GB)
         gradient_accumulation_steps=gradient_accumulation_steps,  # Effective batch size = 8 * 4 = 32
         dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=args.dataloader_num_workers > 0,
+        dataloader_prefetch_factor=4 if args.dataloader_num_workers > 0 else None,
         # --- Evaluation ---
         eval_strategy="steps",
         eval_steps=args.eval_steps,

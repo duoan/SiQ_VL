@@ -26,6 +26,7 @@ from transformers import Trainer, TrainingArguments, set_seed
 from siq_vl.collator import CachedVisionDataCollator, SiQ_VLDataCollator
 from siq_vl.dataset import CachedVQADataset, VQADataset
 from siq_vl.model.modeling import get_stage1_model_and_processor, get_stage2_model_and_processor
+from siq_vl.prefetcher import CUDAPrefetcher
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["WANDB_MODE"] = "disabled"
@@ -62,6 +63,10 @@ def parse_args():
                         help="Directory with pre-extracted vision features (skips vision encoder)")
     parser.add_argument("--no_gradient_checkpointing", action="store_true",
                         help="Disable gradient checkpointing (trades memory for speed)")
+    parser.add_argument("--use_prefetcher", action="store_true",
+                        help="Use CUDA stream prefetcher for async H2D data transfer")
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                        help="Number of batches to prefetch per worker")
 
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--profile_steps", type=int, default=20)
@@ -181,6 +186,8 @@ def main():
         remove_unused_columns=False,
         label_names=["labels"],
         dataloader_pin_memory=True,
+        dataloader_prefetch_factor=args.prefetch_factor if args.dataloader_num_workers > 0 else None,
+        dataloader_persistent_workers=args.dataloader_num_workers > 0,
         include_tokens_per_second=True,
         include_num_input_tokens_seen=True,
     )
@@ -207,12 +214,20 @@ def main():
         "input_ids", "pixel_values", "vision_features", "attention_mask", "labels", "num_image_tokens"
     ]
 
+    # Use CUDA stream prefetcher for overlapping H2D with compute
+    if args.use_prefetcher:
+        prefetcher = CUDAPrefetcher(train_dataloader, device=device)
+        data_iter = iter(prefetcher)
+        rank_zero_info(">>> Using CUDAPrefetcher (async H2D on separate stream)")
+    else:
+        data_iter = iter(train_dataloader)
+
     step_times_warmup = []
-    data_iter = iter(train_dataloader)
 
     for step in range(args.warmup_steps):
         batch = next(data_iter)
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        if not args.use_prefetcher:
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -265,10 +280,15 @@ def main():
             try:
                 batch = next(data_iter)
             except StopIteration:
-                data_iter = iter(train_dataloader)
+                if args.use_prefetcher:
+                    prefetcher.reset()
+                    data_iter = iter(prefetcher)
+                else:
+                    data_iter = iter(train_dataloader)
                 batch = next(data_iter)
 
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            if not args.use_prefetcher:
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             # Count tokens in this step
             if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):

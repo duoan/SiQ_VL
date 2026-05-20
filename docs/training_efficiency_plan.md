@@ -539,6 +539,80 @@ Combined targets:
 
 ---
 
+## 4.1. Negative Results / Failed Experiments
+
+> Not every hypothesis pans out. These are recorded here for the blog's "pitfalls" section
+> and to prevent future re-investigation of dead ends.
+
+### Failed: Vision Feature Caching (Iteration 3 investigation)
+
+- **Hypothesis**: Pre-extracting SigLIP features offline and loading them during training
+  would eliminate the 428M-param vision forward pass entirely, saving ~21ms/step.
+- **What we built**:
+  - `scripts/extract_vision_features.py`: extracts features at 165 tiles/s, stores sharded `.pt` files
+  - `siq_vl/dataset.py::CachedVQADataset`: loads pre-cached features instead of PIL images
+  - `siq_vl/collator.py::CachedVisionDataCollator`: routes to `processor.process_cached()`
+  - `siq_vl/model/modeling.py`: `vision_features` kwarg bypasses vision encoder in forward
+- **Result**: Tokens/sec UNCHANGED (11,070 → 11,070). VRAM actually INCREASED (+27%).
+- **Root cause**: On Blackwell with bf16+SDPA/flash, the SigLIP forward is only 21ms (5ms/tile).
+  The cached features are large tensors (tiles × 1024 × 1152 × bf16 = ~9.4MB/sample).
+  DataLoader H2D transfer of these tensors via `pin_memory` is slower than just computing them.
+  Additionally, the cached tensors consume GPU memory that would otherwise be freed after
+  the transient vision forward completes.
+- **When it WOULD help**: Older GPUs (V100/A100 without Blackwell tensor cores), multi-epoch
+  training where the same images are seen 10+ times, or distributed setups where vision
+  compute is duplicated across ranks without model parallelism.
+- **Kept in codebase**: Yes — the infrastructure is retained for future use.
+
+### Failed: torch.compile on Vision Encoder (Iteration 3 investigation)
+
+- **Hypothesis**: `torch.compile(mode="max-autotune-no-cudagraphs")` on the frozen vision
+  encoder would fuse small ops and reduce kernel launch overhead.
+- **Result**: +3% speedup (statistically insignificant), but adds 40s compile time on first step.
+- **Root cause**: The vision encoder's critical path is already optimal:
+  - Attention → dispatches to flash kernel via SDPA (fused)
+  - Linear layers → CUTLASS bf16 GEMM on tensor cores (already optimal)
+  - Normalization → already fused by Liger
+  - compile can only fuse the residual arithmetic (add, dropout), which is <1% of compute.
+- **HF Trainer compatibility issue**: Wrapping the `PreTrainedModel` submodule with `torch.compile`
+  breaks accelerate's `unwrap_model` (expects `_orig_mod` attribute). Workaround: compile only
+  inside the forward path lazily — but the gains don't justify the complexity.
+
+### Failed: CUDA Stream Prefetcher + DataLoader Tuning (Iteration 4 investigation)
+
+- **Hypothesis**: The DataLoader uses the default CUDA stream for H2D transfers, which blocks
+  GPU compute. Using a dedicated CUDA stream for async prefetching, combined with more workers
+  (12), `prefetch_factor=4`, and `persistent_workers=True`, should overlap data loading with compute.
+- **What we built**:
+  - `siq_vl/prefetcher.py::CUDAPrefetcher`: wraps DataLoader, uses separate CUDA stream for
+    non_blocking H2D, prefetches next batch while current batch is being computed.
+  - Added `--use_prefetcher`, `--prefetch_factor` flags to `scripts/profile_baseline.py`
+  - Added `dataloader_persistent_workers` and `dataloader_prefetch_factor` to TrainingArguments
+- **Result**: Tokens/sec UNCHANGED (20,284 → 20,288, within noise).
+- **Root cause**: Measured independently, the DataLoader produces batches in **9.4ms average
+  (p50=0.2ms!)** while GPU compute takes **288ms**. Data is ready 30x before compute finishes.
+  With 12 persistent workers and prefetch_factor=4, the pipeline is always full — there is
+  zero GPU starvation. The `.to(device)` H2D transfer is <1ms for the processed batch
+  (small tensors after PIL→tensor processing happens on CPU workers).
+- **When it WOULD help**:
+  - Very large batches where H2D transfer becomes significant (hundreds of MB per batch)
+  - Training on images without pre-resizing (raw 4K images decoded on-the-fly)
+  - Setups with slow CPU (few cores) or slow storage (network filesystem)
+  - Multi-GPU DDP where data loading is a per-rank bottleneck
+- **Kept in codebase**: Yes — CUDAPrefetcher is good infrastructure for future scale.
+
+### Failed: Gradient Checkpointing Removal (Iteration 3 investigation)
+
+- **Hypothesis**: In Stage 1 the LLM is frozen — gradient checkpointing recomputes a forward
+  it never needs gradients for, wasting compute.
+- **Result**: +3% speedup, negligible VRAM change.
+- **Root cause**: HF Trainer's gradient checkpointing only wraps modules with `requires_grad`
+  parameters. Since the LLM is fully frozen, checkpointing already short-circuits. The 3%
+  gain comes from reduced Python overhead in the checkpoint wrapper code, not from eliminating
+  recomputation. This becomes more impactful in Stage 2 (where LLM IS trainable).
+
+---
+
 ## 5. Measurement Protocol (mandatory for every iteration)
 
 To ensure blog numbers are credible and reproducible, every iteration must:
