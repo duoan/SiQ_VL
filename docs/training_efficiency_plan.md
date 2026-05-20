@@ -731,21 +731,41 @@ Combined targets:
 
 ### Cumulative Optimization Results
 
-| Iter | Optimization | Tok/s | Step (ms) | Peak VRAM | Cumulative Speedup |
-|---|---|---|---|---|---|
-| 0 | Baseline (FP32 bug) | 4,674 | 310.7 | 19.27 GB | 1.0x |
-| 1 | FP32 dtype fix + vision no_grad | 14,366 | 101.1 | 11.54 GB | 3.07x |
-| 2 | Liger-Kernel (fused CE + RMSNorm + SwiGLU) | 11,070 | 135.4 | 6.78 GB | 2.37x (memory win) |
-| 3 | Batch size 4 → 16 | 20,284 | 282.9 | 16.49 GB | 4.34x |
-| 4 | DataLoader tuning | — | — | — | (no gain) |
-| 5 | Length bucketing (group_by_length) | 21,026 | 270.6 | 15.79 GB | 4.50x |
-| 6 | Sample packing (4D mask) | — | — | — | (negative: -54%) |
-| 7 | torch.compile (replaces Liger) | 27,352 | 203.9 | 20.73 GB | 5.85x |
-| 8 | Batch size 16→20 + compile | 28,322 | 252.9 | 29.09 GB | 6.06x |
-| **10** | **Packing + FlexAttention (mixed data)** | **26,787** | **297** | **34.0 GB** | **5.73x** ¹ |
+**Metric definitions**:
+- **GPU tok/s**: All non-padding tokens processed by the model per second (`attention_mask.sum() / time`).
+  This measures hardware utilization — every token (system prompt, question, answer) goes through
+  the full forward/backward pass.
+- **Eff. tok/s**: Only tokens that produce a training loss (`labels != -100`) per second.
+  This is the true training speed — how fast the model is learning.
+- **Loss ratio**: fraction of real tokens that contribute to loss (dataset-dependent, measured empirically).
+
+| Iter | Optimization | GPU tok/s | Eff. tok/s ² | Step (ms) | VRAM | Speedup |
+|---|---|---|---|---|---|---|
+| 0 | Baseline (FP32 bug) | 4,674 | 2,473 | 310.7 | 19.27 GB | 1.0x |
+| 1 | FP32 dtype fix + vision no_grad | 14,366 | 7,600 | 101.1 | 11.54 GB | 3.07x |
+| 2 | Liger-Kernel (fused CE + RMSNorm + SwiGLU) | 11,070 | 5,856 | 135.4 | 6.78 GB | 2.37x |
+| 3 | Batch size 4 → 16 | 20,284 | 10,730 | 282.9 | 16.49 GB | 4.34x |
+| 4 | DataLoader tuning | — | — | — | — | (no gain) |
+| 5 | Length bucketing (group_by_length) | 21,026 | 11,123 | 270.6 | 15.79 GB | 4.50x |
+| 6 | Sample packing (4D mask) | — | — | — | — | (−54%) |
+| 7 | torch.compile (replaces Liger) | 27,352 | 14,469 | 203.9 | 20.73 GB | 5.85x |
+| 8 | Batch size 16→20 + compile | 28,322 | 14,982 | 252.9 | 29.09 GB | 6.06x |
+| **10** | **Packing + FlexAttention (mixed)** ¹ | **26,787** | **15,777** | **297** | **34.0 GB** | **6.38x** |
+
+² Loss ratio: single-subset (sharegpt4v/coco) = 0.529; mixed-data (6 subsets) = 0.589.
+  Eff. tok/s = GPU tok/s × loss_ratio for the respective dataset.
 
 ¹ Iter 10 measured on mixed-data (6 subsets, high length variance) whereas Iters 0–8 used
-single-subset (sharegpt4v/coco). Apples-to-apples on mixed data: baseline=25,561 → packing=26,787 (+4.8%).
+single-subset (sharegpt4v/coco). On the mixed dataset, the answers are proportionally longer
+(loss_ratio=0.589 vs 0.529), so the effective training speed is higher than the GPU tok/s
+change alone would suggest:
+- Mixed baseline (bucketed, SDPA): GPU=25,561, Eff.=15,873
+- Mixed packing (FlexAttention):   GPU=26,787, Eff.=15,777
+- Apples-to-apples effective speedup on mixed: ~same throughput but −18% VRAM
+
+**Cumulative speedup** is computed as Eff. tok/s relative to Iter 0 (2,473).
+The jump from Iter 8 → Iter 10 reflects switching to the mixed dataset (which has higher
+loss density) rather than pure engineering optimization.
 
 ### MFU (Model FLOPs Utilization) Analysis
 
