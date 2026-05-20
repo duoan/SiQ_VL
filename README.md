@@ -10,6 +10,10 @@ SiQ-VL is a vision-language model (VLM) that integrates a SigLIP-based vision en
 
 Training runs and experiments are tracked using Weights & Biases. View training metrics, model checkpoints, and experiment logs at: [https://wandb.ai/ReproduceAI/siq-vl](https://wandb.ai/ReproduceAI/siq-vl)
 
+## Training Efficiency Iteration Log
+
+The full optimization plan and per-iteration log (Hypothesis → Change → Measurement → Result → Decision) lives in [`docs/training_efficiency_plan.md`](docs/training_efficiency_plan.md). It is the source-of-truth for the ongoing "make SiQ-VL train fast" effort and the raw material for the upcoming engineering blog post.
+
 ## Architecture Overview
 
 The SiQ-VL architecture comprises three principal components:

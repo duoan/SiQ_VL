@@ -1,6 +1,7 @@
 import argparse
 import builtins
 from datetime import datetime
+import json
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ from torchmetrics.utilities.prints import rank_zero_info
 from transformers import (
     EarlyStoppingCallback,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
@@ -458,6 +460,26 @@ def parse_args():
         ),
     )
 
+    # Profiling configuration
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="Enable torch.profiler for the first N training steps (saves Chrome trace to docs/traces/)",
+    )
+    parser.add_argument(
+        "--profile_steps",
+        type=int,
+        default=20,
+        help="Number of steps to profile (after warmup). Only used if --profile is set.",
+    )
+    parser.add_argument(
+        "--profile_warmup_steps",
+        type=int,
+        default=5,
+        help="Number of warmup steps before profiling starts. Only used if --profile is set.",
+    )
+
     return parser.parse_args()
 
 
@@ -801,6 +823,71 @@ def train(args=None):
         EarlyStoppingCallback(early_stopping_patience=10, early_stopping_threshold=1e-4),
         SmartGPUCleanCallback(interval=20 if torch.cuda.is_available() else 2),
     ]
+
+    # Profiler callback (if --profile is set)
+    if args.profile:
+        from torch.profiler import ProfilerActivity, profile, schedule
+
+        trace_dir = os.path.join(os.getcwd(), "docs", "traces")
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_file = os.path.join(trace_dir, f"train_profile_{stage_name}.json")
+
+        profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(
+                wait=0,
+                warmup=args.profile_warmup_steps,
+                active=args.profile_steps,
+                repeat=1,
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            on_trace_ready=lambda p: p.export_chrome_trace(trace_file),
+        )
+
+        class ProfilerCallback(TrainerCallback):
+            def __init__(self, profiler_ctx, total_profiled_steps):
+                self.profiler_ctx = profiler_ctx
+                self.total_steps = total_profiled_steps
+                self.started = False
+
+            def on_train_begin(self, _args, state, control, **kwargs):
+                self.profiler_ctx.__enter__()
+                self.started = True
+                rank_zero_info(f">>> Profiler started (warmup={args.profile_warmup_steps}, active={args.profile_steps})")
+
+            def on_step_end(self, _args, state, control, **kwargs):
+                if self.started:
+                    self.profiler_ctx.step()
+                    if state.global_step >= (args.profile_warmup_steps + args.profile_steps):
+                        self.profiler_ctx.__exit__(None, None, None)
+                        self.started = False
+                        rank_zero_info(f">>> Profiler stopped. Trace saved to: {trace_file}")
+                        rank_zero_info(">>> Top CUDA ops by total time:")
+                        rank_zero_info(
+                            self.profiler_ctx.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+                        )
+                        # Save summary
+                        summary_file = trace_file.replace(".json", "_summary.json")
+                        peak_vram = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+                        summary = {
+                            "trace_file": trace_file,
+                            "peak_vram_gb": round(peak_vram, 2),
+                            "profiled_steps": args.profile_steps,
+                            "warmup_steps": args.profile_warmup_steps,
+                        }
+                        with open(summary_file, "w") as f:
+                            json.dump(summary, f, indent=2)
+                        rank_zero_info(f">>> Summary saved to: {summary_file}")
+
+            def on_train_end(self, _args, state, control, **kwargs):
+                if self.started:
+                    self.profiler_ctx.__exit__(None, None, None)
+                    self.started = False
+
+        callbacks.append(ProfilerCallback(profiler, args.profile_warmup_steps + args.profile_steps))
 
     trainer = Trainer(
         model=vl_model,
