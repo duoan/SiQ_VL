@@ -631,6 +631,28 @@ Combined targets:
   - Multi-GPU DDP where data loading is a per-rank bottleneck
 - **Kept in codebase**: Yes — CUDAPrefetcher is good infrastructure for future scale.
 
+### Failed: Sample Packing with 4D Attention Mask (Iteration 6 investigation)
+
+- **Hypothesis**: Packing multiple samples into fixed-length 1024-token sequences with a
+  block-diagonal causal attention mask would eliminate all padding waste and increase
+  effective throughput.
+- **What we built**:
+  - `siq_vl/packing.py::PackingCollator`: greedy bin-packing with first-fit-decreasing,
+    produces packed sequences with custom position_ids and 4D bf16 attention mask
+  - Block-diagonal causal mask as additive bias `(B, 1, L, L)` with 0 for attend, -inf for mask
+- **Result**: **-54% throughput** (21,026 → 9,663 tok/s). Dramatically worse.
+- **Root cause**: Two compounding problems:
+  1. **SDPA cannot use flash kernel with 4D mask**: falls back to "math" or "mem_efficient"
+     backend which is ~3x slower than flash for 1024-length sequences
+  2. **Quadratic attention cost**: packing 356-token avg samples into 1024-token sequences
+     INCREASES total attention pairs: 7×1024² = 7.3M vs 16×356² = 2.0M (3.6x more compute)
+- **When it WOULD help**:
+  - Long sequences (2K+ tokens) where padding waste is 30–50%
+  - Using `flash_attn_varlen_func` (which natively handles variable-length sequences with
+    `cu_seqlens` without a dense mask) or FlexAttention compiled block masks
+  - Datasets with high length variance where packing actually reduces total positions
+- **Kept in codebase**: Yes — `siq_vl/packing.py` retained for future long-context training.
+
 ### Failed: Gradient Checkpointing Removal (Iteration 3 investigation)
 
 - **Hypothesis**: In Stage 1 the LLM is frozen — gradient checkpointing recomputes a forward

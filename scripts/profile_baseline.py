@@ -26,6 +26,7 @@ from transformers import Trainer, TrainingArguments, set_seed
 from siq_vl.collator import CachedVisionDataCollator, SiQ_VLDataCollator
 from siq_vl.dataset import CachedVQADataset, VQADataset
 from siq_vl.model.modeling import get_stage1_model_and_processor, get_stage2_model_and_processor
+from siq_vl.packing import PackingCollator
 from siq_vl.prefetcher import CUDAPrefetcher
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -69,6 +70,10 @@ def parse_args():
                         help="Number of batches to prefetch per worker")
     parser.add_argument("--group_by_length", action="store_true",
                         help="Group similar-length sequences to reduce padding waste")
+    parser.add_argument("--use_packing", action="store_true",
+                        help="Pack multiple samples into fixed-length sequences (eliminates padding)")
+    parser.add_argument("--pack_max_length", type=int, default=1024,
+                        help="Max sequence length for packed sequences")
 
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--profile_steps", type=int, default=20)
@@ -167,6 +172,11 @@ def main():
         train_dataset = CachedVQADataset(raw_dataset, cache_dir=args.cached_features_dir)
         data_collator = CachedVisionDataCollator(processor=processor, max_length=args.max_length)
         rank_zero_info(f">>> Using CACHED vision features from: {args.cached_features_dir}")
+    elif args.use_packing:
+        train_dataset = VQADataset(raw_dataset)
+        pad_token_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
+        data_collator = PackingCollator(processor=processor, max_length=args.pack_max_length, pad_token_id=pad_token_id)
+        rank_zero_info(f">>> Using PACKING collator (max_length={args.pack_max_length})")
     else:
         train_dataset = VQADataset(raw_dataset)
         data_collator = SiQ_VLDataCollator(processor=processor, max_length=args.max_length)
@@ -225,7 +235,8 @@ def main():
     lr_scheduler = trainer.create_scheduler(num_training_steps=total_steps, optimizer=optimizer)
 
     model_input_keys = [
-        "input_ids", "pixel_values", "vision_features", "attention_mask", "labels", "num_image_tokens"
+        "input_ids", "pixel_values", "vision_features", "attention_mask", "labels",
+        "num_image_tokens", "position_ids",
     ]
 
     # Use CUDA stream prefetcher for overlapping H2D with compute
@@ -306,7 +317,12 @@ def main():
 
             # Count tokens in this step
             if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):
-                n_tokens = int((batch["attention_mask"].sum()).item()) if "attention_mask" in batch else batch["input_ids"].numel()
+                if "attention_mask" in batch and batch["attention_mask"].dim() <= 2:
+                    n_tokens = int(batch["attention_mask"].sum().item())
+                elif "labels" in batch:
+                    n_tokens = int((batch["labels"] != -100).sum().item())
+                else:
+                    n_tokens = batch["input_ids"].numel()
             else:
                 n_tokens = 0
 
