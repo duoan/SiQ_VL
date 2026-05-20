@@ -510,14 +510,50 @@ Combined targets:
 
 ---
 
-### Iteration 8 — P3: torch.compile LLM (planned)
+### Iteration 7 — torch.compile Full Model (replaces Liger)
 
-- **Date**: TBD
-- **Hypothesis**: After P0+P1+P2, applying `torch.compile(mode="reduce-overhead")`
-  to the LLM forward should yield an additional 5–15% speedup.
-- **Risk**: Graph capture compatibility with Liger / FlexAttention; dynamic shape recompilation overhead.
-  → After packing, shapes are fixed (consistent max_length), reducing recompilation pressure.
-- **Decision**: —
+- **Date**: 2025-05-19
+- **Branch / Commit**: `master` (this commit)
+- **Hypothesis**: `torch.compile(mode="max-autotune-no-cudagraphs")` applied to the full model
+  can fuse ops across the entire graph (attention + MLP + embedding), potentially outperforming
+  Liger-Kernel's targeted patches. Key insight: Liger and torch.compile are INCOMPATIBLE —
+  Liger's triton kernels cause illegal memory access under dynamo tracing.
+- **Change**:
+  - `scripts/profile_baseline.py`: add `--no_liger` and `--compile_llm` flags
+  - When `--no_liger` is set, prevent `_apply_liger_kernel()` from running
+  - When `--compile_llm` is set, wrap model with `torch.compile(mode="max-autotune-no-cudagraphs")`
+- **How to Reproduce**:
+  ```bash
+  python scripts/profile_baseline.py --trace_name iter_7_compile_llm \
+    --per_device_train_batch_size 16 --gradient_accumulation_steps 1 \
+    --no_gradient_checkpointing --group_by_length --no_liger --compile_llm
+  ```
+- **Result**:
+  | Metric | Iter 5 (Liger + bucketing) | Iter 7 (torch.compile, no Liger) | Delta |
+  |---|---|---|---|
+  | tokens / sec | 21,026 | **27,352** | **+30.1%** |
+  | avg step time (ms) | 270.6 | **203.9** | **-24.6%** |
+  | p50 step time (ms) | 270.6 | 201.9 | -25.4% |
+  | peak VRAM (GB) | 15.79 | 20.73 | +31.3% |
+- **Additional investigation**: bs=24 with compile = 27,996 tok/s (+2.4%), diminishing returns.
+  bs=32 hits CUDA OOM under compile.
+- **Artifacts**:
+  - Chrome trace: `docs/traces/iter_7_compile_llm.json`
+  - Summary JSON: `docs/traces/iter_7_compile_llm_summary.json`
+- **Decision**: **KEEP**. Replace Liger with torch.compile as the primary optimization.
+  The 30% throughput gain far outweighs the 5 GB VRAM increase (20.73 GB is still only 22% of
+  the 96 GB Blackwell GPU).
+- **Lessons**:
+  - **Liger and torch.compile are mutually exclusive**: Liger monkey-patches model internals
+    with custom triton kernels that confuse torch._dynamo's graph capture, causing illegal
+    memory access errors.
+  - **torch.compile provides broader optimization**: Instead of fusing specific ops (RMSNorm,
+    SwiGLU), compile optimizes the entire computational graph including attention patterns,
+    GEMM scheduling, and memory access patterns.
+  - **VRAM tradeoff is acceptable**: torch.compile doesn't have Liger's fused CE memory savings,
+    but 20 GB is minimal on modern GPUs. For memory-constrained setups, Liger remains the
+    better choice.
+  - **Warmup overhead**: First 3–5 steps take 10–30s each for compilation (amortized over training).
 
 ---
 

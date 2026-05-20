@@ -342,6 +342,20 @@ def parse_args():
         help="Learning rate",
     )
 
+    # Compilation
+    parser.add_argument(
+        "--torch_compile",
+        action="store_true",
+        default=False,
+        help="Apply torch.compile to the model (incompatible with Liger-Kernel)",
+    )
+    parser.add_argument(
+        "--no_liger",
+        action="store_true",
+        default=False,
+        help="Disable Liger-Kernel optimizations (required for torch.compile)",
+    )
+
     # Precision configuration
     parser.add_argument(
         "--bf16",
@@ -571,7 +585,11 @@ def train(args=None):
     gradient_accumulation_steps = args.gradient_accumulation_steps
 
     rank_zero_info(">>> Loading Model and Processor...")
-    # Initialize our Custom Model using config
+
+    if args.no_liger:
+        from siq_vl.model import modeling as _modeling
+        _modeling._LIGER_APPLIED = True
+        rank_zero_info(">>> Liger-Kernel DISABLED")
 
     default_repo_name = f"siq-vl_{vision_name}_{text_name}_{stage_name}"
 
@@ -715,6 +733,8 @@ def train(args=None):
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
         dataloader_prefetch_factor=4 if args.dataloader_num_workers > 0 else None,
         group_by_length=True,
+        torch_compile=args.torch_compile,
+        torch_compile_mode="max-autotune-no-cudagraphs" if args.torch_compile else None,
         # --- Evaluation ---
         eval_strategy="steps",
         eval_steps=args.eval_steps,

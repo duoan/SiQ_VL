@@ -74,6 +74,10 @@ def parse_args():
                         help="Pack multiple samples into fixed-length sequences (eliminates padding)")
     parser.add_argument("--pack_max_length", type=int, default=1024,
                         help="Max sequence length for packed sequences")
+    parser.add_argument("--no_liger", action="store_true",
+                        help="Disable Liger-Kernel (for torch.compile compatibility)")
+    parser.add_argument("--compile_llm", action="store_true",
+                        help="Apply torch.compile to the text model")
 
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--profile_steps", type=int, default=20)
@@ -122,6 +126,11 @@ def main():
     # ================================================================
     rank_zero_info(">>> Loading model and processor...")
 
+    if args.no_liger:
+        from siq_vl.model import modeling as _modeling
+        _modeling._LIGER_APPLIED = True  # Prevent Liger from being applied
+        rank_zero_info(">>> Liger-Kernel DISABLED")
+
     if args.stage == 1:
         model, processor = get_stage1_model_and_processor(
             pretrained_vision_model_path=args.vision_model_name_or_path,
@@ -138,6 +147,11 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+
+    if args.compile_llm:
+        rank_zero_info(">>> Applying torch.compile to full model...")
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+        rank_zero_info(">>> torch.compile applied")
 
     # When using cached features, offload the vision model from GPU to save VRAM
     if args.cached_features_dir:
