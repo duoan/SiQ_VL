@@ -38,7 +38,7 @@ _TILEGYM_APPLIED = False
 
 
 def _apply_tilegym_kernel(use_cutile: bool = True):
-    """Apply TileGym kernels to Qwen2 (RoPE, RMSNorm, SwiGLU, attention) + Liger's fused linear-CE.
+    """Apply TileGym kernels to Qwen2 (RoPE, RMSNorm, SwiGLU, attention, fused linear-CE).
     Native Blackwell-optimized kernels via cuTile DSL — 13-17% faster than Liger alone.
     Must be called before model instantiation. Safe to call multiple times."""
     global _TILEGYM_APPLIED, _LIGER_APPLIED
@@ -51,17 +51,10 @@ def _apply_tilegym_kernel(use_cutile: bool = True):
         backend = "cuTile DSL" if use_cutile else "Triton"
         rank_zero_info(f">>> TileGym applied ({backend}): RoPE + RMSNorm + SwiGLU + FA4 attention")
 
-        # Also apply Liger's fused_linear_cross_entropy for memory efficiency
-        try:
-            from liger_kernel.transformers import apply_liger_kernel_to_qwen2 as _liger_patch
+        from siq_vl.kernels.fused_linear_ce import patch_qwen2_fused_linear_ce
 
-            _liger_patch(
-                rope=False, cross_entropy=False, fused_linear_cross_entropy=True,
-                rms_norm=False, swiglu=False,
-            )
-            rank_zero_info(">>> + Liger fused_linear_cross_entropy (VRAM optimization)")
-        except ImportError:
-            pass
+        patch_qwen2_fused_linear_ce()
+        rank_zero_info(">>> + fused_linear_cross_entropy (chunked, never materializes [BT,V] logits)")
 
         _TILEGYM_APPLIED = True
         _LIGER_APPLIED = True  # prevent Liger from double-patching
