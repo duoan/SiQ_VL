@@ -4,9 +4,12 @@ Replaces the standard `lm_head(hidden) → CE(logits, labels)` pattern with a
 chunked computation that never materializes the full [BT, V] logits tensor.
 
 Forward: chunked matmul + TileGym _ce_cutile kernel (online softmax over vocab tiles)
-Backward: reuses in-place softmax probs from forward for grad_hidden = (probs - one_hot) @ W
+         + computes grad_hidden/grad_weight in the same loop (fused_linear_jsd pattern)
+Backward: trivial O(1) — just scales precomputed gradients by grad_output
 
-Monkey-patches Qwen2ForCausalLM.forward to use this fused path during training.
+Key memory optimization: grad_logits (C, V) is NEVER stored across chunks.
+Each chunk's (C, V) grad_logits is computed, used for backward GEMMs, then freed
+within the same loop iteration. Total stored: grad_hidden (BT, H) + grad_weight (V, H).
 """
 
 import torch
@@ -19,7 +22,7 @@ _CHUNK_SIZE = 4096
 
 
 class FusedLinearCrossEntropy(torch.autograd.Function):
-    """Autograd wrapper using TileGym's cuTile CE kernel for forward."""
+    """Fused linear CE: forward computes all grads, backward is O(1) scalar scale."""
 
     @staticmethod
     def forward(
@@ -37,80 +40,66 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         loss_all = torch.empty(bt, device=hidden_states.device, dtype=torch.float32)
         n_valid = 0
 
-        # After _ce_cutile, logits_chunk is overwritten with softmax probs in-place.
-        # We store these for backward.
-        grad_logits_chunks = []
+        # Precompute gradients in forward (fused_linear_jsd pattern).
+        # Each chunk's grad_logits (C, V) lives only within one iteration.
+        grad_hidden = torch.zeros(bt, h, device=hidden_states.device, dtype=hidden_states.dtype)
+        grad_weight = torch.zeros(vocab_size, h, device=hidden_states.device, dtype=hidden_states.dtype)
 
         for i in range(num_chunks):
             s, e = i * chunk_size, min((i + 1) * chunk_size, bt)
-            x_chunk = hidden_states[s:e].detach()
+            x_chunk = hidden_states[s:e]
             t_chunk = target[s:e]
-
-            # GEMM: logits = x @ W^T (detached buffer for in-place CE kernel)
-            logits_chunk = x_chunk @ weight.T
             loss_chunk = loss_all[s:e]
 
             valid_mask = t_chunk != ignore_index
             n_valid_chunk = valid_mask.sum().item()
 
-            if n_valid_chunk > 0:
-                # TileGym cuTile kernel: computes loss AND overwrites logits with softmax probs
-                _ce_cutile(logits_chunk, t_chunk, loss_chunk, ignore_index)
-
-                # logits_chunk now contains softmax probs — compute grad_logits = probs - one_hot
-                safe_target = t_chunk.clamp(min=0)
-                logits_chunk[torch.arange(logits_chunk.shape[0], device=logits_chunk.device), safe_target] -= 1.0
-                logits_chunk[~valid_mask] = 0.0
-                grad_logits_chunks.append(logits_chunk.to(hidden_states.dtype))
-                n_valid += n_valid_chunk
-            else:
+            if n_valid_chunk == 0:
                 loss_chunk.zero_()
-                grad_logits_chunks.append(None)
+                continue
 
-        # Reduction: mean over valid tokens
+            # GEMM 1: logits = x @ W^T (chunk_size, V)
+            logits_chunk = x_chunk.detach() @ weight.T
+
+            # cuTile kernel: loss + overwrite logits with softmax probs (in-place)
+            _ce_cutile(logits_chunk, t_chunk, loss_chunk, ignore_index)
+
+            # logits_chunk is now softmax probs — compute grad_logits = probs - one_hot
+            safe_target = t_chunk.clamp(min=0)
+            rows = torch.arange(logits_chunk.shape[0], device=logits_chunk.device)
+            logits_chunk[rows, safe_target] -= 1.0
+            logits_chunk[~valid_mask] = 0.0
+            # logits_chunk is now grad_logits (C, V) — use immediately for backward GEMMs
+
+            # GEMM 2: grad_hidden_chunk = grad_logits @ weight  (C,V) @ (V,H) -> (C,H)
+            grad_hidden[s:e] = logits_chunk.to(hidden_states.dtype) @ weight
+
+            # GEMM 3: grad_weight += grad_logits.T @ hidden  (V,C) @ (C,H) -> (V,H)
+            grad_weight.addmm_(logits_chunk.to(hidden_states.dtype).T, x_chunk)
+
+            # logits_chunk (C, V) is freed here — never stored!
+
+            n_valid += n_valid_chunk
+
+        # Loss reduction
         if n_valid > 0:
             loss = loss_all.sum() / n_valid
+            # Scale grads by 1/n_valid (the loss reduction factor)
+            inv_n = 1.0 / n_valid
+            grad_hidden.mul_(inv_n)
+            grad_weight.mul_(inv_n)
         else:
             loss = loss_all.sum()
 
-        ctx.save_for_backward(hidden_states, weight)
-        ctx.grad_logits_chunks = grad_logits_chunks
-        ctx.chunk_size = chunk_size
-        ctx.n_valid = n_valid
+        ctx.save_for_backward(grad_hidden, grad_weight)
+        ctx.has_weight_grad = weight.requires_grad
         return loss
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_states, weight = ctx.saved_tensors
-        grad_logits_chunks = ctx.grad_logits_chunks
-        chunk_size = ctx.chunk_size
-        n_valid = ctx.n_valid
-        bt = hidden_states.shape[0]
-
-        scale = grad_output / max(n_valid, 1)
-
-        grad_hidden = torch.empty_like(hidden_states)
-        grad_weight: Tensor | None = None
-        if ctx.needs_input_grad[1]:
-            grad_weight = torch.zeros_like(weight)
-
-        for i, grad_logits in enumerate(grad_logits_chunks):
-            s = i * chunk_size
-            e = min(s + chunk_size, bt)
-
-            if grad_logits is None:
-                grad_hidden[s:e] = 0.0
-                continue
-
-            # grad_logits already contains (probs - one_hot) from forward
-            scaled_grad = grad_logits * scale
-            grad_hidden[s:e] = scaled_grad @ weight
-
-            if grad_weight is not None:
-                grad_weight.addmm_(scaled_grad.T, hidden_states[s:e])
-
-        ctx.grad_logits_chunks = None
-        return grad_hidden, grad_weight, None, None
+        grad_hidden, grad_weight = ctx.saved_tensors
+        # O(1) backward: just scale by upstream gradient
+        return grad_hidden * grad_output, grad_weight * grad_output if ctx.has_weight_grad else None, None, None
 
 
 def fused_linear_cross_entropy(
@@ -122,7 +111,7 @@ def fused_linear_cross_entropy(
     """Fused linear + cross-entropy using TileGym cuTile kernel.
 
     Never materializes full [BT, V] logits — processes in chunks.
-    The cuTile kernel computes loss + softmax probs in a single pass.
+    All gradients computed in forward; backward is O(1).
 
     Args:
         hidden_states: (BT, H) flattened hidden states
