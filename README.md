@@ -1,18 +1,57 @@
 # SiQ-VL: A Vision-Language Model for Multimodal Understanding
 
-[![GitHub](https://img.shields.io/badge/GitHub-duoan/SiQ_VL-black?logo=github&style=flat-square)](https://github.com/duoan/SiQ_VL) [![W&B](https://img.shields.io/badge/W%26B-Metrics_-yellow)](https://wandb.ai/ReproduceAI/siq-vl) [![Hugging Face Stage1](https://img.shields.io/badge/HF-stage1-orange?logo=huggingface&style=flat-square)](https://huggingface.co/classtag/siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage1) [![Hugging Face Stage2](https://img.shields.io/badge/HF-stage2-orange?logo=huggingface&style=flat-square)](https://huggingface.co/classtag/siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage2) [![Tech Report](https://img.shields.io/badge/Tech%20Report-PDF-red?logo=readthedocs&style=flat-square)](SiQ_VL_Tech_Report.pdf)
+[![GitHub](https://img.shields.io/badge/GitHub-duoan/SiQ_VL-black?logo=github&style=flat-square)](https://github.com/duoan/SiQ_VL) [![W&B](https://img.shields.io/badge/W%26B-Metrics_-yellow)](https://wandb.ai/ReproduceAI/siq-vl) [![Hugging Face Stage1](https://img.shields.io/badge/HF-stage1-orange?logo=huggingface&style=flat-square)](https://huggingface.co/classtag/siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage1) [![Hugging Face Stage2](https://img.shields.io/badge/HF-stage2-orange?logo=huggingface&style=flat-square)](https://huggingface.co/classtag/siq-vl_siglip2-large-patch16-512_qwen2.5-1.5b-instruct_stage2) [![Tech Report](https://img.shields.io/badge/Tech%20Report-PDF-red?logo=readthedocs&style=flat-square)](docs/report/main.pdf) [![arXiv](https://img.shields.io/badge/arXiv-2026-b31b1b?logo=arxiv&style=flat-square)](https://arxiv.org/abs/TBD)
 
 ## Abstract
 
 SiQ-VL is a vision-language model (VLM) that integrates a SigLIP-based vision encoder with a Qwen2.5 language model through a learnable projection module. The architecture employs a multi-stage training paradigm designed to progressively develop capabilities in multimodal understanding and text generation tasks.
 
+This repository also serves as a **single-GPU training efficiency recipe** — documenting 15 iterative optimizations that achieve **22.9x speedup** (4,674 → 107,367 tok/s) on an NVIDIA RTX PRO 6000 Blackwell GPU.
+
+## Highlights
+
+- **22.9x training speedup** through systematic optimization (BF16 fix, TileGym cuTile kernels, sequence packing, batch scaling)
+- **50–64% VRAM reduction** via grad-in-forward fused cross-entropy (logits never materialized)
+- **Full technical report** with 15 experiments (including 10 documented failures): [`docs/report/main.pdf`](docs/report/main.pdf)
+- **Reproducible benchmarks**: all scripts in `scripts/benchmark_*.py`
+
 ## Experiment Tracking
 
 Training runs and experiments are tracked using Weights & Biases. View training metrics, model checkpoints, and experiment logs at: [https://wandb.ai/ReproduceAI/siq-vl](https://wandb.ai/ReproduceAI/siq-vl)
 
-## Training Efficiency Iteration Log
+## Training Efficiency
 
-The full optimization plan and per-iteration log (Hypothesis → Change → Measurement → Result → Decision) lives in [`docs/training_efficiency_plan.md`](docs/training_efficiency_plan.md). It is the source-of-truth for the ongoing "make SiQ-VL train fast" effort and the raw material for the upcoming engineering blog post.
+### Technical Report
+
+The full optimization journey is documented as a LaTeX technical report suitable for arXiv submission:
+
+- **PDF**: [`docs/report/main.pdf`](docs/report/main.pdf)
+- **Source**: [`docs/report/main.tex`](docs/report/main.tex)
+
+### Summary of Optimizations
+
+| Iteration | Optimization | Speedup | Key Insight |
+|---|---|---|---|
+| 0 | Baseline (FP32 bug) | 1.0x | Profiler revealed FP32 GEMM despite `bf16=True` |
+| 1 | BF16 dtype + `no_grad` | 3.07x | 2-line fix, largest single gain |
+| 3 | Batch size 4→16 | 4.34x | GPU underutilized at small B |
+| 7 | `torch.compile` | 5.85x | Replaces Liger (mutually exclusive) |
+| 11 | TileGym FA4 | 6.5x | Blackwell-native cuTile attention |
+| 13 | TileGym full stack + fused CE | 14.6x | 30–41% faster, 50–64% less VRAM vs Liger |
+| 15 | Packing + TileGym (verified) | **22.9x** | 107K Real tok/s on real data |
+
+### Failed Experiments (documented in report)
+
+- Liger-Kernel in Stage 1 (speed regression, frozen LLM has no backward)
+- Vision feature caching (SigLIP too fast to benefit, +27% VRAM)
+- Custom Triton Flash Attention (cannot emit wgmma/TMA on Blackwell)
+- FlexAttention with variable shapes (torch.compile recompilation storm)
+- cudagraphs `reduce-overhead` mode (dynamic VLM shapes)
+- Batch scaling beyond saturation (flat throughput at MFU ceiling)
+
+### Iteration Log
+
+The raw per-iteration log (Hypothesis → Change → Measurement → Result → Decision) lives in [`docs/training_efficiency_plan.md`](docs/training_efficiency_plan.md).
 
 ## Architecture Overview
 
@@ -478,6 +517,7 @@ Checkpoint Output    │ Stage 1        │ Stage 2        │ Stage 3        �
 - Python 3.10 (Python >= 3.10 and < 3.11)
 - PyTorch >= 2.9.1
 - CUDA-capable GPU with at least 24GB VRAM (recommended for training)
+- Tested on: NVIDIA RTX PRO 6000 Blackwell (96GB), CUDA 13.0
 - Package manager: [uv](https://github.com/astral-sh/uv) (recommended) or pip
 
 ## Installation
@@ -724,29 +764,43 @@ This will:
 
 ```
 SiQ_VL/
-├── siq_vl/              # Main package
-│   ├── model.py        # SiQ_VLModel and Projector
-│   ├── processing.py   # SiQ_VLProcessor for multimodal inputs
-│   ├── dataset.py      # VQAIterableDataset for efficient data loading
-│   ├── collator.py     # Data collator for batching
-│   └── callbacks.py    # Training callbacks (metrics, GPU cleanup)
+├── siq_vl/                     # Main package
+│   ├── model/
+│   │   └── modeling.py         # SiQ_VLForCausalLM architecture
+│   ├── kernels/
+│   │   └── fused_linear_ce.py  # Fused Linear-CE with grad-in-forward
+│   ├── processing.py           # SiQ_VLProcessor for multimodal inputs
+│   ├── dataset.py              # VQADataset for efficient data loading
+│   ├── collator.py             # Data collator + PackingCollator
+│   └── callbacks.py            # Training callbacks (metrics, GPU cleanup)
 ├── scripts/
-│   ├── train.py        # Main training script (Stage 1 & Stage 2)
-│   ├── train_launch.sh # Unified launcher for Stage 1 & Stage 2
-│   ├── train_stage_1.sh # Convenience script for Stage 1
-│   └── train_stage_2.sh # Convenience script for Stage 2
-│   # Future: train_stage_3.py, train_rl.py
-├── checkpoints/         # Saved model checkpoints
-│   └── siq_vlm_stage1/ # Stage 1 checkpoints
-└── lmms-eval/          # Evaluation framework (optional)
+│   ├── train.py                # Main training script (Stage 1 & Stage 2)
+│   ├── train_stage_1.sh        # Convenience script for Stage 1
+│   ├── train_stage_2.sh        # Convenience script for Stage 2
+│   ├── benchmark_real_efficiency.py  # Ground-truth efficiency measurement
+│   ├── benchmark_batch_scaling.py    # Batch size sweep benchmark
+│   ├── benchmark_cutile_e2e.py       # TileGym E2E benchmark
+│   └── benchmark_flashoptim.py       # FlashOptim memory benchmark
+├── docs/
+│   ├── report/
+│   │   ├── main.tex            # Technical report (LaTeX, arXiv-ready)
+│   │   └── main.pdf            # Compiled report (21 pages)
+│   ├── training_efficiency_plan.md  # Raw iteration log
+│   └── traces/                 # Per-iteration measurement JSONs
+├── checkpoints/                # Saved model checkpoints
+└── lmms-eval/                  # Evaluation framework (optional)
 ```
 
 ## Development Roadmap
 
-- [x] **Stage 1**: Projector alignment training (Completed)
-- [x] **Stage 2**: Language model fine-tuning with LoRA support (Completed)
+- [x] **Stage 1**: Projector alignment training
+- [x] **Stage 2**: Language model fine-tuning with LoRA support
+- [x] **Training Efficiency**: Single-GPU optimization (22.9x speedup, technical report)
+- [x] **TileGym Integration**: Blackwell-native cuTile kernels (FA4, RMSNorm, SwiGLU, RoPE, fused CE)
+- [x] **Sequence Packing**: FlexAttention-based packing with block-diagonal masks
 - [ ] **Stage 3**: Supervised fine-tuning with chain-of-thought reasoning
 - [ ] **Stage 4**: Reinforcement learning-based training (RLHF/DPO)
+- [ ] **Distributed Training**: Multi-GPU scaling with FSDP/Modal
 - [ ] Evaluation scripts and benchmark integration
 - [ ] Model inference and deployment utilities
 
@@ -899,8 +953,12 @@ SOFTWARE.
 
 This work builds upon the following open-source contributions:
 
-- **SigLIP2** (Zhai et al., 2023): Vision encoder architecture implementation [[GitHub](https://arxiv.org/abs/2502.14786)]
-- **Qwen2.5** (Qwen Team, 2024): Language model architecture [[GitHub](https://arxiv.org/abs/2412.15115)]
+- **SigLIP2** (Zhai et al., 2023): Vision encoder architecture [[arXiv](https://arxiv.org/abs/2502.14786)]
+- **Qwen2.5** (Qwen Team, 2024): Language model architecture [[arXiv](https://arxiv.org/abs/2412.15115)]
 - **HuggingFace Transformers** (Wolf et al., 2020): Deep learning framework [[GitHub](https://github.com/huggingface/transformers)]
-- **FineVision Dataset** (HuggingFace, 2025): open dataset for data-centric training of Vision Language Models [[HuggingFace](https://huggingface.co/datasets/HuggingFaceM4/FineVision)]
+- **FineVision Dataset** (HuggingFace, 2025): Open dataset for data-centric VLM training [[HuggingFace](https://huggingface.co/datasets/HuggingFaceM4/FineVision)]
+- **TileGym** (NVIDIA, 2025): Production cuTile kernels for Blackwell GPUs (FA4, fused ops)
+- **Liger-Kernel** (LinkedIn, 2024): Triton-based fused kernels for LLM training [[GitHub](https://github.com/linkedin/Liger-Kernel)]
+- **FlashAttention** (Dao et al., 2022): Memory-efficient attention [[GitHub](https://github.com/Dao-AILab/flash-attention)]
+- **FlashOptim** (Databricks, 2025): Memory-efficient optimizer states [[GitHub](https://github.com/databricks/flashoptim)]
 
