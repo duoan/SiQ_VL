@@ -183,41 +183,71 @@ Dataset & sharegpt4v/coco (50K samples) \\
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{VLM Training Systems.}
-LLaVA~\cite{liu2023llava} established the two-stage VLM training recipe
-(projector alignment followed by instruction tuning) that SiQ-VL follows.
-InternVL~\cite{chen2024internvl} scales this to 6B+ with dynamic resolution and
-progressive training. Qwen-VL~\cite{bai2023qwenvl} uses a three-stage pipeline with
-interleaved image-text data. These works focus on model architecture and data recipes;
-our work is complementary---we optimize the \emph{training efficiency} for any VLM
-following the two-stage paradigm.
+\paragraph{Vision-Language Model Architectures.}
+The two-stage VLM training recipe (projector alignment $\to$ instruction tuning) was
+popularized by LLaVA~\cite{liu2023llava} and LLaVA-1.5~\cite{liu2024llava15}.
+Subsequent works scale this paradigm: InternVL~\cite{chen2024internvl} introduces dynamic
+resolution with progressive training at 6B+ scale; Qwen-VL~\cite{bai2023qwenvl} and
+Qwen2-VL~\cite{wang2024qwen2vl} use three-stage pipelines with interleaved image-text
+pre-training; LLaVA-NeXT~\cite{liu2024llavanext} explores dynamic high-resolution with
+AnyRes tiling; PaliGemma~\cite{beyer2024paligemma} and Phi-3-Vision~\cite{abdin2024phi3}
+demonstrate that sub-4B VLMs can achieve competitive quality. SiQ-VL follows the LLaVA
+two-stage recipe using SigLIP-2~\cite{zhai2023siglip} as vision encoder and
+Qwen2.5~\cite{yang2024qwen25} as language backbone. Our contribution is orthogonal to
+architecture---we optimize \emph{training throughput} for any VLM following this paradigm.
 
-\paragraph{Kernel Fusion for LLM Training.}
-FlashAttention~\cite{dao2022flashattention,dao2023flashattention2} fuses the attention
-computation to reduce memory IO. Liger-Kernel~\cite{hsu2024liger} applies Triton-based
-fusion to RMSNorm, SwiGLU, RoPE, and cross-entropy. Our work compares Liger against
-NVIDIA's cuTile DSL (TileGym) on Blackwell, finding cuTile 30--41\% faster due to
-access to architecture-specific instructions (wgmma, TMA).
+\paragraph{GPU Kernel Optimization.}
+FlashAttention~\cite{dao2022flashattention} and FlashAttention-2~\cite{dao2023flashattention2}
+reduce attention memory from $O(N^2)$ to $O(N)$ via tiled IO-aware computation.
+Triton~\cite{tillet2019triton} provides a Python-based DSL for writing custom GPU
+kernels, enabling projects like Liger-Kernel~\cite{hsu2024liger} that fuse LLM training
+operators (RMSNorm, SwiGLU, RoPE, cross-entropy) in Triton. Unsloth~\cite{unsloth2024}
+takes a similar approach for LoRA fine-tuning. On the vendor side, NVIDIA's cuTile DSL
+(part of CUTLASS 4.0) provides direct access to Blackwell-specific hardware:
+wgmma (warp-group matrix multiply), TMA (Tensor Memory Accelerator), and SM remapping.
+We show that cuTile kernels (via TileGym) outperform Triton-based Liger by 30--41\%
+on Blackwell, establishing a clear hierarchy: vendor DSL $>$ Triton $>$ vanilla PyTorch
+on new architectures.
 
-\paragraph{Sequence Packing.}
-Packing variable-length sequences into fixed bins to eliminate padding was introduced
-for BERT pre-training~\cite{krell2021efficient} and extended to decoder models with
-block-diagonal attention masks. HuggingFace Transformers 4.57+ provides native support
-via position\_id reset detection + FlexAttention~\cite{he2024flexattention}. Our work
-quantifies when packing helps (+4.6\% for uniform data, more for high-variance data).
+\paragraph{Mixed Precision and Memory Efficiency.}
+Mixed-precision training~\cite{micikevicius2018mixed} using FP16/BF16 is now standard.
+Gradient checkpointing~\cite{chen2016training} trades compute for memory.
+The ``online softmax'' trick~\cite{milakov2018online} computes cross-entropy without
+materializing full logits; we extend this with a ``grad-in-forward'' pattern that
+computes $\nabla_h$ within the forward pass, avoiding storage of $B \times L \times V$
+gradient tensors. Memory-efficient optimizers~\cite{loshchilov2019adamw} like
+8-bit Adam~\cite{dettmers2022adam8bit} and FlashOptim~\cite{flashoptim2024} (gradient
+release + fused state updates) further reduce optimizer memory; we benchmark FlashOptim
+and find marginal gains at the 0.5B scale.
 
-\paragraph{Training Efficiency at Scale.}
-Megatron-LM~\cite{shoeybi2019megatron}, DeepSpeed~\cite{rasley2020deepspeed}, and
-FSDP~\cite{zhao2023pytorch} focus on multi-GPU efficiency. Our work addresses the
-orthogonal problem of \emph{single-GPU} efficiency---the throughput floor that
-distributed methods multiply. The techniques we identify (batch scaling, shape
-quantization, kernel selection) apply equally to each device in a distributed setup.
+\paragraph{Sequence Packing and Variable-Length Training.}
+Packing multiple sequences into fixed-length bins to eliminate padding was introduced
+for BERT pre-training~\cite{krell2021efficient}. For causal LMs, block-diagonal attention
+masks~\cite{raffel2020t5} or \texttt{cu\_seqlens}-based variable-length
+attention~\cite{dao2022flashattention} maintain sample isolation within packed sequences.
+HuggingFace Transformers 4.57+ provides native packing support via position\_id reset
+detection with FlexAttention~\cite{he2024flexattention} backends. Our contribution is
+quantifying the \emph{diminishing returns} of packing: with effective bucketing at large
+batch sizes, padding waste is already $<$5\%, making packing's throughput gain marginal
+(+4.6\%).
 
-\paragraph{MFU Analysis.}
-PaLM~\cite{chowdhery2023palm} introduced Model FLOPs Utilization as the standard
-metric for training efficiency. We contribute MFU measurements for sub-1B VLMs on
-Blackwell GPUs---a combination not previously characterized---and demonstrate that
-memory bandwidth (not compute) is the binding constraint at this model scale.
+\paragraph{Distributed Training Systems.}
+Megatron-LM~\cite{shoeybi2019megatron} pioneered tensor and pipeline parallelism.
+DeepSpeed ZeRO~\cite{rasley2020deepspeed,rajbhandari2020zero} partitions optimizer
+states, gradients, and parameters across GPUs. PyTorch FSDP~\cite{zhao2023pytorch}
+integrates sharded data parallelism natively. These systems optimize multi-GPU
+communication and memory distribution. Our work addresses the orthogonal, often
+overlooked problem of \emph{per-device} efficiency---the throughput floor that distributed
+methods multiply. Every technique we identify (batch scaling, shape quantization,
+kernel selection) benefits each GPU in a distributed setup independently.
+
+\paragraph{Training Efficiency Metrics.}
+PaLM~\cite{chowdhery2023palm} formalized Model FLOPs Utilization (MFU) as the ratio
+of achieved to theoretical peak throughput. Chinchilla~\cite{hoffmann2022training}
+establishes compute-optimal scaling laws. We contribute MFU measurements for sub-1B
+VLMs on Blackwell---a previously uncharacterized regime---and show the
+memory-bandwidth ceiling at 19--23\% MFU is structural for small models, not a software
+limitation.
 
 % ═══════════════════════════════════════════════════════════════════════════════
 \section{The Optimization Journey}
@@ -1060,12 +1090,23 @@ All code and data at: \url{https://github.com/duoan/SiQ_VL}
 \end{itemize}
 
 % ═══════════════════════════════════════════════════════════════════════════════
-\begin{thebibliography}{20}
+\begin{thebibliography}{30}
 
+% --- VLM Architectures ---
 \bibitem{liu2023llava}
 H.~Liu, C.~Li, Q.~Wu, and Y.~J. Lee.
 \newblock Visual instruction tuning.
 \newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{liu2024llava15}
+H.~Liu, C.~Li, Y.~Li, and Y.~J. Lee.
+\newblock Improved baselines with visual instruction tuning.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem{liu2024llavanext}
+H.~Liu, C.~Li, Y.~Li, B.~Li, Y.~Zhang, S.~Shen, and Y.~J. Lee.
+\newblock LLaVA-NeXT: Improved reasoning, OCR, and world knowledge.
+\newblock \emph{Blog post}, 2024.
 
 \bibitem{chen2024internvl}
 Z.~Chen, J.~Wu, W.~Wang, et al.
@@ -1077,6 +1118,33 @@ J.~Bai, S.~Bai, S.~Yang, et al.
 \newblock Qwen-VL: A versatile vision-language model for understanding, localization, text reading, and beyond.
 \newblock \emph{arXiv:2308.12966}, 2023.
 
+\bibitem{wang2024qwen2vl}
+P.~Wang, S.~Bai, S.~Tan, et al.
+\newblock Qwen2-VL: Enhancing vision-language model's perception of the world at any resolution.
+\newblock \emph{arXiv:2409.12191}, 2024.
+
+\bibitem{beyer2024paligemma}
+L.~Beyer, A.~Steiner, A.~S. Pinto, et al.
+\newblock PaliGemma: A versatile 3B VLM for transfer.
+\newblock \emph{arXiv:2407.07726}, 2024.
+
+\bibitem{abdin2024phi3}
+M.~Abdin, J.~Aneja, H.~Awadalla, et al.
+\newblock Phi-3 technical report: A highly capable language model locally on your phone.
+\newblock \emph{arXiv:2404.14219}, 2024.
+
+% --- Vision/Language Backbones ---
+\bibitem{zhai2023siglip}
+X.~Zhai, B.~Mustafa, A.~Kolesnikov, and L.~Beyer.
+\newblock Sigmoid loss for language image pre-training.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem{yang2024qwen25}
+A.~Yang, B.~Yang, B.~Hui, et al.
+\newblock Qwen2.5: A party of foundation models.
+\newblock \emph{arXiv:2412.15115}, 2024.
+
+% --- Kernel Optimization ---
 \bibitem{dao2022flashattention}
 T.~Dao, D.~Y. Fu, S.~Ermon, A.~Rudra, and C.~R\'{e}.
 \newblock FlashAttention: Fast and memory-efficient exact attention with IO-awareness.
@@ -1087,21 +1155,69 @@ T.~Dao.
 \newblock FlashAttention-2: Faster attention with better parallelism and work partitioning.
 \newblock In \emph{ICLR}, 2024.
 
+\bibitem{tillet2019triton}
+P.~Tillet, H.~T. Kung, and D.~Cox.
+\newblock Triton: An intermediate language and compiler for tiled neural network computations.
+\newblock In \emph{MAPL Workshop}, 2019.
+
 \bibitem{hsu2024liger}
 P.~Hsu, Y.~Shi, Y.~Zhu, et al.
 \newblock Liger-Kernel: Efficient Triton kernels for LLM training.
 \newblock \emph{arXiv:2410.10989}, 2024.
+
+\bibitem{unsloth2024}
+D.~Han and M.~Han.
+\newblock Unsloth: 2x faster LLM fine-tuning with 80\% less memory.
+\newblock \url{https://github.com/unslothai/unsloth}, 2024.
 
 \bibitem{he2024flexattention}
 T.~He, et al.
 \newblock FlexAttention: A programming model for generating optimized attention kernels.
 \newblock \emph{PyTorch Blog}, 2024.
 
+% --- Mixed Precision and Memory ---
+\bibitem{micikevicius2018mixed}
+P.~Micikevicius, S.~Narang, J.~Alben, et al.
+\newblock Mixed precision training.
+\newblock In \emph{ICLR}, 2018.
+
+\bibitem{chen2016training}
+T.~Chen, B.~Xu, C.~Zhang, and C.~Guestrin.
+\newblock Training deep nets with sublinear memory cost.
+\newblock \emph{arXiv:1604.06174}, 2016.
+
+\bibitem{milakov2018online}
+M.~Milakov and N.~Gimelshein.
+\newblock Online normalizer calculation for softmax.
+\newblock \emph{arXiv:1805.02867}, 2018.
+
+\bibitem{loshchilov2019adamw}
+I.~Loshchilov and F.~Hutter.
+\newblock Decoupled weight decay regularization.
+\newblock In \emph{ICLR}, 2019.
+
+\bibitem{dettmers2022adam8bit}
+T.~Dettmers, M.~Lewis, Y.~Belkada, and L.~Zettlemoyer.
+\newblock 8-bit optimizers via block-wise quantization.
+\newblock In \emph{ICLR}, 2022.
+
+\bibitem{flashoptim2024}
+Databricks Mosaic Research.
+\newblock FlashOptim: Memory-efficient optimizers with gradient release.
+\newblock \url{https://github.com/databricks/flashoptim}, 2024.
+
+% --- Sequence Packing ---
 \bibitem{krell2021efficient}
 M.~M. Krell, N.~Kosec, S.~P. Perez, and A.~Fitzgibbon.
 \newblock Efficient sequence packing without cross-contamination: Accelerating large language models without impacting performance.
 \newblock \emph{arXiv:2107.02027}, 2021.
 
+\bibitem{raffel2020t5}
+C.~Raffel, N.~Shazeer, A.~Roberts, et al.
+\newblock Exploring the limits of transfer learning with a unified text-to-text transformer.
+\newblock \emph{JMLR}, 21(140):1--67, 2020.
+
+% --- Distributed Training ---
 \bibitem{shoeybi2019megatron}
 M.~Shoeybi, M.~Patwary, R.~Puri, et al.
 \newblock Megatron-LM: Training multi-billion parameter language models using model parallelism.
@@ -1112,15 +1228,26 @@ J.~Rasley, S.~Rajbhandari, O.~Ruwase, and Y.~He.
 \newblock DeepSpeed: System optimizations enable training deep learning models with over 100 billion parameters.
 \newblock In \emph{KDD}, 2020.
 
+\bibitem{rajbhandari2020zero}
+S.~Rajbhandari, J.~Rasley, O.~Ruwase, and Y.~He.
+\newblock ZeRO: Memory optimizations toward training trillion parameter models.
+\newblock In \emph{SC}, 2020.
+
 \bibitem{zhao2023pytorch}
 Y.~Zhao, A.~Gu, R.~Varma, et al.
 \newblock PyTorch FSDP: Experiences on scaling fully sharded data parallel.
 \newblock In \emph{VLDB}, 2023.
 
+% --- Scaling Laws and MFU ---
 \bibitem{chowdhery2023palm}
 A.~Chowdhery, S.~Narang, J.~Devlin, et al.
 \newblock PaLM: Scaling language modeling with Pathways.
 \newblock \emph{JMLR}, 24:1--113, 2023.
+
+\bibitem{hoffmann2022training}
+J.~Hoffmann, S.~Borgeaud, A.~Mensch, et al.
+\newblock Training compute-optimal large language models.
+\newblock In \emph{NeurIPS}, 2022.
 
 \end{thebibliography}
 
