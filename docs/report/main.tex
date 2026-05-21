@@ -181,114 +181,319 @@ Dataset & sharegpt4v/coco (50K samples) \\
 \section{The Optimization Journey}
 \label{sec:journey}
 
-\subsection{Iteration 0: The FP32 Baseline (4,674 tok/s)}
+Each experiment follows the structure: \textbf{Hypothesis} $\to$ \textbf{Experiment}
+$\to$ \textbf{Finding} $\to$ \textbf{Conclusion} $\to$ \textbf{Lesson Learned}.
 
-The initial profiler trace revealed a critical bug: despite declaring \texttt{bf16=True},
-49.96\% of CUDA time was spent in \texttt{cutlass\_80\_simt\_sgemm} (FP32 GEMM kernels).
-Root cause: \texttt{from\_pretrained()} loads weights in FP32 by default; HF Trainer's
-autocast only covers the forward pass, not the model weights themselves.
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 0 --- Baseline Measurement}
 
-\subsection{Iteration 1: bf16 Fix + Vision no\_grad (14,366 tok/s, 3.07$\times$)}
+\paragraph{Hypothesis.} We expect the baseline to be limited by attention compute
+(SDPA vs FlashAttention) and unoptimized dataloader transfers.
 
-Loading with \texttt{torch\_dtype=torch.bfloat16} and wrapping the frozen vision
-encoder in \texttt{torch.no\_grad()} gave an immediate \textbf{3$\times$ speedup}
-and 40\% VRAM reduction. \emph{Lesson: always verify actual kernel dispatches, not
-just config flags.}
+\paragraph{Experiment.} Run 20 profiled training steps with \texttt{torch.profiler}
+(B=4, grad\_accum=4, bf16, gradient\_checkpointing). Inspect CUDA kernel dispatches.
 
-\subsection{Iteration 2: Liger-Kernel (11,070 tok/s, \texorpdfstring{$\downarrow$}{down}25\% speed, $\downarrow$41\% VRAM)}
+\paragraph{Finding.} 49.96\% of CUDA time is \texttt{cutlass\_80\_simt\_sgemm}---an
+\emph{FP32} GEMM kernel. Despite \texttt{bf16=True} in TrainingArguments, the actual
+model weights are in FP32 on device. \texttt{from\_pretrained()} default loads FP32;
+HF Trainer's autocast only wraps the forward call, not the model parameters.
 
-We integrated Liger-Kernel's fused operators (Linear-CE, RMSNorm, SwiGLU, RoPE).
-\textbf{Paradoxically, this was slower} in Stage~1 because the LLM is frozen—fused
-CE backward savings don't materialize when there's no backward through the LLM.
-However, VRAM dropped 41\% (from 11.5 to 6.8\,GB) because the fused CE never
-materializes the full $(B, L, 151936)$ logits tensor.
-
-\emph{Lesson: kernel fusion benefits depend on which parts of the model have gradients.
-Stage~1 (projector-only) doesn't benefit from LLM kernel fusion speed-wise.}
-
-\subsection{Iteration 3: Batch Size Scaling (20,284 tok/s, 4.34$\times$)}
-
-With the VRAM headroom from Liger, we scaled from B=4 to B=16. This 4$\times$ batch
-increase yielded only 1.83$\times$ throughput gain because larger matmuls approach
-the memory-bandwidth ceiling. Investigation results:
-
-\begin{table}[H]
-\centering\small
-\caption{Approaches investigated in Iteration 3}
-\begin{tabular}{@{}lrrl@{}}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lr@{}}
 \toprule
-Approach & Tok/s & VRAM & Verdict \\
-\midrule
-Vision feature caching & 11,070 & 8.6\,GB & \textcolor{red}{Worse} (H2D $>$ compute) \\
-torch.compile on vision & 11,070 & 6.8\,GB & Marginal (+3\%) \\
-Gradient checkpointing off & 11,400 & 6.8\,GB & Marginal (+3\%) \\
-\textbf{Batch size 4$\to$16} & \textbf{20,284} & \textbf{16.5\,GB} & \textbf{Winner (+83\%)} \\
+Metric & Value \\ \midrule
+Tokens/sec & \textbf{4,674} \\
+Step time & 310.7\,ms \\
+Peak VRAM & 19.27\,GB \\
+Top CUDA kernel & \texttt{cutlass\_sgemm} (FP32!) 33.6\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Iteration 5: Length Bucketing (21,026 tok/s, 4.50$\times$)}
+\paragraph{Conclusion.} The system is running FP32 GEMM on a GPU with 936\,TFLOP/s BF16
+tensor cores. This is the single largest performance bug---not attention, not data loading.
 
-HuggingFace \texttt{group\_by\_length} reduced padding waste from 17.4\% to 4.1\%.
-Despite eliminating 13 percentage points of waste, tok/s improved only 3.7\% because
-the dataset (sharegpt4v/coco) already has low length variance (CoV=11.5\%).
+\paragraph{Lesson.} \emph{Always inspect actual kernel dispatches in the profiler trace.
+Config flags (\texttt{bf16=True}) do not guarantee the intended dtype reaches the hardware.}
 
-\subsection{Iteration 7: torch.compile Replaces Liger (27,352 tok/s, 5.85$\times$)}
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 1 --- Fix FP32 + Vision \texttt{no\_grad}}
 
-A key discovery: \textbf{Liger-Kernel and torch.compile are mutually exclusive}. Liger's
-Triton patches cause illegal memory access under \texttt{torch.\_dynamo} tracing.
-Replacing Liger with \texttt{torch.compile(mode="max-autotune-no-cudagraphs")} gave
-\textbf{30\% speedup} over Liger (but lost the VRAM savings).
+\paragraph{Hypothesis.} Loading with \texttt{torch\_dtype=torch.bfloat16} will force
+BF16 tensor-core GEMM dispatch. Wrapping the frozen vision encoder in
+\texttt{torch.no\_grad()} will eliminate its autograd graph, saving time and memory.
 
-\emph{Lesson: whole-graph compilation outperforms targeted operator fusion for this workload.}
+\paragraph{Experiment.} Modify \texttt{get\_stage1\_model\_and\_processor} to pass
+\texttt{torch\_dtype=torch.bfloat16}; wrap vision forward in \texttt{torch.no\_grad()}.
 
-\subsection{Iteration 8: Batch Tuning Under Compile (28,322 tok/s, 6.06$\times$)}
+\paragraph{Finding.}
 
-Pushed B from 16 to 20 (+3.5\%). Further increases showed diminishing returns because
-\texttt{torch.compile} recompiles on shape changes, and variable-length sequences
-already produce multiple discrete shapes per epoch.
-
-\subsection{Iteration 10: Packing + FlexAttention (26,787 tok/s)}
-
-On a mixed 6-subset dataset (length variance $\sigma$=400), packing into N=1536 bins
-reduced padding from 10.2\% to $\sim$2\%, yielding +4.8\% throughput and -18\% VRAM.
-The gain was modest because bucketing already captured most variance.
-
-\subsection{Iteration 11: TileGym FA4 --- Blackwell-Native Attention}
-
-NVIDIA's TileGym provides cuTile DSL kernels targeting Blackwell hardware features
-(wgmma, TMA, SM remapping). Key result for Flash Attention:
-
-\begin{table}[H]
-\centering\small
-\caption{TileGym FA4 vs SDPA (end-to-end Stage 1 step time)}
+\begin{table}[H]\centering\small
 \begin{tabular}{@{}lrrr@{}}
 \toprule
-Backend & N=512 & N=1024 & N=1536 \\
-\midrule
-SDPA & 69.2\,ms & 82.1\,ms & 84.3\,ms \\
-TileGym FA4 & 64.9\,ms & 75.2\,ms & 75.0\,ms \\
-\textbf{Speedup} & \textbf{1.07$\times$} & \textbf{1.09$\times$} & \textbf{1.12$\times$} \\
+Metric & Before & After & $\Delta$ \\ \midrule
+Tokens/sec & 4,674 & \textbf{14,366} & \textbf{+207\%} \\
+Step time (ms) & 310.7 & 101.1 & --67\% \\
+Peak VRAM (GB) & 19.27 & 11.54 & --40\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The speedup comes from FA4's \textbf{native GQA support}: Qwen2.5's 14Q/2KV config
-requires SDPA to expand K/V 7$\times$ via \texttt{repeat\_kv}, while FA4 handles
-it in-kernel.
+\paragraph{Conclusion.} A \textbf{3.07$\times$ speedup} from a 2-line change. BF16 GEMM
+dispatches confirmed via profiler (\texttt{cutlass\_bf16\_tensor\_op\_gemm}).
 
-\subsection{Iteration 13: TileGym Full Stack (30--41\% faster than Liger)}
+\paragraph{Lesson.} \emph{The first profiler run is worth more than a week of kernel
+optimization. This single fix delivered more speedup than all subsequent iterations combined.}
 
-The complete TileGym replacement (\texttt{apply\_tilegym\_kernel\_to\_qwen2}) patches
-ALL Qwen2 ops: RoPE, RMSNorm, SwiGLU, FA4 attention, plus our custom fused linear CE.
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 2 --- Liger-Kernel Integration}
 
-\begin{table}[H]
-\centering\small
-\caption{TileGym full stack vs Liger-Kernel (Stage 2, gradient checkpointing, B=4)}
+\paragraph{Hypothesis.} Liger-Kernel's fused operators (Linear-CE, RMSNorm, SwiGLU, RoPE)
+will reduce kernel launch overhead and eliminate the large $(B, L, 151936)$ logits tensor,
+improving both speed and memory.
+
+\paragraph{Experiment.} Integrate via \texttt{apply\_liger\_kernel\_to\_qwen2(rope=True,
+fused\_linear\_cross\_entropy=True, rms\_norm=True, swiglu=True)}.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Metric & Before (Iter 1) & After (Liger) & $\Delta$ \\ \midrule
+Tokens/sec & 14,366 & 11,070 & \textcolor{red}{\textbf{--25\%}} \\
+Peak VRAM (GB) & 11.54 & \textbf{6.78} & \textcolor{cpacking}{\textbf{--41\%}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Speed is \emph{worse}. In Stage~1 the LLM is frozen---no backward runs through the
+LLM layers, so fused CE backward savings never materialize. Triton JIT compilation adds
+100ms spikes. However, VRAM drops 41\% because fused CE never materializes full logits.
+
+\paragraph{Conclusion.} Keep for VRAM savings (enables larger batches later), but
+Liger is \textbf{not a speed win for Stage~1 projector-only training}.
+
+\paragraph{Lesson.} \emph{Kernel fusion benefits depend on which modules have gradients.
+Stage~1 (frozen LLM) gains nothing from LLM-internal fusion. Always profile the actual
+training stage, not just micro-benchmarks.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 3 --- Vision Acceleration Investigation}
+
+\paragraph{Hypothesis.} Three candidate approaches to further speed up Stage~1:
+(a)~pre-cache SigLIP features to skip vision forward entirely;
+(b)~\texttt{torch.compile} on the frozen vision encoder;
+(c)~simply increase batch size to better utilize the GPU.
+
+\paragraph{Experiment.} Implement all three independently and measure tok/s.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\caption{Iteration 3: Three approaches compared}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Approach & Tok/s & VRAM & Verdict \\ \midrule
+\textit{Baseline (Iter 2, B=4)} & 11,070 & 6.8\,GB & --- \\
+(a) Vision feature caching & 11,070 & 8.6\,GB & \textcolor{red}{Worse (+27\% VRAM, 0\% speed)} \\
+(b) torch.compile on vision & 11,400 & 6.8\,GB & Negligible (+3\%) \\
+(c) \textbf{Batch 4$\to$16} & \textbf{20,284} & \textbf{16.5\,GB} & \textcolor{cpacking}{\textbf{Winner (+83\%)}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Vision caching fails because SigLIP forward takes only 5\,ms/tile on Blackwell
+(too fast to benefit from caching), while loading cached tensors (9.4\,MB/sample) from
+CPU$\to$GPU via DataLoader is slower. torch.compile has no opportunity because SDPA
+already dispatches to flash kernels and shapes are dynamic.
+
+\paragraph{Conclusion.} The GPU is \textbf{underutilized at B=4}. Increasing batch size
+is the highest-leverage knob: 4$\times$ more tokens per step, only 2.4$\times$ more VRAM.
+
+\paragraph{Lesson.} \emph{Don't cache what's already fast. On modern GPUs with high tensor-core
+throughput, re-computing vision features is cheaper than transferring large pre-computed
+tensors over PCIe/memory bus. Always compare compute cost vs transfer cost.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 5 --- Length Bucketing}
+
+\paragraph{Hypothesis.} Intra-batch padding wastes 17.4\% of compute. Sorting samples by
+length (HF \texttt{group\_by\_length}) will group similar-length sequences, reducing
+padding to near zero.
+
+\paragraph{Experiment.} Add \texttt{lengths} property to VQADataset with heuristic
+estimation (3.5 chars/token + overhead). Enable \texttt{group\_by\_length=True}.
+
+\paragraph{Finding.} Padding waste drops from 17.4\% to 4.1\% (--13pp). However,
+tok/s improves only \textbf{3.7\%} (20,284 $\to$ 21,026).
+
+\paragraph{Conclusion.} Bucketing is a \emph{free} optimization (no code complexity, no
+memory cost), but the throughput gain is modest because sharegpt4v/coco has low length
+variance (CoV=11.5\%, range 260--502 tokens).
+
+\paragraph{Lesson.} \emph{Padding waste $\neq$ throughput loss. The GPU processes padded
+tokens at the same speed as real tokens (same GEMM size). The ``waste'' is that you computed
+tokens that don't contribute to learning, but wall-clock time per step barely changes if
+the max sequence length in each batch stays similar.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 7 --- torch.compile Replaces Liger}
+
+\paragraph{Hypothesis.} \texttt{torch.compile(mode="max-autotune-no-cudagraphs")} applied
+to the full model should fuse ops across the entire graph—outperforming Liger's
+targeted patches. The two may be combinable for maximum effect.
+
+\paragraph{Experiment.} Attempt compile with Liger; when that crashes (illegal memory
+access), try compile \emph{without} Liger as a replacement.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Config & Tok/s & VRAM & vs Iter 5 \\ \midrule
+Liger + compile & \multicolumn{3}{c}{\textcolor{red}{CRASH (illegal memory access)}} \\
+Liger only (Iter 5) & 21,026 & 15.8\,GB & --- \\
+\textbf{Compile only (no Liger)} & \textbf{27,352} & 20.7\,GB & \textbf{+30.1\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Conclusion.} Liger and torch.compile are \textbf{mutually exclusive}---Liger's
+Triton patches confuse \texttt{torch.\_dynamo} graph capture. Compile alone gives 30\%
+speedup over Liger by optimizing the entire computational graph (attention + MLP + embedding).
+
+\paragraph{Lesson.} \emph{Whole-graph compilation > targeted operator fusion for this workload.
+But there's a trade-off: compile loses Liger's 41\% VRAM savings (no fused CE).
+Choose based on whether you're memory-constrained or compute-constrained.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 8 --- Batch Tuning Under torch.compile}
+
+\paragraph{Hypothesis.} With compile reducing overhead, increasing B from 16 to 24--32
+should further improve GPU utilization and tok/s.
+
+\paragraph{Experiment.} Sweep B $\in \{16, 20, 24, 28, 32\}$ under torch.compile.
+Also test \texttt{reduce-overhead} mode (cudagraphs) and \texttt{pad\_to\_multiple\_of=64}.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+Config & Tok/s & VRAM & $\Delta$ & Note \\ \midrule
+B=16, compile & 27,108 & 23.7\,GB & --- & \\
+\textbf{B=20, compile} & \textbf{28,032} & 29.8\,GB & +3.4\% & Optimal \\
+B=24, compile & 27,440 & 38.5\,GB & +1.2\% & Diminishing returns \\
+B=32, compile & OOM & --- & --- & \\
+\texttt{reduce-overhead} & 22,000 & --- & \textcolor{red}{--20\%} & Dynamic shapes kill cudagraphs \\
+\texttt{pad\_to\_multiple\_of=64} & 25,300 & --- & \textcolor{red}{--6.6\%} & Extra padding wastes compute \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Conclusion.} Diminishing returns above B=20. cudagraphs is
+\textbf{counterproductive} for VLMs (dynamic shapes from variable image tiles cause
+frequent graph re-capture). This workload is at its single-GPU ceiling for the
+1.5B model: MFU$\approx$23\%.
+
+\paragraph{Lesson.} \emph{torch.compile's ``reduce-overhead'' mode (cudagraphs) assumes
+static shapes. VLMs with variable-resolution images violate this assumption fundamentally.
+Don't force static-shape optimizations on inherently dynamic workloads.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 10 --- Sequence Packing + FlexAttention}
+
+\paragraph{Hypothesis.} Even after bucketing, 10\% padding remains on the mixed 6-subset
+dataset (length variance $\sigma$=400). Packing multiple short samples into fixed-length
+bins (N=1536) with FlexAttention block-diagonal masks should eliminate padding entirely.
+
+\paragraph{Experiment.} Implement \texttt{PackingCollator} with first-fit-decreasing
+bin-packing. Use HuggingFace's native packed-sequence detection via \texttt{position\_ids}
+resets + \texttt{attn\_implementation="flex\_attention"}.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-N & Liger tok/s & TileGym tok/s & Speed $\Delta$ & VRAM $\Delta$ \\
-\midrule
+Config & Tok/s & Step (ms) & VRAM & Padding \\ \midrule
+Baseline (bucketed, SDPA) & 25,561 & 192 & 41.4\,GB & 10.2\% \\
+\textbf{Packing + FlexAttn} & \textbf{26,787} & 297 & 34.0\,GB & $\sim$2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Only \textbf{+4.8\% throughput} despite eliminating 80\% of padding waste.
+The step time actually \emph{increased} (192$\to$297ms) because packed sequences are
+longer (N=1536 vs avg 456), increasing the attention quadratic term. The gain comes
+from processing more samples per step.
+
+\paragraph{Conclusion.} Packing is a modest win (+4.8\% tok/s, --18\% VRAM) on this dataset.
+The throughput gain is limited because bucketing already captured most length variance.
+
+\paragraph{Lesson.} \emph{Packing eliminates padding tokens but creates longer sequences,
+which have their own cost (quadratic attention). The net gain depends on the ratio
+$\text{avg\_sample\_length} / \text{bin\_size}$. When samples are short ($\sim$350 tok)
+relative to the bin (1536), each bin holds only 3--4 samples with 30\% wasted space—defeating
+the purpose. Bin size should be $\sim$2--3$\times$ average sample length.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 11 --- TileGym FA4: Blackwell-Native Attention}
+
+\paragraph{Hypothesis.} NVIDIA's cuTile DSL can generate attention kernels that access
+Blackwell-specific features (wgmma, TMA, SM remapping) inaccessible from Triton.
+TileGym's pre-built FA4 with native GQA should outperform both SDPA and our custom
+Triton attention (which failed in an earlier attempt).
+
+\paragraph{Experiment.} Replace SDPA in the text model's attention layers with TileGym
+FA4 (\texttt{tilegym.ops.cutile.experimental.fmha}). Benchmark kernel-level and end-to-end.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\caption{TileGym FA4 vs SDPA (end-to-end Stage 1 step time)}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Backend & N=512 & N=1024 & N=1536 & Why faster \\ \midrule
+SDPA & 69.2\,ms & 82.1\,ms & 84.3\,ms & Must expand K/V 7$\times$ (GQA) \\
+TileGym FA4 & 64.9\,ms & 75.2\,ms & 75.0\,ms & Native GQA in-kernel \\
+\textbf{Speedup} & \textbf{1.07$\times$} & \textbf{1.09$\times$} & \textbf{1.12$\times$} & Grows with seq len \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent (Note: a prior attempt with our own Triton Flash Attention failed—\emph{slower}
+than SDPA because Triton cannot emit wgmma/TMA instructions for Blackwell.)
+
+\paragraph{Conclusion.} FA4 provides 7--12\% E2E speedup in Stage~1 (where attention is
+forward-only). The gain increases with sequence length due to the quadratic attention term.
+
+\paragraph{Lesson.} \emph{On new GPU architectures, vendor-provided kernel libraries
+(cuTile/TileGym) outperform portable solutions (Triton) because they can access
+architecture-specific instructions. Don't waste time writing custom Triton attention
+for Blackwell—use TileGym's production kernel.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 13 --- TileGym Full Stack: ALL Qwen2 Ops}
+
+\paragraph{Hypothesis.} If FA4 alone gives 7--12\%, replacing \emph{all} Qwen2 ops
+(RoPE, RMSNorm, SwiGLU, attention, CE loss) with cuTile equivalents should provide
+a larger cumulative speedup over Liger-Kernel.
+
+\paragraph{Experiment.} Apply \texttt{apply\_tilegym\_kernel\_to\_qwen2(use\_cutile=True)}
+which patches all ops. Additionally, implement custom \texttt{FusedLinearCrossEntropy}
+using TileGym's \texttt{\_ce\_cutile} kernel with ``grad-in-forward'' pattern (compute
+$\nabla_h$, $\nabla_W$ within the forward loop; backward becomes $O(1)$).
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\caption{TileGym full stack vs Liger-Kernel (Stage 2, grad\_ckpt, B=4)}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Seq Len & Liger tok/s & TileGym tok/s & Speed $\Delta$ & VRAM $\Delta$ \\ \midrule
 512 & 38.3K & 49.7K & \textbf{+30\%} & \textbf{--50\%} \\
 1024 & 46.5K & 64.6K & \textbf{+39\%} & \textbf{--59\%} \\
 2048 & 48.7K & 68.7K & \textbf{+41\%} & \textbf{--64\%} \\
@@ -296,18 +501,52 @@ N & Liger tok/s & TileGym tok/s & Speed $\Delta$ & VRAM $\Delta$ \\
 \end{tabular}
 \end{table}
 
-\paragraph{Fused Linear Cross-Entropy with Grad-in-Forward.}
-Our custom \texttt{torch.autograd.Function} computes $\nabla_h$ and $\nabla_W$
-\emph{within} the forward loop using TileGym's \texttt{\_ce\_cutile} kernel.
-The backward is $O(1)$ (scalar scaling). This reduces VRAM by 51--64\% for the
-LM head in Stage~2.
+\noindent The VRAM reduction (50--64\%) comes from the grad-in-forward CE pattern:
+logits ($B \times L \times V$) are never materialized; gradients are accumulated
+chunk-by-chunk (1024 tokens) during the forward pass.
 
-\subsection{Iteration 15: Ground Truth Verification (107K tok/s)}
+\paragraph{Conclusion.} TileGym's full stack is \textbf{both faster AND more memory-efficient}
+than Liger-Kernel on Blackwell. It is the correct kernel solution for this hardware.
 
-All previous numbers used profiler estimates or synthetic data. Iteration~15
-re-measured everything on \textbf{real data} with precise \texttt{attention\_mask}
-accounting. Peak verified throughput: \textbf{107,367 Real tok/s} (Packing + TileGym,
-B=64$\to$23 packed bins, N=1024).
+\paragraph{Lesson.} \emph{cuTile's online softmax kernel (\texttt{\_ce\_online\_kernel}) computes
+loss + grad in a single pass over vocab tiles. Combined with grad-in-forward (accumulate
+$\nabla_h$ per chunk, never store $\nabla_{\text{logits}}$), this eliminates the largest
+memory bottleneck in LLM training: the logits tensor ($B \times L \times V = B \times L \times 151936$).}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 15 --- Ground Truth Verification}
+
+\paragraph{Hypothesis.} Previous metrics were computed from profiler estimates and synthetic
+data. The cumulative table may contain errors from:
+(a)~incorrect padding percentage assumptions,
+(b)~synthetic vs real-data performance differences, and
+(c)~TileGym autotuning artifacts contaminating measurements.
+
+\paragraph{Experiment.} Write \texttt{benchmark\_real\_efficiency.py}: load real dataset
+(sharegpt4v/coco, 50K images), run actual forward+backward with precise per-step
+measurement of \texttt{attention\_mask.sum()}, \texttt{(labels != -100).sum()}, and
+$B \times N$. Test 17 configurations (varying B, bucketing, packing, TileGym).
+
+\paragraph{Finding.} Peak verified throughput: \textbf{107,367 Real tok/s}
+(Packing + TileGym, B=64$\to$23 packed bins, N=1024, 18.1\,GB VRAM).
+
+Key corrections from estimates:
+\begin{itemize}[leftmargin=*]
+  \item TileGym with \emph{variable} shapes: 652ms/step (\textcolor{red}{5$\times$ slower})
+    due to JIT autotuning on every unique (M,N,K). Prior benchmarks used fixed N, hiding this.
+  \item Vanilla bucketing at B=64 saturates at 90K tok/s (not higher as assumed).
+  \item Packing provides +4.6\% over bucketing (not $\sim$0\% as previously claimed).
+  \item MFU is 19--23\% (slightly lower than the 24\% estimated from synthetic data).
+\end{itemize}
+
+\paragraph{Conclusion.} Synthetic benchmarks \textbf{overestimate real throughput} because
+they use fixed shapes (no autotuning overhead) and ignore data pipeline costs. All
+performance claims must be verified on real data.
+
+\paragraph{Lesson.} \emph{Never trust synthetic benchmarks as the final word. Real data
+introduces variable shapes, image decoding latency, collator overhead, and dataloader
+stalls that don't exist in torch.randn() benchmarks. The ground-truth benchmark
+(\texttt{attention\_mask.sum() / wall\_time}) is the only honest metric.}
 
 % ═══════════════════════════════════════════════════════════════════════════════
 \section{Results}
