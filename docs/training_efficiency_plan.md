@@ -1001,52 +1001,62 @@ gradient_accumulation_steps = 1     # already large effective batch
 ### Cumulative Optimization Results
 
 **Metric definitions**:
-- **GPU tok/s**: All non-padding tokens processed by the model per second (`attention_mask.sum() / time`).
-  This measures hardware utilization — every token (system prompt, question, answer) goes through
-  the full forward/backward pass.
-- **Eff. tok/s**: Only tokens that produce a training loss (`labels != -100`) per second.
-  This is the true training speed — how fast the model is learning.
-- **Loss ratio**: fraction of real tokens that contribute to loss (dataset-dependent, measured empirically).
+- **Real tok/s**: Non-padding tokens processed per second (`attention_mask.sum() / time`).
+  Every non-padding token (system prompt, question, answer, image placeholder) goes through
+  the full forward/backward pass. This is the primary metric for engineering optimization.
+- **Speedup**: Real tok/s relative to Iter 0 baseline.
+- **Step (ms)**: Wall-clock time for one full training step (forward + backward + optimizer).
+- **VRAM**: Peak GPU memory during training step.
 
-| Iter | Optimization | GPU tok/s | Eff. tok/s ² | Step (ms) | VRAM | Speedup |
+Note: The old "Eff. tok/s" column (= Real tok/s × loss_ratio) has been removed. Loss_ratio
+is a dataset property (~0.529 for sharegpt4v/coco, ~0.589 for mixed) that doesn't change
+with engineering optimization — it's just a constant multiplier that obscured the real gains.
+
+| Iter | Optimization | Real tok/s | Step (ms) | VRAM | Speedup | Config |
 |---|---|---|---|---|---|---|
-| 0 | Baseline (FP32 bug) | 4,674 | 2,473 | 310.7 | 19.27 GB | 1.0x |
-| 1 | FP32 dtype fix + vision no_grad | 14,366 | 7,600 | 101.1 | 11.54 GB | 3.07x |
-| 2 | Liger-Kernel (fused CE + RMSNorm + SwiGLU) | 11,070 | 5,856 | 135.4 | 6.78 GB | 2.37x |
-| 3 | Batch size 4 → 16 | 20,284 | 10,730 | 282.9 | 16.49 GB | 4.34x |
-| 4 | DataLoader tuning | — | — | — | — | (no gain) |
-| 5 | Length bucketing (group_by_length) | 21,026 | 11,123 | 270.6 | 15.79 GB | 4.50x |
-| 6 | Sample packing (4D mask) | — | — | — | — | (−54%) |
-| 7 | torch.compile (replaces Liger) | 27,352 | 14,469 | 203.9 | 20.73 GB | 5.85x |
-| 8 | Batch size 16→20 + compile | 28,322 | 14,982 | 252.9 | 29.09 GB | 6.06x |
-| 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 15,777 | 297 | 34.0 GB | 6.38x |
-| 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 16,701 | 64.9 | 2.39 GB | 6.75x |
-| 13 | TileGym full stack + cuTile CE ³ | 52,974 | 28,023 | 40.8 | 5.63 GB | 11.33x |
-| **14** | **Batch scaling (B=768, N=1024) ⁴** | **74,774** | **39,561** | **10,518** | **75.98 GB** | **16.0x** |
+| 0 | Baseline (FP32 bug) | 4,674 | 310.7 | 19.27 GB | 1.0x | B=4, real data |
+| 1 | FP32 dtype fix + vision no_grad | 14,366 | 101.1 | 11.54 GB | 3.07x | B=4, real data |
+| 2 | Liger-Kernel (fused CE + RMSNorm + SwiGLU) | 11,070 | 135.4 | 6.78 GB | 2.37x | B=4, real data |
+| 3 | Batch size 4 → 16 | 20,284 | 282.9 | 16.49 GB | 4.34x | B=16, real data |
+| 4 | DataLoader tuning | — | — | — | (no gain) | |
+| 5 | Length bucketing (group_by_length) | 21,026 | 270.6 | 15.79 GB | 4.50x | B=16, bucketed |
+| 6 | Sample packing (4D mask) | — | — | — | (−54%) | |
+| 7 | torch.compile (replaces Liger) | 27,352 | 203.9 | 20.73 GB | 5.85x | B=16, compile |
+| 8 | Batch size 16→20 + compile | 28,322 | 252.9 | 29.09 GB | 6.06x | B=20, compile |
+| 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 297 | 34.0 GB | 5.73x | B=16, packed, mixed |
+| 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 64.9 | 2.39 GB | 6.76x | B=4, N=512 |
+| 13 | TileGym full stack + cuTile CE ² | 52,974 | 40.8 | 5.63 GB | 11.33x | B=4, real data |
+| **14** | **Batch scaling (Stage 2) ³** | **74,774** | **10,518** | **75.98 GB** | **16.0x** | **B=768, N=1024** |
 
-² Loss ratio: single-subset (sharegpt4v/coco) = 0.529; mixed-data (6 subsets) = 0.589.
-  Eff. tok/s = GPU tok/s × loss_ratio for the respective dataset.
+¹ Iter 10 measured on mixed-data (6 subsets). Packing eliminated padding waste but FlexAttention
+  compilation overhead partially offset the gain. Net result: −18% VRAM, similar throughput.
 
-³ Iter 13 measured on real sharegpt4v/coco pipeline (B=4, variable lengths, avg ~540 tok/sample).
-  Peak synthetic throughput: Stage 1 = 100.3K tok/s (B=4, N=1024); Stage 2 = 76.5K tok/s
-  (B=32, N=1024, grad_ckpt, AdamW). The cuTile CE + grad-in-forward pattern reduced Stage 2
-  VRAM by 64% (14.47 → 5.27 GB).
+² Iter 13 measured on real sharegpt4v/coco pipeline (B=4, avg ~540 tok/sample).
+  Peak synthetic: Stage 1 = 100.3K tok/s; Stage 2 = 76.5K tok/s (B=32, N=1024, grad_ckpt).
 
-⁴ Iter 14 measured on synthetic data (B=768, N=1024, Stage 2 unfrozen + grad_ckpt + AdamW).
-  Throughput is B-independent (~74K tok/s at any B from 32 to 768) — GPU compute was already
-  fully saturated. FlashAdamW adds 0.4 GB savings; gradient_release enables B=832 max.
+³ Iter 14: Stage 2 (unfrozen + grad_ckpt + AdamW), synthetic N=1024 (zero padding).
+  Throughput is B-independent (~74K tok/s). GPU compute fully saturated at B=32.
 
-¹ Iter 10 measured on mixed-data (6 subsets, high length variance) whereas Iters 0–8 used
-single-subset (sharegpt4v/coco). On the mixed dataset, the answers are proportionally longer
-(loss_ratio=0.589 vs 0.529), so the effective training speed is higher than the GPU tok/s
-change alone would suggest:
-- Mixed baseline (bucketed, SDPA): GPU=25,561, Eff.=15,873
-- Mixed packing (FlexAttention):   GPU=26,787, Eff.=15,777
-- Apples-to-apples effective speedup on mixed: ~same throughput but −18% VRAM
+### Packing Efficiency Analysis
 
-**Cumulative speedup** is computed as Eff. tok/s relative to Iter 0 (2,473).
-The jump from Iter 8 → Iter 10 reflects switching to the mixed dataset (which has higher
-loss density) rather than pure engineering optimization.
+Why packing shows minimal improvement:
+
+| Scenario | Padding waste | Packing gain | Explanation |
+|---|---|---|---|
+| B=768, bucketed, sharegpt4v/coco (avg=540) | ~5% | +5% | Bucketing already groups similar lengths |
+| B=768, packed, N=1024 | ~3% | — | Packing efficiency 95-97% |
+| B=384, bucketed, mixed (avg=680, σ=400) | ~10% | +10% | Higher variance = more padding |
+| B=16, bucketed (original config) | ~7% | +7% | Small batch has less padding diversity |
+
+**Key insight**: At B=768 with `group_by_length`, all 768 samples in a batch already have
+nearly identical lengths (bucketing is very effective at large B). The remaining 5% padding
+waste is the only thing packing can eliminate — a marginal gain.
+
+**When packing IS valuable**:
+- High length variance datasets (mixed data with 100–5000 token sequences)
+- Small batch sizes (where bucketing has fewer similar-length candidates)
+- When packing enables longer effective sequences (e.g. multi-turn dialogue)
+- Distributed training where gradient sync overhead is per-step (packing reduces steps/epoch)
 
 ### MFU (Model FLOPs Utilization) Analysis
 
