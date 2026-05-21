@@ -1012,30 +1012,38 @@ Note: The old "Eff. tok/s" column (= Real tok/s × loss_ratio) has been removed.
 is a dataset property (~0.529 for sharegpt4v/coco, ~0.589 for mixed) that doesn't change
 with engineering optimization — it's just a constant multiplier that obscured the real gains.
 
-| Iter | Optimization | Real tok/s | Step (ms) | VRAM | Speedup | Config |
-|---|---|---|---|---|---|---|
-| 0 | Baseline (FP32 bug) | 4,674 | 310.7 | 19.27 GB | 1.0x | B=4, real data |
-| 1 | FP32 dtype fix + vision no_grad | 14,366 | 101.1 | 11.54 GB | 3.07x | B=4, real data |
-| 2 | Liger-Kernel (fused CE + RMSNorm + SwiGLU) | 11,070 | 135.4 | 6.78 GB | 2.37x | B=4, real data |
-| 3 | Batch size 4 → 16 | 20,284 | 282.9 | 16.49 GB | 4.34x | B=16, real data |
-| 4 | DataLoader tuning | — | — | — | (no gain) | |
-| 5 | Length bucketing (group_by_length) | 21,026 | 270.6 | 15.79 GB | 4.50x | B=16, bucketed |
-| 6 | Sample packing (4D mask) | — | — | — | (−54%) | |
-| 7 | torch.compile (replaces Liger) | 27,352 | 203.9 | 20.73 GB | 5.85x | B=16, compile |
-| 8 | Batch size 16→20 + compile | 28,322 | 252.9 | 29.09 GB | 6.06x | B=20, compile |
-| 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 297 | 34.0 GB | 5.73x | B=16, packed, mixed |
-| 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 64.9 | 2.39 GB | 6.76x | B=4, N=512 |
-| 13 | TileGym full stack + cuTile CE ² | 52,974 | 40.8 | 5.63 GB | 11.33x | B=4, real data |
-| **14** | **Batch scaling (Stage 2) ³** | **74,774** | **10,518** | **75.98 GB** | **16.0x** | **B=768, N=1024** |
+| Iter | Optimization | Real tok/s | Pos/s (hw) | Pad% | Step (ms) | VRAM | Speedup |
+|---|---|---|---|---|---|---|---|
+| 0 | Baseline (FP32 bug) | 4,674 | ~4,700 | ~1% | 310.7 | 19.27 GB | 1.0x |
+| 1 | bf16 fix + vision no_grad | 14,366 | ~14,400 | ~1% | 101.1 | 11.54 GB | 3.07x |
+| 2 | Liger-Kernel (fused CE+RMSNorm+SwiGLU) | 11,070 | ~11,100 | ~1% | 135.4 | 6.78 GB | 2.37x |
+| 3 | Batch 4→16 | 20,284 | 22,340 | 9.2% | 282.9 | 16.49 GB | 4.34x |
+| 5 | **Length bucketing** | 21,026 | 22,170 | **5.2%** | 270.6 | 15.79 GB | 4.50x |
+| 7 | torch.compile | 27,352 | 29,430 | 7.0% | 203.9 | 20.73 GB | 5.85x |
+| 8 | Batch 16→20 + compile | 28,322 | 30,050 | 5.8% | 252.9 | 29.09 GB | 6.06x |
+| 10 | **Packing** (FlexAttn, mixed) ¹ | 26,787 | 55,165 | **51%** | 297 | 34.0 GB | 5.73x |
+| 11 | TileGym FA4 | 31,581 | 31,560 | 0% | 64.9 | 2.39 GB | 6.76x |
+| 13 | TileGym full + cuTile CE ² | 52,974 | 54,900 | 3.5% | 40.8 | 5.63 GB | 11.33x |
+| **14** | **B=768, Stage 2 ³** | **74,774** | **74,770** | **0%** | **10,518** | **75.98 GB** | **16.0x** |
 
-¹ Iter 10 measured on mixed-data (6 subsets). Packing eliminated padding waste but FlexAttention
-  compilation overhead partially offset the gain. Net result: −18% VRAM, similar throughput.
+**Column definitions**:
+- **Real tok/s**: Non-padding tokens processed per second (`attention_mask.sum() / time`).
+  This is the TRUE effective throughput — every token counted here received full forward+backward compute.
+- **Pos/s (hw)**: Total positions processed per second (`B × N_padded / time`), including padding.
+  This is what the hardware actually computes.
+- **Pad%**: Fraction of GPU compute wasted on padding = `1 - Real/Pos`.
+- **Speedup**: Real tok/s relative to Iter 0.
 
-² Iter 13 measured on real sharegpt4v/coco pipeline (B=4, avg ~540 tok/sample).
-  Peak synthetic: Stage 1 = 100.3K tok/s; Stage 2 = 76.5K tok/s (B=32, N=1024, grad_ckpt).
+¹ Iter 10 packing (N=1024) had 51% wasted positions because avg sample = 356 tokens → only
+  ~2 samples fit per packed slot, leaving 312/1024 = 30% unfilled, plus FlexAttention overhead.
+  On the mixed dataset (high variance), packing efficiency was worse than expected.
+  **Lesson**: Packing only helps when `N / avg_sample_len` is close to an integer (tight fit).
 
-³ Iter 14: Stage 2 (unfrozen + grad_ckpt + AdamW), synthetic N=1024 (zero padding).
-  Throughput is B-independent (~74K tok/s). GPU compute fully saturated at B=32.
+² Iter 13 on real sharegpt4v/coco (B=4, avg ~540 tok/sample, dynamic padding to ~560).
+  Peak synthetic: Stage 1 = 100.3K; Stage 2 = 76.5K (B=32, N=1024, grad_ckpt).
+
+³ Iter 14: Stage 2, synthetic N=1024 (zero padding by construction).
+  Throughput B-independent (~74K). GPU fully saturated at MFU=24%.
 
 ### Packing Efficiency Analysis
 
