@@ -31,11 +31,19 @@
 }
 
 % ─── Custom colors ──────────────────────────────────────────────────────────
-\definecolor{vanilla}{HTML}{4C72B0}
-\definecolor{tilegym}{HTML}{DD8452}
-\definecolor{packing}{HTML}{55A868}
-\definecolor{packtilegym}{HTML}{C44E52}
+\definecolor{cvanilla}{HTML}{4C72B0}
+\definecolor{ctilegym}{HTML}{DD8452}
+\definecolor{cpacking}{HTML}{55A868}
+\definecolor{cpacktg}{HTML}{C44E52}
 \definecolor{lightgray}{HTML}{F5F5F5}
+
+% pgfplots styles
+\pgfplotsset{
+  vanilla/.style={color=cvanilla, draw=cvanilla},
+  tilegym/.style={color=ctilegym, draw=ctilegym},
+  packing/.style={color=cpacking, draw=cpacking},
+  packtilegym/.style={color=cpacktg, draw=cpacktg, fill=cpacktg},
+}
 
 % ─── Code listing style ─────────────────────────────────────────────────────
 \lstset{
@@ -126,7 +134,7 @@ We focus exclusively on engineering optimizations that preserve model quality
 
 \subsection{Hardware}
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Hardware configuration}
 \label{tab:hardware}
@@ -146,7 +154,7 @@ CUDA / Driver & CUDA 13.0, Driver 580.126 \\
 
 \subsection{Model Architecture}
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{SiQ-VL model configuration}
 \label{tab:model}
@@ -219,7 +227,7 @@ With random sampling, padding waste scales with batch size (18--20\% at B=32).
 \textbf{Length bucketing} (HuggingFace \texttt{group\_by\_length}) sorts samples
 by estimated token length, ensuring each batch contains similar-length sequences.
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -300,7 +308,7 @@ This reduces VRAM by 51--64\% for the LM head in Stage~2.
 
 \subsection{Throughput Scaling}
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -362,7 +370,7 @@ shows \emph{effective} packed batch size.}
 
 \subsection{Complete Results Table}
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Ground-truth measurements on real data (sharegpt4v/coco, 50K samples, Stage~1)}
 \label{tab:results}
@@ -391,7 +399,7 @@ Packing (N=1024) & 45 & 103,542 & 103,542 & 0.0 & 446.0 & 31.1\,GB \\
 
 \subsection{VRAM--Throughput Trade-off}
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -434,7 +442,7 @@ Packing (N=1024) & 45 & 103,542 & 103,542 & 0.0 & 446.0 & 31.1\,GB \\
   (3.16,58.096) (10.93,91.427) (18.12,107.367)
 };
 
-\node[anchor=south, packtilegym] at (axis cs:18.12,108) {\small\textbf{107K}};
+\node[anchor=south, color=cpacktg] at (axis cs:18.12,108) {\small\textbf{107K}};
 
 \end{axis}
 \end{tikzpicture}
@@ -446,7 +454,7 @@ Beyond 18\,GB, throughput saturates --- additional VRAM buys no improvement.}
 
 \subsection{MFU Analysis}
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -471,7 +479,7 @@ Beyond 18\,GB, throughput saturates --- additional VRAM buys no improvement.}
   nodes near coords style={font=\footnotesize},
   every node near coord/.append style={anchor=south},
 ]
-\addplot[fill=vanilla!70] coordinates {
+\addplot[fill=cvanilla!70, draw=cvanilla] coordinates {
   (1,12.3) (2,19.1) (3,19.3) (4,19.7) (5,21.9) (6,22.7)
 };
 \end{axis}
@@ -484,7 +492,7 @@ memory bandwidth, not by software overhead.}
 
 \subsection{Speedup Progression}
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -509,7 +517,7 @@ memory bandwidth, not by software overhead.}
   nodes near coords,
   nodes near coords style={font=\footnotesize, anchor=south},
 ]
-\addplot[color=vanilla, thick, mark=*, mark size=3] coordinates {
+\addplot[color=cvanilla, thick, mark=*, mark size=3] coordinates {
   (0,21.7) (1,57.0) (2,76.9) (3,90.3) (4,91.4) (5,94.5) (6,107.4)
 };
 
@@ -563,7 +571,7 @@ This makes TileGym \emph{counterproductive} without shape quantization.
 
 \subsection{Bucketing vs.\ Packing: A Nuanced Picture}
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Bucketing vs.\ Packing at similar VRAM ($\sim$17\,GB)}
 \label{tab:buck_vs_pack}
@@ -596,7 +604,7 @@ and is \emph{independent} of engineering choices.
 \section{Negative Results}
 \label{sec:negative}
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Failed optimizations and lessons learned}
 \label{tab:failures}
@@ -622,7 +630,7 @@ TileGym with variable shapes & 5$\times$ \emph{slower} & JIT autotuning on every
 Based on our measurements, the optimal training configuration for SiQ-VL on
 a single Blackwell GPU is:
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Recommended training recipe}
 \label{tab:recipe}
