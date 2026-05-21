@@ -916,6 +916,50 @@ materialized in Stage 1 where backward was never called.
 
 ---
 
+### Iteration 15 — Ground Truth Verification (Full Re-measurement)
+
+- **Date**: 2026-05-20
+- **Branch / Commit**: `main` @ HEAD
+- **Hypothesis**: Previous cumulative table contained estimated Pad% and Pos/s values.
+  Re-run ALL key configurations on real data with precise metric instrumentation.
+- **Change**:
+  - New script: `scripts/benchmark_real_efficiency.py`
+  - Measures `attention_mask.sum()`, `(labels != -100).sum()`, `B × N`, step time exactly
+- **How to Reproduce**:
+  ```bash
+  # Example: vanilla B=32 with bucketing
+  python scripts/benchmark_real_efficiency.py --stage 1 --batch_size 32 --use_bucketing
+  # TileGym with fixed shapes
+  python scripts/benchmark_real_efficiency.py --stage 1 --batch_size 32 --use_tilegym --pad_to_multiple_of 64 --use_bucketing --warmup 10
+  # Packing + TileGym (best config)
+  python scripts/benchmark_real_efficiency.py --stage 1 --batch_size 64 --use_packing --pack_max_length 1024 --use_tilegym --warmup 10
+  ```
+- **Measurement Setup**:
+  - GPU: 1 × RTX PRO 6000 Blackwell 96GB
+  - Model: SigLIP2-base-patch16-224 + Qwen2.5-0.5B-Instruct (Stage 1, projector only)
+  - Dataset: `sharegpt4v(coco)`, 50,017 samples, real images
+  - Each run: 10 measured steps after warmup (2-10 warmup depending on TileGym JIT)
+- **Result**: See "Cumulative Optimization Results (VERIFIED)" table in §4.1.
+- **Key Corrections from Previous Estimates**:
+  1. Bucketing B=64 Real tok/s is 90K (previously estimated higher)
+  2. Packing gives +4.6% over bucketing at same batch (not the ~0% claimed earlier)
+  3. TileGym at B=4 gives 58K (vs 53K in old Iter 13 — close but slightly higher)
+  4. TileGym CATASTROPHIC with variable shapes (650ms/step vs 115ms at fixed shapes)
+  5. Hardware ceiling confirmed at ~108K Pos/s (independent of config)
+- **Artifacts**:
+  - Trace: `docs/traces/iter_15_ground_truth_efficiency.json`
+  - Script: `scripts/benchmark_real_efficiency.py`
+- **Decision**: Keep — this is the new source of truth for the cumulative table.
+- **Lessons / Surprises**:
+  - TileGym's JIT autotuning is per-shape. Variable-length batches without `pad_to_multiple_of`
+    cause 4-5x slowdown. This was hidden in synthetic benchmarks that used fixed N.
+  - Bucketing at B=4 is SLOWER than no bucketing (16K vs 22K) because bucketed short sequences
+    underutilize the GPU more than having some padding with longer sequences.
+  - The system saturates at ~90K Real tok/s (vanilla) or ~107K (TileGym+packing) regardless
+    of batch size beyond B=64. VRAM scales linearly with B but throughput doesn't.
+
+---
+
 ### Iteration 14 — Batch-Size Scaling & Optimizer Memory (FlashOptim)
 
 - **Date**: 2026-05-20
@@ -998,73 +1042,90 @@ gradient_accumulation_steps = 1     # already large effective batch
 
 ## 4.1. Performance Summary & MFU Analysis
 
-### Cumulative Optimization Results
+### Cumulative Optimization Results (VERIFIED — Iteration 15)
 
-**Metric definitions**:
-- **Real tok/s**: Non-padding tokens processed per second (`attention_mask.sum() / time`).
-  Every non-padding token (system prompt, question, answer, image placeholder) goes through
-  the full forward/backward pass. This is the primary metric for engineering optimization.
-- **Speedup**: Real tok/s relative to Iter 0 baseline.
-- **Step (ms)**: Wall-clock time for one full training step (forward + backward + optimizer).
-- **VRAM**: Peak GPU memory during training step.
+All numbers below were re-measured end-to-end on real data (`sharegpt4v/coco`, 50K samples)
+using `scripts/benchmark_real_efficiency.py`. Raw traces at `docs/traces/iter_15_ground_truth_efficiency.json`.
 
-Note: The old "Eff. tok/s" column (= Real tok/s × loss_ratio) has been removed. Loss_ratio
-is a dataset property (~0.529 for sharegpt4v/coco, ~0.589 for mixed) that doesn't change
-with engineering optimization — it's just a constant multiplier that obscured the real gains.
+**Metric definitions** (all measured, not estimated):
+- **Real tok/s**: Non-padding tokens processed per second = `attention_mask.sum() / step_time`.
+- **Pos/s (hw)**: Total positions per second = `B × N_padded / step_time` (hardware throughput).
+- **Pad%**: Measured padding waste = `1 - sum(attention_mask) / (B × N)`.
+- **Loss%**: Tokens with gradient / real tokens = `(labels != -100).sum() / attention_mask.sum()`.
+- **Step (ms)**: Wall-clock time for full fwd+bwd+zero_grad, averaged over 10 measured steps.
+- **VRAM**: Peak GPU memory (torch.cuda.max_memory_allocated).
 
-| Iter | Optimization | Real tok/s | Pos/s (hw) | Pad% | Step (ms) | VRAM | Speedup |
-|---|---|---|---|---|---|---|---|
-| 0 | Baseline (FP32 bug) | 4,674 | ~4,700 | ~1% | 310.7 | 19.27 GB | 1.0x |
-| 1 | bf16 fix + vision no_grad | 14,366 | ~14,400 | ~1% | 101.1 | 11.54 GB | 3.07x |
-| 2 | Liger-Kernel (fused CE+RMSNorm+SwiGLU) | 11,070 | ~11,100 | ~1% | 135.4 | 6.78 GB | 2.37x |
-| 3 | Batch 4→16 | 20,284 | 22,340 | 9.2% | 282.9 | 16.49 GB | 4.34x |
-| 5 | **Length bucketing** | 21,026 | 22,170 | **5.2%** | 270.6 | 15.79 GB | 4.50x |
-| 7 | torch.compile | 27,352 | 29,430 | 7.0% | 203.9 | 20.73 GB | 5.85x |
-| 8 | Batch 16→20 + compile | 28,322 | 30,050 | 5.8% | 252.9 | 29.09 GB | 6.06x |
-| 10 | **Packing** (FlexAttn, mixed) ¹ | 26,787 | 55,165 | **51%** | 297 | 34.0 GB | 5.73x |
-| 11 | TileGym FA4 | 31,581 | 31,560 | 0% | 64.9 | 2.39 GB | 6.76x |
-| 13 | TileGym full + cuTile CE ² | 52,974 | 54,900 | 3.5% | 40.8 | 5.63 GB | 11.33x |
-| **14** | **B=768, Stage 2 ³** | **74,774** | **74,770** | **0%** | **10,518** | **75.98 GB** | **16.0x** |
+#### Stage 1 (Frozen LLM — only projector trains)
 
-**Column definitions**:
-- **Real tok/s**: Non-padding tokens processed per second (`attention_mask.sum() / time`).
-  This is the TRUE effective throughput — every token counted here received full forward+backward compute.
-- **Pos/s (hw)**: Total positions processed per second (`B × N_padded / time`), including padding.
-  This is what the hardware actually computes.
-- **Pad%**: Fraction of GPU compute wasted on padding = `1 - Real/Pos`.
-- **Speedup**: Real tok/s relative to Iter 0.
+| Config | B | avg N | Real tok/s | Pos/s (hw) | Pad% | Loss% | Step ms | VRAM |
+|--------|---|-------|-----------|------------|------|-------|---------|------|
+| Vanilla, no bucketing | 4 | 382 | 21,673 | 24,611 | 11.9% | 55.3% | 62.0 | 2.48 GB |
+| Vanilla, bucketing | 4 | 336 | 16,473 | 16,900 | 2.5% | 54.2% | 79.4 | 2.14 GB |
+| Vanilla, no bucketing | 16 | 421 | 52,993 | 65,323 | 18.9% | 56.0% | 103.1 | 7.05 GB |
+| Vanilla, bucketing | 16 | 341 | 57,020 | 59,202 | 3.7% | 54.2% | 92.1 | 5.25 GB |
+| Vanilla, no bucketing | 32 | 424 | 62,619 | 78,502 | 20.2% | 55.6% | 173.0 | 13.00 GB |
+| **Vanilla, bucketing** | **32** | **343** | **76,868** | **80,349** | **4.3%** | **54.3%** | **136.8** | **9.42 GB** |
+| Vanilla, bucketing | 64 | 345 | 90,349 | 94,866 | 4.8% | 54.3% | 233.0 | 17.69 GB |
+| Vanilla, bucketing | 128 | 350 | 90,255 | 95,880 | 5.9% | 54.5% | 467.9 | 34.57 GB |
+| Vanilla, bucketing | 256 | 354 | 89,605 | 95,679 | 6.3% | 54.7% | 947.7 | 68.80 GB |
+| Vanilla + pad64 | 32 | 384 | 74,123 | 86,584 | 14.4% | 54.3% | 141.9 | 10.16 GB |
+| **TileGym + pad64** | **4** | **435** | **58,096** | **71,807** | **19.1%** | **57.3%** | **24.2** | **3.16 GB** |
+| TileGym + pad64, bucketing | 32 | 384 | 91,427 | 106,601 | 14.2% | 54.3% | 115.3 | 10.93 GB |
+| TileGym + pad64, bucketing | 64 | 384 | 93,167 | 108,386 | 14.0% | 54.5% | 226.7 | 18.15 GB |
+| TileGym + pad64, bucketing | 128 | 384 | 90,876 | 105,101 | 13.5% | 54.7% | 467.7 | 32.61 GB |
+| Packing (N=1024) | 32→12 | 1024 | 83,684 | 83,684 | 0.0% | 51.2% | 140.7 | 8.94 GB |
+| Packing (N=1024) | 64→23 | 1024 | 94,517 | 94,517 | 0.0% | 51.3% | 250.3 | 16.74 GB |
+| Packing (N=1024) | 128→45 | 1024 | 103,542 | 103,542 | 0.0% | 52.4% | 446.0 | 31.12 GB |
+| **Packing + TileGym (N=1024)** | **64→23** | **1024** | **107,367** | **107,367** | **0.0%** | **51.9%** | **218.4** | **18.12 GB** |
 
-¹ Iter 10 packing (N=1024) had 51% wasted positions because avg sample = 356 tokens → only
-  ~2 samples fit per packed slot, leaving 312/1024 = 30% unfilled, plus FlexAttention overhead.
-  On the mixed dataset (high variance), packing efficiency was worse than expected.
-  **Lesson**: Packing only helps when `N / avg_sample_len` is close to an integer (tight fit).
+#### Key Findings
 
-² Iter 13 on real sharegpt4v/coco (B=4, avg ~540 tok/sample, dynamic padding to ~560).
-  Peak synthetic: Stage 1 = 100.3K; Stage 2 = 76.5K (B=32, N=1024, grad_ckpt).
+1. **Throughput plateau at ~90-95K Real tok/s (vanilla)**: Beyond B=64 with bucketing,
+   adding more batch size does NOT increase throughput — only increases VRAM and step time.
+   The GPU is compute-saturated at this point.
 
-³ Iter 14: Stage 2, synthetic N=1024 (zero padding by construction).
-  Throughput B-independent (~74K). GPU fully saturated at MFU=24%.
+2. **TileGym ceiling: ~107K Real tok/s**: With cuTile kernels (packing + fixed shapes),
+   peak throughput is 107K — a **14% lift** over vanilla-bucketed peak (90K → 107K).
+   With pad_to_multiple=64: 93K (+3% vs vanilla bucketed due to extra padding).
 
-### Packing Efficiency Analysis
+3. **TileGym requires quantized shapes**: Variable sequence lengths cause catastrophic
+   autotuning overhead (650ms/step vs 115ms at fixed shapes). In production, use
+   `pad_to_multiple_of=64` or packing with fixed bin sizes.
 
-Why packing shows minimal improvement:
+4. **Bucketing is extremely effective**: Reduces padding from 18-20% to 4-6%.
+   At B≥64, bucketing groups enough similar-length samples that padding is minimal.
 
-| Scenario | Padding waste | Packing gain | Explanation |
-|---|---|---|---|
-| B=768, bucketed, sharegpt4v/coco (avg=540) | ~5% | +5% | Bucketing already groups similar lengths |
-| B=768, packed, N=1024 | ~3% | — | Packing efficiency 95-97% |
-| B=384, bucketed, mixed (avg=680, σ=400) | ~10% | +10% | Higher variance = more padding |
-| B=16, bucketed (original config) | ~7% | +7% | Small batch has less padding diversity |
+5. **Packing provides marginal gains over bucketing at large B**: 
+   Packing gives 0% padding (vs 4-6% for bucketing at B=64+), but the ~5% padding
+   elimination translates to only ~5% more Real tok/s (94.5K vs 90.3K).
 
-**Key insight**: At B=768 with `group_by_length`, all 768 samples in a batch already have
-nearly identical lengths (bucketing is very effective at large B). The remaining 5% padding
-waste is the only thing packing can eliminate — a marginal gain.
+6. **Best configurations by VRAM budget**:
+   - **≤5 GB**: TileGym B=4 pad64 → 58K Real tok/s (24ms/step)
+   - **≤10 GB**: TileGym B=32 bucketing pad64 → 91K Real tok/s (115ms/step)
+   - **≤20 GB**: Packing+TileGym B=64→23 N=1024 → **107K Real tok/s** (218ms/step)
+   - **≤35 GB**: Packing+TileGym or vanilla B=128 → ~103K Real tok/s
 
-**When packing IS valuable**:
-- High length variance datasets (mixed data with 100–5000 token sequences)
-- Small batch sizes (where bucketing has fewer similar-length candidates)
-- When packing enables longer effective sequences (e.g. multi-turn dialogue)
-- Distributed training where gradient sync overhead is per-step (packing reduces steps/epoch)
+7. **Loss% is dataset-intrinsic (~54%)**: Independent of batch size, bucketing, packing,
+   or kernel choice. It's the fraction of non-padding tokens that contribute to the loss
+   (answer tokens only, not system prompt or question).
+
+### Packing Efficiency Analysis (Verified)
+
+| Config | Pad% | Real tok/s | vs Bucketing same B |
+|--------|------|-----------|---------------------|
+| Bucketing B=64 | 4.8% | 90,349 | — |
+| Packing B=64→23, N=1024 | 0.0% | 94,517 | **+4.6%** |
+| Bucketing B=128 | 5.9% | 90,255 | — |
+| Packing B=128→45, N=1024 | 0.0% | 103,542 | **+14.7%** |
+
+Packing shows modest gains at similar VRAM (~17-31 GB). The 14.7% gain at B=128 is
+larger because packing converts the 128 short samples into 45 packed bins of N=1024,
+giving longer sequences that better utilize Tensor Cores.
+
+**When packing IS valuable** (confirmed by measurement):
+- When combined with TileGym (fixed N enables kernel caching) → +14% over vanilla packing
+- At very large effective batch (128+ input samples) → longer packed sequences
+- High length variance datasets (not tested here; sharegpt4v/coco is relatively uniform)
 
 ### MFU (Model FLOPs Utilization) Analysis
 
@@ -1084,34 +1145,28 @@ waste is the only thing packing can eliminate — a marginal gain.
 - Frozen (fwd + activation bwd): **4 × N × P** per token
 - Forward-only (no_grad): **2 × N × P** per token
 
-#### Current MFU (Iter 14)
+#### Current MFU (Iter 15 — Verified)
 
-| Config | tok/s | Achieved TFLOP/s | MFU |
+Using measured Real tok/s from Iteration 15 ground truth:
+
+**Formula**: MFU = (tok/s × FLOPs_per_token) / Peak_TFLOP/s  
+Stage 1 (frozen LLM): FLOPs_per_token = 4 × N × P = 4 × 494M = 1.976 GFLOP  
+Peak BF16: 936 TFLOP/s
+
+| Config | Measured tok/s | Achieved TFLOP/s | MFU |
 |---|---|---|---|
-| Stage 1 (frozen LLM), B=4, N=1024 | 100,300 | 202.0 | **21.6%** |
-| Stage 1 (frozen LLM), B=128, N=1024 | 108,014 | 217.4 | **23.2%** |
-| Stage 2 (full FT + grad_ckpt), B=32, N=1024 | 74,578 | 223.8 | **23.9%** |
-| Stage 2 (full FT + grad_ckpt), B=768, N=1024 | 74,774 | 224.4 | **24.0%** |
-| Stage 2 (full FT + grad_ckpt), B=384, N=2048 | 73,818 | 220.2 | **23.5%** |
-| Stage 2 (full FT + grad_ckpt), B=192, N=4096 | 71,245 | 211.8 | **22.6%** |
+| Vanilla, bucketing, B=64 | 90,349 | 178.5 | **19.1%** |
+| TileGym + pad64, B=32 | 91,427 | 180.7 | **19.3%** |
+| TileGym + pad64, B=64 | 93,167 | 184.1 | **19.7%** |
+| Packing, B=128→45, N=1024 | 103,542 | 204.6 | **21.9%** |
+| **Packing + TileGym, B=64→23** | **107,367** | **212.2** | **22.7%** |
+| TileGym, B=4, pad64 | 58,096 | 114.8 | **12.3%** |
 
 **Key observations**:
-- MFU is **constant at ~24%** regardless of batch size — confirms GPU is already saturated.
-- Stage 2 (6N FLOP/tok) achieves slightly higher MFU than Stage 1 (4N FLOP/tok) because
-  full backward has better compute/memory ratio.
-- Longer sequences (N=4096) show slightly lower MFU due to quadratic attention scaling.
-
-#### Historical MFU progression
-
-| Iter | Config | Achieved TFLOP/s | MFU |
-|---|---|---|---|
-| 7 | Stage 1, B=16, N=356, torch.compile | 217 | 23.1% |
-| 13 | Stage 1, B=4, N=1024, TileGym full stack | 202 | 21.6% |
-| 14 | Stage 2, B=768, N=1024, TileGym + AdamW | 224 | **24.0%** |
-
-MFU has remained flat at 21–24% across all optimizations. This is expected: our kernel
-optimizations reduce overhead and VRAM (enabling larger batch), but the fundamental
-arithmetic intensity of 0.5B model GEMMs hasn't changed.
+- MFU is **19-23%** across all saturated configs — consistent with model scale limitations.
+- B=4 only achieves 12% MFU (insufficient parallelism for Tensor Cores).
+- Packing + TileGym at peak gives 22.7% MFU — near ceiling for this 0.5B model.
+- Previous estimates of 24% MFU were slightly inflated (likely based on synthetic data).
 
 ### Why MFU is 24% (and why that's near-optimal for this workload)
 
