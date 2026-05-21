@@ -358,7 +358,7 @@ def get_stage1_model_and_processor(
         from siq_vl.kernels.attention_backend import register_cutile_attention
         register_cutile_attention()
         text_attn_impl = "cutile"
-        rank_zero_info(">>> cuTile Flash Attention registered as attention backend")
+        rank_zero_info(">>> TileGym FA4 (cuTile) registered: native GQA + autotuned tiles")
     elif use_packing:
         text_attn_impl = "flex_attention"
     else:
