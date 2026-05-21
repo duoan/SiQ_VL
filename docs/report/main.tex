@@ -475,6 +475,72 @@ static shapes. VLMs with variable-resolution images violate this assumption fund
 Don't force static-shape optimizations on inherently dynamic workloads.}
 
 % ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 4 --- Offline Image Preprocessing (Planned, Superseded)}
+
+\paragraph{Hypothesis.} CPU-bound image preprocessing (PIL resize + normalize + tile)
+is the DataLoader bottleneck. Pre-processing all images to tensor shards on disk would
+let the DataLoader only tokenize text and load pre-computed tensors via mmap.
+
+\paragraph{Experiment.} Planned but not executed.
+
+\paragraph{Finding.} Iteration~3 revealed that vision compute (SigLIP forward) is only
+5\,ms/tile on Blackwell---far faster than expected. The DataLoader is NOT the bottleneck;
+the GPU is simply underutilized at B=4. Pre-processing would save $\sim$5\,ms/step on
+a 270\,ms step (1.9\%), making it not worth the infrastructure complexity.
+
+\paragraph{Conclusion.} \textbf{Superseded} by batch size scaling (Iter 3). The planned
+offline preprocessing infrastructure was never needed because vision compute is not
+the bottleneck on modern GPUs.
+
+\paragraph{Lesson.} \emph{Measure before building infrastructure. We planned an entire
+caching system (scripts, datasets, collators) before discovering that the ``slow'' component
+takes only 5\,ms. Batch scaling gave 83\% improvement with zero infrastructure.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 6 --- First Packing Attempt (Failed)}
+
+\paragraph{Hypothesis.} Concatenating sequences into fixed-length packed bins with a
+4D block-diagonal attention mask should eliminate all padding.
+
+\paragraph{Experiment.} Implement packing with explicit \texttt{attention\_mask}
+(4D dense tensor, shape $B \times 1 \times N \times N$) under SDPA backend.
+
+\paragraph{Finding.} SDPA detects the non-trivial 4D mask and falls back to the
+\emph{math kernel} (naive $O(N^2)$ materialized attention)---orders of magnitude slower
+than the flash/efficient kernels used for simple causal masks. Training step time
+increased 3$\times$.
+
+\paragraph{Conclusion.} \textbf{Reverted}. SDPA cannot efficiently handle arbitrary
+4D masks. A different attention backend is needed for packing.
+
+\paragraph{Lesson.} \emph{Attention backend selection is not just about ``flash vs SDPA''---it's
+about what \underline{mask shapes} each backend supports efficiently. SDPA's flash path
+only handles causal masks; any custom mask triggers the slow fallback. This motivated
+the move to FlexAttention in Iter 10.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 9 --- DataLoader Optimization (Incremental)}
+
+\paragraph{Hypothesis.} Increasing DataLoader workers and using a CUDA prefetch stream
+should overlap data transfer with GPU compute, reducing idle time between steps.
+
+\paragraph{Experiment.} Test num\_workers $\in \{0, 2, 4, 8, 16\}$, add
+\texttt{pin\_memory=True}, implement a CUDA prefetcher that pre-transfers the next
+batch to GPU on a separate stream.
+
+\paragraph{Finding.} num\_workers=8 is optimal (+2\% over workers=4).
+The CUDA prefetcher showed no measurable gain because HuggingFace Trainer already
+uses \texttt{pin\_memory} and the H2D transfer ($<$1\,ms for our batch sizes) is
+fully overlapped with GPU compute at B=16+.
+
+\paragraph{Conclusion.} Marginal. Kept num\_workers=8 as default.
+
+\paragraph{Lesson.} \emph{DataLoader optimization only matters when data loading is
+the bottleneck. With B$\geq$16, each training step takes 200+ms of GPU compute,
+while data loading takes $<$5\,ms. The GPU is never waiting for data. Focus optimization
+effort on the actual bottleneck (GPU compute efficiency).}
+
+% ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 10 --- Sequence Packing + FlexAttention}
 
 \paragraph{Hypothesis.} Even after bucketing, 10\% padding remains on the mixed 6-subset
@@ -584,6 +650,91 @@ than Liger-Kernel on Blackwell. It is the correct kernel solution for this hardw
 loss + grad in a single pass over vocab tiles. Combined with grad-in-forward (accumulate
 $\nabla_h$ per chunk, never store $\nabla_{\text{logits}}$), this eliminates the largest
 memory bottleneck in LLM training: the logits tensor ($B \times L \times V = B \times L \times 151936$).}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 12 --- Stage 2 Readiness (cuTile Forward Doesn't Help Backward)}
+
+\paragraph{Hypothesis.} TileGym FA4 gave 7--12\% speedup in Stage~1 (forward-only attention).
+In Stage~2 (unfrozen LLM with full backward), using FA4 for forward + SDPA for backward
+(\texttt{cutile\_training} backend) should still provide a net speedup.
+
+\paragraph{Experiment.} Benchmark Stage~2 (Full FT + grad\_ckpt) with SDPA vs
+\texttt{cutile\_training} (FA4 fwd + SDPA bwd via \texttt{autograd.Function} wrapper).
+Also benchmark LoRA vs Full FT across sequence lengths.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\caption{cuTile\_training vs SDPA for Stage 2 (unfrozen LLM)}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Config & SDPA & cuTile+SDPA\_bwd & Speedup \\ \midrule
+Full FT, N=512 & 272.3\,ms & 276.8\,ms & 0.98$\times$ \\
+Full FT, N=1024 & 290.3\,ms & 292.6\,ms & 0.99$\times$ \\
+Full FT, N=2048 & 333.6\,ms & 338.7\,ms & 0.99$\times$ \\
+LoRA r=16, N=512 & 102.1\,ms & 112.4\,ms & 0.91$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The \texttt{autograd.Function} Python overhead (save/restore tensors, dispatch)
+cancels out the FA4 forward gain. With unfrozen LLM, the backward pass dominates
+($\sim$70\% of step time)---a 12\% faster forward contributes only $\sim$3.6\% E2E,
+which is eaten by the wrapper overhead.
+
+Also benchmarked: \texttt{flash-attn-4} (Dao-AILab) install is \textbf{blocked}---requires
+CUDA 13.1+ (system has 13.0).
+
+\paragraph{Conclusion.} Use plain SDPA for Stage~2. cuTile forward-only benefits
+\emph{only} help when backward is never called (Stage~1 frozen LLM).
+
+\paragraph{Lesson.} \emph{Optimizing a component that's $<$15\% of step time (attention forward)
+while the rest (backward at 70\%) is unchanged yields negligible E2E gains.
+Amdahl's Law is unforgiving: always target the dominant cost.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 14 --- Batch-Size Scaling + FlashOptim}
+
+\paragraph{Hypothesis.} With TileGym full stack using only 5.6\,GB VRAM (Stage~2, B=4),
+we have 90\,GB of headroom. Scaling B to fill the GPU should increase throughput.
+Additionally, FlashOptim (Databricks) with gradient release can compress optimizer
+memory, enabling even larger batches.
+
+\paragraph{Experiment.} Sweep B from 32 to 896 (Stage~2, Full FT, grad\_ckpt, TileGym,
+N=1024). Separately benchmark FlashAdamW vs standard AdamW.
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\caption{Batch scaling (Stage 2, TileGym full stack, N=1024)}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+B & ms/step & tok/s & VRAM & GPU Util \\ \midrule
+32 & 439 & 74,578 & 7.0\,GB & 7\% \\
+128 & 1,769 & 74,075 & 15.3\,GB & 16\% \\
+384 & 5,279 & 74,484 & 39.6\,GB & 42\% \\
+\textbf{768} & \textbf{10,518} & \textbf{74,774} & \textbf{76.0\,GB} & \textbf{80\%} \\
+896 & \multicolumn{4}{c}{OOM} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Throughput is \textbf{completely flat} at $\sim$74K tok/s regardless of B.
+The GPU is already compute-saturated; larger batches only increase step time linearly
+(more tokens per step, same tok/s). VRAM scales linearly at $\sim$0.1\,GB per sample.
+
+FlashOptim result: FlashAdamW saves 0.4\,GB over standard AdamW (from 7.0 to 6.6\,GB
+at B=32)---marginal for this 0.5B model where optimizer states are only $\sim$2\,GB.
+
+\paragraph{Conclusion.} Batch size does NOT improve throughput when the GPU is already
+saturated. Its only value is (a)~reducing per-step overhead if running distributed
+training, or (b)~gradient statistics stability. \textbf{Recommended B=32} for Stage~2
+(minimal VRAM, same tok/s).
+
+\paragraph{Lesson.} \emph{When MFU is already at ceiling ($\sim$24\%), no amount of batch
+scaling can improve throughput. Batch size is a knob for memory/communication trade-offs,
+not compute efficiency. On a single GPU with sufficient VRAM, B should be set to the minimum
+that achieves peak throughput (B=32 here), preserving headroom for longer sequences.}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 15 --- Ground Truth Verification}
