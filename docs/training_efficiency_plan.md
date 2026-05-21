@@ -807,6 +807,54 @@ Combined targets:
 
 ---
 
+### Iteration 12 — Stage 2 Readiness Benchmark (Unfrozen Text Model)
+
+- **Date**: 2026-05-20
+- **Branch / Commit**: `master`
+- **Goal**: Establish Stage 2 baseline and determine optimal configuration before actual training.
+- **Key finding**: `flash-attn-4` (Dao-AILab) requires CUDA 13.1+ — incompatible with our CUDA 13.0.
+  TileGym FA4 remains our best attention option. However, for Stage 2 (unfrozen LLM where backward
+  dominates), the attention backend choice makes negligible difference — SDPA is recommended.
+
+#### Stage 2 Benchmark Results (B=4, SDPA + Liger)
+
+| Mode | N=512 | N=1024 | N=2048 | N=4096 |
+|---|---|---|---|---|
+| **LoRA r=16** | 99.7ms, 20.5K tok/s, 4.4GB | 133.5ms, 30.7K tok/s, 7.6GB | 238.3ms, 34.4K tok/s, 14.0GB | — |
+| **Full FT** | 272.1ms, 7.5K tok/s, 4.1GB | 290.4ms, 14.1K tok/s, 5.9GB | 333.7ms, 24.5K tok/s, 9.7GB | — |
+| **Full FT + grad_ckpt** | 293.2ms, 7.0K tok/s, 2.3GB | 302.2ms, 13.6K tok/s, 2.3GB | 362.1ms, 22.6K tok/s, 2.5GB | 471.4ms, 34.8K tok/s, 2.9GB |
+| **Full FT + grad_ckpt, B=8** | — | 348.5ms, 23.5K tok/s, 2.5GB | — | — |
+| **Full FT + grad_ckpt, B=16** | — | 452.2ms, 36.2K tok/s, 2.9GB | — | — |
+
+#### cuTile_training vs SDPA (unfrozen LLM)
+
+| Config | SDPA | cuTile+SDPA_bwd | Speedup |
+|---|---|---|---|
+| Full FT, N=512 | 272.3 ms | 276.8 ms | 0.98x |
+| Full FT, N=1024 | 290.3 ms | 292.6 ms | 0.99x |
+| Full FT, N=2048 | 333.6 ms | 338.7 ms | 0.99x |
+| LoRA r=16, N=512 | 102.1 ms | 112.4 ms | 0.91x |
+
+**Conclusion**: With unfrozen LLM, backward pass dominates. Our `cutile_training` backend
+(FA4 fwd + SDPA bwd) adds Python overhead from `autograd.Function` wrapper without meaningful
+gain. **Recommendation: Use plain SDPA for Stage 2**. The cuTile forward-only benefit only
+materialized in Stage 1 where backward was never called.
+
+#### Stage 2 Configuration Recommendations
+
+| Strategy | When to Use | Trainable | Best tok/s | VRAM |
+|---|---|---|---|---|
+| **LoRA r=16** | Quick iteration, good quality | 11.5M (1.7%) | 34.4K (N=2048) | 14GB |
+| **Full FT + grad_ckpt** | Maximum quality, long seqs | 496.8M (100%) | 36.2K (B=16) | 2.9GB |
+| **Full FT + grad_ckpt + packing** | Max efficiency on mixed data | 496.8M | (to be measured) | ~3GB |
+
+- **Flash Attention 4 (Dao-AILab)**: Blocked on CUDA 13.1. Once available, `flash_attn_varlen_func`
+  would natively support packed sequences with `cu_seqlens` for both forward and backward — the
+  ideal Stage 2 packing solution (eliminates FlexAttention's compile overhead).
+- **torch.compile**: Crashed with Liger+LoRA combination; use `--no_liger --torch_compile` if needed.
+
+---
+
 ## 4.1. Performance Summary & MFU Analysis
 
 ### Cumulative Optimization Results
@@ -1104,7 +1152,8 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 | §4 (Iter 8) + §5 | "Last mile: batch tuning and measurement methodology" |
 | §4 (Iter 10) | "Packing done right: FlexAttention + mixed datasets" |
 | §4 (Iter 11) | "Custom kernels: cuTile DSL on Blackwell" |
-| §4 (Iter 12) | "Going horizontal: distributed training on Modal" |
+| §4 (Iter 12) | "Stage 2 readiness: unfreezing the LLM" |
+| §4 (Iter 13+) | "Going horizontal: distributed training on Modal" |
 | §6 | "Pitfalls I hit (from the Risk Register)" |
 
 ---
@@ -1135,6 +1184,7 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - `siq_vl/kernels/cutile_attention.py` — cuTile Flash Attention (forward + varlen + autotuning)
 - `siq_vl/kernels/attention_backend.py` — HF Transformers attention backend registration
 - `siq_vl/dataset.py::VQADataset` — one random turn per sample
+- `scripts/benchmark_stage2.py` — Stage 2 benchmark (LoRA / Full FT / grad_ckpt comparison)
 - `scripts/train.py::train` — Trainer assembly + Stage switching
 - `scripts/train_launch.sh` — host detection + accelerate launch
 - `modal_train.py` — (planned) Modal App definition for distributed training
