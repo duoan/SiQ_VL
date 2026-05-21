@@ -355,6 +355,12 @@ def parse_args():
         default=False,
         help="Disable Liger-Kernel optimizations (required for torch.compile)",
     )
+    parser.add_argument(
+        "--use_tilegym",
+        action="store_true",
+        default=False,
+        help="Use TileGym cuTile kernels (Blackwell-native, replaces Liger). 13-17%% faster than Liger.",
+    )
 
     # Precision configuration
     parser.add_argument(
@@ -591,6 +597,11 @@ def train(args=None):
         _modeling._LIGER_APPLIED = True
         rank_zero_info(">>> Liger-Kernel DISABLED")
 
+    if args.use_tilegym:
+        from siq_vl.model import modeling as _modeling
+        _modeling._LIGER_APPLIED = True  # prevent Liger from also applying
+        rank_zero_info(">>> TileGym mode: will use cuTile DSL kernels instead of Liger")
+
     default_repo_name = f"siq-vl_{vision_name}_{text_name}_{stage_name}"
 
     if stage_name == "stage1":
@@ -598,6 +609,7 @@ def train(args=None):
             pretrained_vision_model_path=vision_model_name_or_path,
             pretrained_text_model_path=text_model_name_or_path,
             enable_dynamic_tiling=args.enable_dynamic_tiling,
+            use_tilegym=args.use_tilegym,
         )
     elif stage_name == "stage2":
         stage_1_checkpoint_path = args.stage_1_checkpoint_path
@@ -611,6 +623,7 @@ def train(args=None):
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             lora_target_modules=args.lora_target_modules,
+            use_tilegym=args.use_tilegym,
         )
 
     # ====================================================

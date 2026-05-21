@@ -807,6 +807,42 @@ Combined targets:
 
 ---
 
+### Iteration 13 — TileGym Full Kernel Replacement (cuTile DSL for ALL ops)
+
+- **Date**: 2026-05-20
+- **Branch / Commit**: `master`
+- **Discovery**: `tilegym.transformers.apply_tilegym_kernel_to_qwen2(use_cutile=True)` monkey-patches
+  ALL key Qwen2 ops (RoPE, RMSNorm, SwiGLU, attention) with Blackwell-native cuTile DSL kernels.
+  This is essentially a Blackwell-optimized replacement for Liger-Kernel.
+- **Benchmark vs Liger (B=4, N=1024)**:
+
+  | Config | Stage 1 (frozen) | Stage 2 (unfrozen) |
+  |---|---|---|
+  | Liger-Kernel | 60.2 ms, 68K tok/s | 73.2 ms, 55.9K tok/s |
+  | TileGym cuTile | 53.6 ms, 76.4K tok/s | 65.2 ms, 62.8K tok/s |
+  | **Speedup** | **12.3%** | **12.4%** |
+  | TileGym + Liger fused_linear_CE | 53.4 ms, 76.7K tok/s | 65.1 ms, 63.0K tok/s |
+
+- **Stage 2 + gradient checkpointing scaling**:
+
+  | N | Liger tok/s | TileGym tok/s | Speedup |
+  |---|---|---|---|
+  | 512 | 38.3K | 43.3K | +13% |
+  | 1024 | 46.5K | 54.3K | +17% |
+  | 2048 | 48.7K | 57.0K | +17% |
+
+- **Peak throughput (Stage 1)**: B=16, N=1024 → **84.3K tok/s** at 42.3 GB
+- **Integration**: `--use_tilegym` flag in `scripts/train.py`, or `use_tilegym=True` in model init.
+  Automatically applies TileGym + Liger's `fused_linear_cross_entropy` (best of both).
+- **flash-attn-4 status**: `pip install flash-attn-4[cu13]` blocked by CUDA 13.0 → requires 13.1+.
+- **Lessons**:
+  - TileGym is to Liger what cuTile is to Triton — same idea, but targets Blackwell natively.
+  - The ~12-17% speedup comes from ALL ops, not just attention. SwiGLU/RMSNorm/RoPE are all
+    faster because cuTile emits `wgmma` + TMA instructions that Triton can't generate on sm_120.
+  - `fused_linear_cross_entropy` is complementary — TileGym doesn't have this, Liger does.
+
+---
+
 ### Iteration 12 — Stage 2 Readiness Benchmark (Unfrozen Text Model)
 
 - **Date**: 2026-05-20
@@ -879,7 +915,8 @@ materialized in Stage 1 where backward was never called.
 | 7 | torch.compile (replaces Liger) | 27,352 | 14,469 | 203.9 | 20.73 GB | 5.85x |
 | 8 | Batch size 16→20 + compile | 28,322 | 14,982 | 252.9 | 29.09 GB | 6.06x |
 | 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 15,777 | 297 | 34.0 GB | 6.38x |
-| **11** | **TileGym FA4 (cuTile, native GQA)** | **31,581** | **16,701** | **64.9** | **2.39 GB** | **6.75x** |
+| 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 16,701 | 64.9 | 2.39 GB | 6.75x |
+| **13** | **TileGym full patch (all cuTile ops)** | **33,615** | **17,777** | **60.8** | **3.55 GB** | **7.19x** |
 
 ² Loss ratio: single-subset (sharegpt4v/coco) = 0.529; mixed-data (6 subsets) = 0.589.
   Eff. tok/s = GPU tok/s × loss_ratio for the respective dataset.
@@ -1152,8 +1189,9 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 | §4 (Iter 8) + §5 | "Last mile: batch tuning and measurement methodology" |
 | §4 (Iter 10) | "Packing done right: FlexAttention + mixed datasets" |
 | §4 (Iter 11) | "Custom kernels: cuTile DSL on Blackwell" |
+| §4 (Iter 13) | "TileGym: the Blackwell-native Liger-Kernel" |
 | §4 (Iter 12) | "Stage 2 readiness: unfreezing the LLM" |
-| §4 (Iter 13+) | "Going horizontal: distributed training on Modal" |
+| §4 (Iter 14+) | "Going horizontal: distributed training on Modal" |
 | §6 | "Pitfalls I hit (from the Risk Register)" |
 
 ---

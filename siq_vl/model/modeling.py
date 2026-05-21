@@ -34,6 +34,40 @@ logger = logging.get_logger(__name__)
 logger.setLevel(logging.INFO)
 
 _LIGER_APPLIED = False
+_TILEGYM_APPLIED = False
+
+
+def _apply_tilegym_kernel(use_cutile: bool = True):
+    """Apply TileGym kernels to Qwen2 (RoPE, RMSNorm, SwiGLU, attention) + Liger's fused linear-CE.
+    Native Blackwell-optimized kernels via cuTile DSL — 13-17% faster than Liger alone.
+    Must be called before model instantiation. Safe to call multiple times."""
+    global _TILEGYM_APPLIED, _LIGER_APPLIED
+    if _TILEGYM_APPLIED:
+        return
+    try:
+        from tilegym.transformers import apply_tilegym_kernel_to_qwen2
+
+        apply_tilegym_kernel_to_qwen2(use_cutile=use_cutile)
+        backend = "cuTile DSL" if use_cutile else "Triton"
+        rank_zero_info(f">>> TileGym applied ({backend}): RoPE + RMSNorm + SwiGLU + FA4 attention")
+
+        # Also apply Liger's fused_linear_cross_entropy for memory efficiency
+        try:
+            from liger_kernel.transformers import apply_liger_kernel_to_qwen2 as _liger_patch
+
+            _liger_patch(
+                rope=False, cross_entropy=False, fused_linear_cross_entropy=True,
+                rms_norm=False, swiglu=False,
+            )
+            rank_zero_info(">>> + Liger fused_linear_cross_entropy (VRAM optimization)")
+        except ImportError:
+            pass
+
+        _TILEGYM_APPLIED = True
+        _LIGER_APPLIED = True  # prevent Liger from double-patching
+    except ImportError:
+        rank_zero_info(">>> TileGym not installed, falling back to Liger-Kernel")
+        _apply_liger_kernel()
 
 
 def _apply_liger_kernel():
@@ -339,6 +373,7 @@ def get_stage1_model_and_processor(
     enable_dynamic_tiling: bool = False,
     use_packing: bool = False,
     use_cutile: bool = False,
+    use_tilegym: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
@@ -347,22 +382,29 @@ def get_stage1_model_and_processor(
         pretrained_text_model_path: Path to the pretrained text model.
         use_packing: If True, uses flex_attention for efficient packed sequence training.
         use_cutile: If True, uses cuTile Flash Attention backend (Blackwell-optimized).
+        use_tilegym: If True, uses TileGym full kernel replacement (RoPE+RMSNorm+SwiGLU+FA4).
+                     Supersedes both Liger and use_cutile.
 
     Returns:
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
     """
     rank_zero_info("Initializing SiQ-VL model for stage 1...")
-    _apply_liger_kernel()
 
-    if use_cutile:
+    if use_tilegym:
+        _apply_tilegym_kernel(use_cutile=True)
+        text_attn_impl = "sdpa"  # TileGym patches SDPA in-place
+    elif use_cutile:
+        _apply_liger_kernel()
         from siq_vl.kernels.attention_backend import register_cutile_attention
         register_cutile_attention()
         text_attn_impl = "cutile"
         rank_zero_info(">>> TileGym FA4 (cuTile) registered: native GQA + autotuned tiles")
-    elif use_packing:
-        text_attn_impl = "flex_attention"
     else:
-        text_attn_impl = "sdpa"
+        _apply_liger_kernel()
+        if use_packing:
+            text_attn_impl = "flex_attention"
+        else:
+            text_attn_impl = "sdpa"
 
     config = get_siq_vl_config(
         text_model_name_or_path=pretrained_text_model_path,
@@ -403,6 +445,7 @@ def get_stage2_model_and_processor(
     lora_alpha: int = 16,  # Alpha parameter for LoRA scaling
     lora_dropout: float = 0.05,  # Dropout probability for the LoRA update matrices
     lora_target_modules: list[str] | None = None,
+    use_tilegym: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the stage 2 SiQ-VL model and processor.
@@ -413,8 +456,12 @@ def get_stage2_model_and_processor(
         lora_alpha: Alpha parameter for LoRA scaling.
         lora_dropout: Dropout probability for the LoRA update matrices.
         lora_target_modules: Target modules for the LoRA update matrices.
+        use_tilegym: If True, uses TileGym cuTile kernels instead of Liger.
     """
-    _apply_liger_kernel()
+    if use_tilegym:
+        _apply_tilegym_kernel(use_cutile=True)
+    else:
+        _apply_liger_kernel()
 
     model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path, torch_dtype=torch.bfloat16)
     processor = SiQ_VLProcessor.from_pretrained(stage_1_checkpoint_path)
