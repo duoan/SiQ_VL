@@ -1,0 +1,688 @@
+\documentclass[11pt,a4paper]{article}
+
+% ─── Packages ───────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\usepackage{subcaption}
+% \usepackage{algorithm}  % not available in this texlive install
+% \usepackage{algorithmic}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{listings}
+
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{groupplots}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=green!50!black,
+  urlcolor=blue!70!black,
+}
+
+% ─── Custom colors ──────────────────────────────────────────────────────────
+\definecolor{vanilla}{HTML}{4C72B0}
+\definecolor{tilegym}{HTML}{DD8452}
+\definecolor{packing}{HTML}{55A868}
+\definecolor{packtilegym}{HTML}{C44E52}
+\definecolor{lightgray}{HTML}{F5F5F5}
+
+% ─── Code listing style ─────────────────────────────────────────────────────
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{lightgray},
+  frame=single,
+  framerule=0pt,
+  breaklines=true,
+  columns=fullflexible,
+}
+
+% ─── Header/Footer ──────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small SiQ-VL Training Efficiency}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ─── Title ──────────────────────────────────────────────────────────────────
+\title{%
+  \textbf{Squeezing Every FLOP: Single-GPU Training Efficiency\\
+  Optimization for Vision-Language Models}\\[6pt]
+  \large A Case Study on SiQ-VL (0.5B) with NVIDIA Blackwell
+}
+\author{
+  Duo An \\
+  \texttt{duo.an@example.com}
+}
+\date{May 2026}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+\maketitle
+
+% ─── Abstract ───────────────────────────────────────────────────────────────
+\begin{abstract}
+We present a systematic study of single-GPU training efficiency optimization
+for SiQ-VL, a small-scale (0.5B parameter) vision-language model trained on
+an NVIDIA RTX PRO 6000 Blackwell GPU (96\,GB VRAM). Through 15 iterations of
+measured optimizations spanning kernel fusion, data strategies, and batch scaling,
+we improve effective throughput from 21.7K to 107.4K real tokens/second ---
+a \textbf{4.95$\times$ speedup}. We identify the throughput ceiling imposed by
+Model FLOPs Utilization (MFU $\approx$ 22.7\%) for this model scale, demonstrate
+that length bucketing eliminates 95\% of padding waste, and show that cuTile
+(TileGym) kernels provide a further 14--23\% speedup at fixed tensor shapes.
+All measurements use real training data with precise attention-mask accounting,
+correcting earlier estimates based on synthetic benchmarks.
+\end{abstract}
+
+\vspace{1em}
+\noindent\textbf{Keywords:} Vision-Language Models, Training Efficiency, GPU Kernel Optimization, cuTile, Blackwell, Sequence Packing
+
+\tableofcontents
+\newpage
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Training vision-language models (VLMs) efficiently on a single GPU is crucial
+for researchers with limited hardware budgets. While much attention has been paid
+to distributed training at scale, the \emph{single-GPU efficiency frontier}
+determines the baseline throughput that distributed methods multiply.
+
+This report documents the complete optimization journey of \textbf{SiQ-VL}, a
+compact VLM combining a SigLIP-2 vision encoder with a Qwen2.5 language model.
+We focus exclusively on engineering optimizations that preserve model quality
+(identical loss curves) while maximizing tokens processed per second.
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=*]
+  \item A \textbf{reproducible benchmark} (\texttt{benchmark\_real\_efficiency.py})
+    that measures Real tok/s, Pos/s, Pad\%, and Loss\% on actual training data.
+  \item Quantitative evidence that \textbf{length bucketing} at large batch sizes
+    (B$\geq$64) reduces padding waste to $<$5\%, making sequence packing only
+    marginally beneficial (+4.6\%).
+  \item Demonstration that NVIDIA's \textbf{cuTile DSL} (via TileGym) achieves
+    23\% kernel speedup but \emph{requires} quantized tensor shapes to avoid
+    catastrophic JIT overhead.
+  \item A complete \textbf{MFU analysis} confirming that 0.5B-scale models are
+    memory-bandwidth bound at 19--23\% MFU, with throughput saturating at B$\geq$64.
+\end{enumerate}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{System Setup}
+\label{sec:setup}
+
+\subsection{Hardware}
+
+\begin{table}[h]
+\centering
+\caption{Hardware configuration}
+\label{tab:hardware}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Component & Specification \\
+\midrule
+GPU & NVIDIA RTX PRO 6000 Blackwell Server Edition \\
+VRAM & 96\,GB GDDR7 \\
+SMs & 188 @ 2430\,MHz \\
+Peak BF16 Tensor & 936\,TFLOP/s (dense) \\
+Memory Bandwidth & 1.79\,TB/s \\
+CUDA / Driver & CUDA 13.0, Driver 580.126 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Model Architecture}
+
+\begin{table}[h]
+\centering
+\caption{SiQ-VL model configuration}
+\label{tab:model}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Component & Architecture & Parameters \\
+\midrule
+Vision Encoder & SigLIP2-base-patch16-224 & 92.9M (15.8\%) \\
+Language Model & Qwen2.5-0.5B-Instruct & 494.0M (83.8\%) \\
+Projector & 2-layer MLP + Pixel Shuffle & 2.8M (0.5\%) \\
+\midrule
+\textbf{Total} & & \textbf{589.7M} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Training stages:}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Stage 1} (Projector alignment): Vision encoder and LLM frozen;
+    only the 2.8M projector trains. FLOPs/token $= 4NP$ (forward + activation backward).
+  \item \textbf{Stage 2} (LLM fine-tuning): Vision encoder frozen; LLM trains
+    (full or LoRA). FLOPs/token $= 6NP$ (full forward + backward).
+\end{itemize}
+
+\subsection{Software Stack}
+
+\begin{itemize}[leftmargin=*]
+  \item PyTorch 2.9.1 with \texttt{torch.compile} support
+  \item HuggingFace Transformers 5.3.0
+  \item TileGym (NVIDIA cuTile DSL kernels for Blackwell)
+  \item Dataset: \texttt{lmms-lab/LLaVA-OneVision-Data / sharegpt4v(coco)} (50K samples)
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Metrics}
+
+We define four metrics measured \emph{exactly} from tensor values:
+
+\begin{align}
+  \text{Real tok/s} &= \frac{\sum_i \texttt{attention\_mask}_i.\text{sum}()}{\Delta t} \label{eq:real_toks} \\
+  \text{Pos/s (hw)} &= \frac{\sum_i B_i \times N_i}{\Delta t} \label{eq:pos} \\
+  \text{Pad\%} &= 1 - \frac{\text{Real tok/s}}{\text{Pos/s}} \label{eq:pad} \\
+  \text{MFU} &= \frac{\text{Real tok/s} \times F_{\text{tok}}}{\text{Peak TFLOP/s}} \label{eq:mfu}
+\end{align}
+
+\noindent where $F_{\text{tok}} = 4 \times P = 4 \times 494\text{M} = 1.976$ GFLOP for Stage~1.
+
+\subsection{Measurement Protocol}
+
+Each configuration is measured as follows:
+\begin{enumerate}
+  \item Load real dataset (not synthetic) with actual images.
+  \item Run $W$ warmup steps (2--10 depending on JIT overhead).
+  \item Run $S=10$ measured steps, recording per-step: wall time (\texttt{cuda.synchronize}
+    bracketed), \texttt{attention\_mask.sum()}, \texttt{(labels != -100).sum()}, $B \times N$.
+  \item Report aggregated metrics over all $S$ steps.
+\end{enumerate}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Optimization Techniques}
+\label{sec:techniques}
+
+\subsection{Length Bucketing}
+
+The standard VLM training pipeline pads all sequences in a batch to the longest.
+With random sampling, padding waste scales with batch size (18--20\% at B=32).
+\textbf{Length bucketing} (HuggingFace \texttt{group\_by\_length}) sorts samples
+by estimated token length, ensuring each batch contains similar-length sequences.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\textwidth,
+  height=6cm,
+  xlabel={Batch Size (B)},
+  ylabel={Padding Waste (\%)},
+  legend pos=north east,
+  grid=major,
+  ymin=0, ymax=25,
+  xmin=0, xmax=270,
+  xtick={4,16,32,64,128,256},
+]
+\addplot[vanilla, thick, mark=square*, mark size=2.5] coordinates {
+  (4,11.9) (16,18.9) (32,20.2)
+};
+\addlegendentry{No bucketing}
+
+\addplot[packing, thick, mark=triangle*, mark size=2.5] coordinates {
+  (4,2.5) (16,3.7) (32,4.3) (64,4.8) (128,5.9) (256,6.3)
+};
+\addlegendentry{Bucketing}
+
+\addplot[packtilegym, thick, dashed, mark=diamond*, mark size=2.5] coordinates {
+  (32,14.2) (64,14.0) (128,13.5)
+};
+\addlegendentry{TileGym + pad64}
+
+\addplot[tilegym, thick, dotted] coordinates {(4,0) (256,0)};
+\addlegendentry{Packing (0\%)}
+
+\end{axis}
+\end{tikzpicture}
+\caption{Padding waste vs.\ batch size. Bucketing reduces waste from 20\% to $<$6\%.
+TileGym's \texttt{pad\_to\_multiple\_of=64} introduces 13--14\% intentional padding
+as a trade-off for kernel efficiency. Packing eliminates padding entirely.}
+\label{fig:padding}
+\end{figure}
+
+\subsection{Sequence Packing}
+
+Packing concatenates multiple short sequences into fixed-length bins (N=1024),
+using position ID resets to maintain document boundaries. This eliminates padding
+at the cost of more complex attention masking.
+
+\subsection{TileGym (cuTile DSL Kernels)}
+
+NVIDIA's cuTile DSL generates Blackwell-optimized kernels for matmul, attention,
+and fused operations. We use TileGym to patch Qwen2's attention and MLP layers:
+
+\begin{lstlisting}
+from tilegym.transformers import apply_tilegym_kernel_to_qwen2
+apply_tilegym_kernel_to_qwen2(use_cutile=True)
+\end{lstlisting}
+
+\noindent\textbf{Critical finding}: cuTile kernels use JIT compilation with per-shape
+autotuning. Variable-length batches trigger recompilation on \emph{every unique shape},
+causing 4--5$\times$ slowdown. The solution is \texttt{pad\_to\_multiple\_of=64} to
+quantize shapes, or packing with fixed bin size.
+
+\subsection{Fused Linear Cross-Entropy}
+
+We implement a custom \texttt{torch.autograd.Function} that fuses the LM head
+projection with cross-entropy loss using the ``grad-in-forward'' pattern:
+
+\begin{enumerate}
+  \item Chunk hidden states into blocks of 1024 tokens.
+  \item For each chunk: compute logits $= Wh$, apply cross-entropy, accumulate
+    $\nabla_h$ immediately, discard logits.
+  \item Peak memory: $O(\text{chunk\_size} \times V)$ instead of $O(N \times V)$.
+\end{enumerate}
+
+This reduces VRAM by 51--64\% for the LM head in Stage~2.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+
+\subsection{Throughput Scaling}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\textwidth,
+  height=7.5cm,
+  xlabel={Batch Size (B)},
+  ylabel={Real tok/s (thousands)},
+  legend pos=south east,
+  grid=major,
+  ymin=0, ymax=120,
+  xmin=0, xmax=270,
+  xtick={4,16,32,64,128,256},
+  scaled y ticks=false,
+  y tick label style={/pgf/number format/fixed},
+]
+
+% Vanilla no bucketing
+\addplot[vanilla, thick, mark=square*, mark size=2.5, opacity=0.5] coordinates {
+  (4,21.673) (16,52.993) (32,62.619)
+};
+\addlegendentry{Vanilla (no bucketing)}
+
+% Vanilla bucketing
+\addplot[vanilla, thick, mark=square*, mark size=2.5] coordinates {
+  (4,16.473) (16,57.020) (32,76.868) (64,90.349) (128,90.255) (256,89.605)
+};
+\addlegendentry{Vanilla + bucketing}
+
+% TileGym + pad64
+\addplot[tilegym, thick, mark=triangle*, mark size=2.5] coordinates {
+  (4,58.096) (32,91.427) (64,93.167) (128,90.876)
+};
+\addlegendentry{TileGym + pad64 + bucketing}
+
+% Packing
+\addplot[packing, thick, mark=diamond*, mark size=2.5] coordinates {
+  (12,83.684) (23,94.517) (45,103.542)
+};
+\addlegendentry{Packing (N=1024)}
+
+% Packing + TileGym
+\addplot[packtilegym, thick, mark=star, mark size=3.5] coordinates {
+  (23,107.367)
+};
+\addlegendentry{Packing + TileGym (best)}
+
+% Saturation line
+\addplot[black, dashed, thin] coordinates {(0,95) (270,95)};
+\node[anchor=south west] at (axis cs:140,96) {\small\textit{hardware ceiling $\approx$108K Pos/s}};
+
+\end{axis}
+\end{tikzpicture}
+\caption{Real token throughput vs.\ batch size (Stage~1). All curves saturate
+at B$\geq$64 due to compute-bound behavior. TileGym lifts the ceiling from
+$\sim$90K to $\sim$107K by reducing per-kernel overhead. Note: packing x-axis
+shows \emph{effective} packed batch size.}
+\label{fig:throughput}
+\end{figure}
+
+\subsection{Complete Results Table}
+
+\begin{table}[h]
+\centering
+\caption{Ground-truth measurements on real data (sharegpt4v/coco, 50K samples, Stage~1)}
+\label{tab:results}
+\small
+\begin{tabular}{@{}llrrrrr@{}}
+\toprule
+Config & B & Real tok/s & Pos/s & Pad\% & ms/step & VRAM \\
+\midrule
+Vanilla & 4 & 21,673 & 24,611 & 11.9 & 62.0 & 2.5\,GB \\
+Vanilla + bucketing & 16 & 57,020 & 59,202 & 3.7 & 92.1 & 5.3\,GB \\
+Vanilla + bucketing & 32 & 76,868 & 80,349 & 4.3 & 136.8 & 9.4\,GB \\
+Vanilla + bucketing & 64 & 90,349 & 94,866 & 4.8 & 233.0 & 17.7\,GB \\
+Vanilla + bucketing & 128 & 90,255 & 95,880 & 5.9 & 467.9 & 34.6\,GB \\
+\midrule
+TileGym + pad64 & 4 & 58,096 & 71,807 & 19.1 & 24.2 & 3.2\,GB \\
+TileGym + pad64 + buck. & 32 & 91,427 & 106,601 & 14.2 & 115.3 & 10.9\,GB \\
+TileGym + pad64 + buck. & 64 & 93,167 & 108,386 & 14.0 & 226.7 & 18.2\,GB \\
+\midrule
+Packing (N=1024) & 23 & 94,517 & 94,517 & 0.0 & 250.3 & 16.7\,GB \\
+Packing (N=1024) & 45 & 103,542 & 103,542 & 0.0 & 446.0 & 31.1\,GB \\
+\midrule
+\textbf{Packing + TileGym} & \textbf{23} & \textbf{107,367} & \textbf{107,367} & \textbf{0.0} & \textbf{218.4} & \textbf{18.1\,GB} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{VRAM--Throughput Trade-off}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\textwidth,
+  height=6.5cm,
+  xlabel={Peak VRAM (GB)},
+  ylabel={Real tok/s (thousands)},
+  legend pos=south east,
+  grid=major,
+  ymin=0, ymax=120,
+  xmin=0, xmax=75,
+]
+
+% Vanilla bucketing
+\addplot[vanilla, thick, mark=square*, mark size=2.5] coordinates {
+  (2.14,16.473) (5.25,57.020) (9.42,76.868) (17.69,90.349) (34.57,90.255) (68.80,89.605)
+};
+\addlegendentry{Vanilla + bucketing}
+
+% TileGym
+\addplot[tilegym, thick, mark=triangle*, mark size=2.5] coordinates {
+  (3.16,58.096) (10.93,91.427) (18.15,93.167) (32.61,90.876)
+};
+\addlegendentry{TileGym + pad64}
+
+% Packing
+\addplot[packing, thick, mark=diamond*, mark size=2.5] coordinates {
+  (8.94,83.684) (16.74,94.517) (31.12,103.542)
+};
+\addlegendentry{Packing}
+
+% Best point
+\addplot[packtilegym, thick, mark=star, mark size=4, only marks] coordinates {
+  (18.12,107.367)
+};
+\addlegendentry{Packing + TileGym}
+
+% Pareto frontier (dashed)
+\addplot[black, dashed, thin, no marks] coordinates {
+  (3.16,58.096) (10.93,91.427) (18.12,107.367)
+};
+
+\node[anchor=south, packtilegym] at (axis cs:18.12,108) {\small\textbf{107K}};
+
+\end{axis}
+\end{tikzpicture}
+\caption{VRAM--Throughput Pareto frontier. The optimal operating points are:
+TileGym B=4 at 3\,GB, TileGym B=32 at 11\,GB, and Packing+TileGym at 18\,GB.
+Beyond 18\,GB, throughput saturates --- additional VRAM buys no improvement.}
+\label{fig:pareto}
+\end{figure}
+
+\subsection{MFU Analysis}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.7\textwidth,
+  height=5.5cm,
+  xlabel={Configuration},
+  ylabel={MFU (\%)},
+  ymin=0, ymax=30,
+  ybar,
+  bar width=14pt,
+  xtick=data,
+  xticklabels={
+    {B=4\\TileGym},
+    {B=64\\Bucket},
+    {B=32\\TileGym},
+    {B=64\\TileGym},
+    {Packing\\B=45},
+    {Pack+TG\\B=23}
+  },
+  xticklabel style={align=center, font=\footnotesize},
+  nodes near coords,
+  nodes near coords style={font=\footnotesize},
+  every node near coord/.append style={anchor=south},
+]
+\addplot[fill=vanilla!70] coordinates {
+  (1,12.3) (2,19.1) (3,19.3) (4,19.7) (5,21.9) (6,22.7)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Model FLOPs Utilization across configurations. MFU saturates at
+$\sim$23\% for this 0.5B model --- limited by small GEMM shapes and
+memory bandwidth, not by software overhead.}
+\label{fig:mfu}
+\end{figure}
+
+\subsection{Speedup Progression}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\textwidth,
+  height=6cm,
+  xlabel={Optimization Iteration},
+  ylabel={Real tok/s (thousands)},
+  grid=major,
+  ymin=0, ymax=115,
+  xmin=-0.5, xmax=6.5,
+  xtick={0,1,2,3,4,5,6},
+  xticklabels={
+    {Baseline\\B=4},
+    {Bucket\\B=16},
+    {Bucket\\B=32},
+    {Bucket\\B=64},
+    {TileGym\\B=32},
+    {Packing\\B=64},
+    {Pack+TG\\B=64}
+  },
+  xticklabel style={align=center, font=\footnotesize},
+  nodes near coords,
+  nodes near coords style={font=\footnotesize, anchor=south},
+]
+\addplot[color=vanilla, thick, mark=*, mark size=3] coordinates {
+  (0,21.7) (1,57.0) (2,76.9) (3,90.3) (4,91.4) (5,94.5) (6,107.4)
+};
+
+% Annotations
+\draw[<->, thick, red!60!black] (axis cs:0,25) -- (axis cs:6,25)
+  node[midway, below, font=\small] {4.95$\times$ total speedup};
+\end{axis}
+\end{tikzpicture}
+\caption{Throughput progression through the optimization journey. The largest
+single gains come from batch scaling (B=4$\to$64: +4.2$\times$) and cuTile
+kernels (+23\% at equal batch). Packing adds a final +14\% at the ceiling.}
+\label{fig:progression}
+\end{figure}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Analysis \& Discussion}
+\label{sec:analysis}
+
+\subsection{Why Throughput Saturates at B=64}
+
+Beyond B=64 (with bucketing), Real tok/s plateaus at $\sim$90K despite VRAM
+scaling linearly. This occurs because:
+
+\begin{enumerate}
+  \item \textbf{Compute saturation}: All tensor-core GEMMs are already running
+    at near-peak occupancy. Adding more tokens per step increases latency
+    proportionally without improving per-token efficiency.
+  \item \textbf{Memory bandwidth bound}: The 0.5B model's weight matrices
+    (494M $\times$ 2\,B = 988\,MB) must be read from GDDR7 regardless of batch
+    size. At 1.79\,TB/s, this takes $\sim$0.55\,ms per layer --- a fixed cost
+    that dominates at small GEMM shapes.
+  \item \textbf{Amdahl's Law}: Non-matmul operations (softmax, RoPE, normalization)
+    consume 15--20\% of step time but cannot be parallelized across batch.
+\end{enumerate}
+
+\subsection{TileGym: Power and Pitfall}
+
+TileGym's cuTile kernels deliver 23\% speedup at fixed shapes by:
+\begin{itemize}
+  \item Eliminating kernel launch overhead via persistent kernels
+  \item Using Blackwell-native TMA (Tensor Memory Accelerator) for loads
+  \item Fusing multi-head attention with GQA natively
+\end{itemize}
+
+However, the JIT autotuner runs 20 samples per configuration to select
+optimal tile sizes. With variable sequence lengths:
+$$
+\text{overhead} = N_{\text{unique\_shapes}} \times 20 \times t_{\text{kernel}} \approx 500\text{ms}
+$$
+This makes TileGym \emph{counterproductive} without shape quantization.
+
+\subsection{Bucketing vs.\ Packing: A Nuanced Picture}
+
+\begin{table}[h]
+\centering
+\caption{Bucketing vs.\ Packing at similar VRAM ($\sim$17\,GB)}
+\label{tab:buck_vs_pack}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+Strategy & Real tok/s & Pad\% & $\Delta$ vs Bucket & Trade-off \\
+\midrule
+Bucketing (B=64) & 90,349 & 4.8\% & --- & Simple, no code changes \\
+Packing (B=64$\to$23, N=1024) & 94,517 & 0.0\% & +4.6\% & Custom collator + FlexAttention \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The 4.6\% gain from packing is real but modest. Packing becomes more
+valuable when:
+\begin{itemize}
+  \item Combined with cuTile (fixed N enables kernel caching): +14\% over vanilla packing
+  \item Dataset has high length variance ($\sigma / \mu > 0.5$)
+  \item Multi-turn dialogues create naturally long sequences
+\end{itemize}
+
+\subsection{Loss Ratio is Dataset-Intrinsic}
+
+The measured loss ratio (fraction of non-padding tokens that produce gradients)
+is $54.3 \pm 1.5\%$ across all configurations. This is determined entirely by
+the chat template structure (system prompt + question = no gradient, answer = gradient)
+and is \emph{independent} of engineering choices.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Negative Results}
+\label{sec:negative}
+
+\begin{table}[h]
+\centering
+\caption{Failed optimizations and lessons learned}
+\label{tab:failures}
+\small
+\begin{tabular}{@{}p{3.8cm}p{4cm}p{5.5cm}@{}}
+\toprule
+Technique & Result & Root Cause \\
+\midrule
+Vision feature caching & 0\% speedup, +27\% VRAM & SigLIP forward (5\,ms/tile) faster than H2D transfer of cached tensors \\
+\texttt{torch.compile} on vision & +3\% (noise) & Dynamic shapes from tiling; 40s compile overhead \\
+Custom Triton Flash Attention & Slower than SDPA & Blackwell's native SDPA already uses SM90+ instructions \\
+FlexAttention for packing & 51\% padding waste & avg sample (356 tok) $\ll$ bin size (1024); poor packing efficiency \\
+TileGym with variable shapes & 5$\times$ \emph{slower} & JIT autotuning on every unique (B,N,K) \\
+\texttt{flash-attn-4} install & Blocked & Requires CUDA 13.1+; system has CUDA 13.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Recommended Configuration}
+\label{sec:recipe}
+
+Based on our measurements, the optimal training configuration for SiQ-VL on
+a single Blackwell GPU is:
+
+\begin{table}[h]
+\centering
+\caption{Recommended training recipe}
+\label{tab:recipe}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Batch size & 64 (input) $\to$ 23 packed bins \\
+Sequence length & 1024 (fixed, packed) \\
+Kernels & TileGym (\texttt{apply\_tilegym\_kernel\_to\_qwen2}) \\
+Fused CE & Custom grad-in-forward (chunk=1024) \\
+Precision & BF16 \\
+Optimizer & FlashAdamW \\
+Data strategy & Packing with first-fit-decreasing \\
+Expected throughput & \textbf{107K real tok/s} \\
+Expected VRAM & 18.1\,GB (Stage 1) \\
+MFU & 22.7\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion \& Future Work}
+\label{sec:conclusion}
+
+We have systematically optimized SiQ-VL's single-GPU training from 21.7K to
+107.4K real tokens/second (4.95$\times$), reaching the hardware efficiency
+ceiling at 22.7\% MFU. The key insight is that for small (0.5B) models,
+\textbf{batch scaling + shape quantization + kernel fusion} are the three
+levers that matter; advanced techniques like sequence packing provide only
+marginal additional gains over effective length bucketing.
+
+\subsection{Future Directions}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Scale up}: Moving to Qwen2.5-3B/7B will increase MFU to
+    35--50\% by enabling larger GEMM shapes.
+  \item \textbf{Scale out}: Multi-GPU training on Modal (FSDP2 + tensor
+    parallelism) multiplies single-GPU throughput by $N_{\text{GPUs}}$.
+  \item \textbf{FP8 training}: Blackwell's FP8 tensor cores offer 2$\times$
+    peak TFLOP/s; FP8 training could double throughput when stable.
+  \item \textbf{Longer sequences}: Multi-turn data with 4K--8K tokens would
+    better amortize per-batch fixed costs and improve MFU.
+  \item \textbf{Overlapped execution}: Pipelining vision encoder + LLM
+    forward across CUDA streams to hide sequential dependency.
+\end{enumerate}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section*{Reproducibility}
+
+All code, data, and measurement scripts are available at:
+\begin{center}
+\texttt{github.com/classtag/SiQ-VL}
+\end{center}
+
+\noindent Key files:
+\begin{itemize}
+  \item \texttt{scripts/benchmark\_real\_efficiency.py} --- Main benchmark
+  \item \texttt{docs/traces/iter\_15\_ground\_truth\_efficiency.json} --- Raw data
+  \item \texttt{docs/training\_efficiency\_plan.md} --- Full iteration log
+\end{itemize}
+
+\end{document}
