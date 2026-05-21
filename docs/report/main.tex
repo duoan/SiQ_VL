@@ -17,6 +17,7 @@
 % \usepackage{algorithmic}
 \usepackage{enumitem}
 \usepackage{microtype}
+\usepackage{float}
 \usepackage{fancyhdr}
 \usepackage{listings}
 
@@ -134,7 +135,7 @@ We focus exclusively on engineering optimizations that preserve model quality
 
 \subsection{Hardware}
 
-\begin{table}[!htbp]
+\begin{table}[H]
 \centering
 \caption{Hardware configuration}
 \label{tab:hardware}
@@ -154,7 +155,7 @@ CUDA / Driver & CUDA 13.0, Driver 580.126 \\
 
 \subsection{Model Architecture}
 
-\begin{table}[!htbp]
+\begin{table}[H]
 \centering
 \caption{SiQ-VL model configuration}
 \label{tab:model}
@@ -227,7 +228,7 @@ With random sampling, padding waste scales with batch size (18--20\% at B=32).
 \textbf{Length bucketing} (HuggingFace \texttt{group\_by\_length}) sorts samples
 by estimated token length, ensuring each batch contains similar-length sequences.
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -308,7 +309,7 @@ This reduces VRAM by 51--64\% for the LM head in Stage~2.
 
 \subsection{Throughput Scaling}
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -370,7 +371,7 @@ shows \emph{effective} packed batch size.}
 
 \subsection{Complete Results Table}
 
-\begin{table}[!htbp]
+\begin{table}[H]
 \centering
 \caption{Ground-truth measurements on real data (sharegpt4v/coco, 50K samples, Stage~1)}
 \label{tab:results}
@@ -399,7 +400,7 @@ Packing (N=1024) & 45 & 103,542 & 103,542 & 0.0 & 446.0 & 31.1\,GB \\
 
 \subsection{VRAM--Throughput Trade-off}
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -454,7 +455,7 @@ Beyond 18\,GB, throughput saturates --- additional VRAM buys no improvement.}
 
 \subsection{MFU Analysis}
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -492,7 +493,7 @@ memory bandwidth, not by software overhead.}
 
 \subsection{Speedup Progression}
 
-\begin{figure}[!htbp]
+\begin{figure}[H]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -571,7 +572,7 @@ This makes TileGym \emph{counterproductive} without shape quantization.
 
 \subsection{Bucketing vs.\ Packing: A Nuanced Picture}
 
-\begin{table}[!htbp]
+\begin{table}[H]
 \centering
 \caption{Bucketing vs.\ Packing at similar VRAM ($\sim$17\,GB)}
 \label{tab:buck_vs_pack}
@@ -604,7 +605,7 @@ and is \emph{independent} of engineering choices.
 \section{Negative Results}
 \label{sec:negative}
 
-\begin{table}[!htbp]
+\begin{table}[H]
 \centering
 \caption{Failed optimizations and lessons learned}
 \label{tab:failures}
@@ -630,7 +631,7 @@ TileGym with variable shapes & 5$\times$ \emph{slower} & JIT autotuning on every
 Based on our measurements, the optimal training configuration for SiQ-VL on
 a single Blackwell GPU is:
 
-\begin{table}[!htbp]
+\begin{table}[H]
 \centering
 \caption{Recommended training recipe}
 \label{tab:recipe}
