@@ -901,6 +901,73 @@ materialized in Stage 1 where backward was never called.
 
 ---
 
+### Iteration 14 — Batch-Size Scaling & Optimizer Memory (FlashOptim)
+
+- **Date**: 2026-05-20
+- **Branch / Commit**: `master`
+- **Goal**: With Iter 13 showing only 5.6 GB VRAM on a 95 GB GPU, push batch size to maximize
+  GPU utilization and evaluate `flashoptim` (Databricks) for optimizer memory compression.
+
+#### Batch Scaling Results (Stage 2 + AdamW + grad_ckpt + TileGym full stack, N=1024)
+
+| B | ms/step | tok/s | VRAM (GB) | Util% |
+|---|---|---|---|---|
+| 32 | 439.4 | 74,578 | 7.03 | 7% |
+| 64 | 890.0 | 73,640 | 9.22 | 10% |
+| 128 | 1,769.4 | 74,075 | 15.29 | 16% |
+| 192 | 2,649.5 | 74,205 | 21.36 | 22% |
+| 256 | 3,529.5 | 74,273 | 27.43 | 29% |
+| 320 | 4,401.5 | 74,447 | 33.50 | 35% |
+| 384 | 5,279.2 | 74,484 | 39.57 | 42% |
+| 448 | 6,149.0 | 74,606 | 45.63 | 48% |
+| 512 | 7,027.1 | 74,609 | 51.71 | 54% |
+| 640 | 8,764.7 | 74,773 | 63.84 | 67% |
+| **768** | **10,517.5** | **74,774** | **75.98** | **80%** |
+| 896 | OOM | — | >80 | — |
+
+#### B×N Trade-off (same total tokens = 786K, ~80% VRAM fill)
+
+| Config | ms/step | tok/s | eff tok/s | VRAM (GB) |
+|---|---|---|---|---|
+| B=768, N=1024 | 10,509.9 | 74,828 | 71,247 | 76.0 |
+| B=384, N=2048 | 10,653.7 | 73,818 | 72,052 | 75.8 |
+| B=192, N=4096 | 11,038.3 | 71,245 | 70,393 | 75.7 |
+
+#### Key Findings
+
+1. **Throughput is batch-size-independent** at ~74K tok/s. GPU compute is fully saturated
+   even at B=32. Adding more data only increases step time proportionally.
+2. **VRAM scales linearly** at ~6 GB per additional 64 samples.
+3. **Same total tokens → same VRAM** regardless of B/N split. The fused_linear_CE and
+   gradient checkpointing eliminate per-sample overhead.
+4. **Longer sequences are only ~5% slower** (N=4096 vs N=1024) — acceptable for
+   long-context training where the quality benefit outweighs the small throughput cost.
+5. **Optimal B for Stage 2**: B=512–640 (54–67% VRAM), leaving headroom for:
+   - Real data with variable lengths (some batches may be longer)
+   - Multi-image samples that produce more vision tokens
+
+#### Practical Training Recipe
+
+```
+per_device_train_batch_size = 512   # for N≤1024 sequences
+per_device_train_batch_size = 256   # for N≤2048 sequences
+per_device_train_batch_size = 128   # for N≤4096 sequences
+gradient_accumulation_steps = 1     # already large effective batch
+```
+
+#### Next: FlashOptim (Databricks) — Optimizer Memory Compression
+
+- **What**: Drop-in `FlashAdamW` replaces `torch.optim.AdamW`, quantizing optimizer states
+  (momentum, variance) to int8 + 8-bit error correction. Reduces per-param memory by ~57%.
+- **Why**: With B=768 filling 80% VRAM, the remaining budget is tight. FlashOptim could free
+  ~4 GB of optimizer states, allowing B=896+ or longer sequences.
+- **Features**: Fused Triton kernels (no overhead), gradient release (update during backward),
+  compressed checkpoints (50%+ smaller), compatible with FSDP2.
+- **Hypothesis**: 35% less peak memory with identical convergence.
+- **Status**: TO BE TESTED.
+
+---
+
 ## 4.1. Performance Summary & MFU Analysis
 
 ### Cumulative Optimization Results
@@ -926,7 +993,8 @@ materialized in Stage 1 where backward was never called.
 | 8 | Batch size 16→20 + compile | 28,322 | 14,982 | 252.9 | 29.09 GB | 6.06x |
 | 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 15,777 | 297 | 34.0 GB | 6.38x |
 | 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 16,701 | 64.9 | 2.39 GB | 6.75x |
-| **13** | **TileGym full stack + cuTile CE** | **52,974** | **28,023** | **40.8** | **5.63 GB** | **11.33x** |
+| 13 | TileGym full stack + cuTile CE | 52,974 | 28,023 | 40.8 | 5.63 GB | 11.33x |
+| **14** | **Batch scaling (B=768, N=1024)** | **74,774** | **39,561** | **10,518** | **75.98 GB** | **16.0x** |
 
 ² Loss ratio: single-subset (sharegpt4v/coco) = 0.529; mixed-data (6 subsets) = 0.589.
   Eff. tok/s = GPU tok/s × loss_ratio for the respective dataset.
@@ -1201,7 +1269,8 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 | §4 (Iter 11) | "Custom kernels: cuTile DSL on Blackwell" |
 | §4 (Iter 13) | "TileGym: the Blackwell-native Liger-Kernel" |
 | §4 (Iter 12) | "Stage 2 readiness: unfreezing the LLM" |
-| §4 (Iter 14+) | "Going horizontal: distributed training on Modal" |
+| §4 (Iter 14) | "Batch scaling: GPU already saturated — use VRAM for convergence" |
+| §4 (Iter 15+) | "Going horizontal: distributed training on Modal" |
 | §6 | "Pitfalls I hit (from the Risk Register)" |
 
 ---
@@ -1233,6 +1302,8 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - `siq_vl/kernels/attention_backend.py` — HF Transformers attention backend registration
 - `siq_vl/dataset.py::VQADataset` — one random turn per sample
 - `scripts/benchmark_stage2.py` — Stage 2 benchmark (LoRA / Full FT / grad_ckpt comparison)
+- `scripts/benchmark_batch_scaling.py` — Batch-size scaling (find max B for VRAM budget)
+- `scripts/benchmark_flashoptim.py` — FlashOptim (Databricks) vs AdamW comparison
 - `scripts/train.py::train` — Trainer assembly + Stage switching
 - `scripts/train_launch.sh` — host detection + accelerate launch
 - `modal_train.py` — (planned) Modal App definition for distributed training
@@ -1247,3 +1318,4 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - **Modal**: Serverless cloud platform for running GPU workloads; provisions containers with GPUs on demand, with persistent Volumes for data/checkpoints
 - **cuTile DSL**: NVIDIA's domain-specific language for writing GPU kernels targeting Blackwell (sm_120) architecture, with native support for wgmma, TMA, and autotuning
 - **FSDP (Fully Sharded Data Parallel)**: PyTorch-native distributed training strategy that shards model parameters, gradients, and optimizer states across GPUs
+- **FlashOptim**: Databricks library providing drop-in optimizer replacements (`FlashAdamW`) that quantize states to int8 + error correction, reducing per-parameter memory by ~57%. Features gradient release (update during backward) and compressed checkpoints
