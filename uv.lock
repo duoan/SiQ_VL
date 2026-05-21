@@ -411,6 +411,21 @@ cu13 = [
 ]
 
 [[package]]
+name = "flashoptim"
+version = "0.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.9.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
+    { name = "torch", version = "2.9.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a3/ad/9bf3ec596650e23371a1515014de3d250046e18de8226310ebd6256677a9/flashoptim-0.1.4.tar.gz", hash = "sha256:8d2d9f2608bef51005ba827b8b63af17189979cc0301c542aad2610ab1780718", size = 99938, upload-time = "2026-04-17T18:17:49.268Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/2e/8465a97b6d574f50ecb98b76b2a57b8306b1834478f2097abf57a77d2bcf/flashoptim-0.1.4-py3-none-any.whl", hash = "sha256:8a4a3f2528fbda419d4f4dd0c9debb3de22bd0a45969bee2eb5a58185d3bd451", size = 46638, upload-time = "2026-04-17T18:17:51.047Z" },
+]
+
+[[package]]
 name = "fonttools"
 version = "4.63.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1536,6 +1551,7 @@ dependencies = [
     { name = "deepspeed" },
     { name = "einops" },
     { name = "flash-attn-4", extra = ["cu13"] },
+    { name = "flashoptim" },
     { name = "liger-kernel" },
     { name = "nltk" },
     { name = "peft" },
@@ -1567,6 +1583,7 @@ requires-dist = [
     { name = "deepspeed", specifier = ">=0.18.2" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "flash-attn-4", extras = ["cu13"], specifier = ">=4.0.0b14" },
+    { name = "flashoptim", specifier = ">=0.1.4" },
     { name = "liger-kernel", specifier = ">=0.8.0" },
     { name = "nltk", specifier = ">=3.9.2" },
     { name = "peft", specifier = ">=0.18.0" },
