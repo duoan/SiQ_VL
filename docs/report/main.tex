@@ -388,6 +388,28 @@ throughput, re-computing vision features is cheaper than transferring large pre-
 tensors over PCIe/memory bus. Always compare compute cost vs transfer cost.}
 
 % ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 4 --- Offline Image Preprocessing (Planned, Superseded)}
+
+\paragraph{Hypothesis.} CPU-bound image preprocessing (PIL resize + normalize + tile)
+is the DataLoader bottleneck. Pre-processing all images to tensor shards on disk would
+let the DataLoader only tokenize text and load pre-computed tensors via mmap.
+
+\paragraph{Experiment.} Planned but not executed.
+
+\paragraph{Finding.} Iteration~3 revealed that vision compute (SigLIP forward) is only
+5\,ms/tile on Blackwell---far faster than expected. The DataLoader is NOT the bottleneck;
+the GPU is simply underutilized at B=4. Pre-processing would save $\sim$5\,ms/step on
+a 270\,ms step (1.9\%), making it not worth the infrastructure complexity.
+
+\paragraph{Conclusion.} \textbf{Superseded} by batch size scaling (Iter 3). The planned
+offline preprocessing infrastructure was never needed because vision compute is not
+the bottleneck on modern GPUs.
+
+\paragraph{Lesson.} \emph{Measure before building infrastructure. We planned an entire
+caching system (scripts, datasets, collators) before discovering that the ``slow'' component
+takes only 5\,ms. Batch scaling gave 83\% improvement with zero infrastructure.}
+
+% ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 5 --- Length Bucketing}
 
 \paragraph{Hypothesis.} Intra-batch padding wastes 17.4\% of compute. Sorting samples by
@@ -408,6 +430,28 @@ variance (CoV=11.5\%, range 260--502 tokens).
 tokens at the same speed as real tokens (same GEMM size). The ``waste'' is that you computed
 tokens that don't contribute to learning, but wall-clock time per step barely changes if
 the max sequence length in each batch stays similar.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 6 --- First Packing Attempt (Failed)}
+
+\paragraph{Hypothesis.} Concatenating sequences into fixed-length packed bins with a
+4D block-diagonal attention mask should eliminate all padding.
+
+\paragraph{Experiment.} Implement packing with explicit \texttt{attention\_mask}
+(4D dense tensor, shape $B \times 1 \times N \times N$) under SDPA backend.
+
+\paragraph{Finding.} SDPA detects the non-trivial 4D mask and falls back to the
+\emph{math kernel} (naive $O(N^2)$ materialized attention)---orders of magnitude slower
+than the flash/efficient kernels used for simple causal masks. Training step time
+increased 3$\times$.
+
+\paragraph{Conclusion.} \textbf{Reverted}. SDPA cannot efficiently handle arbitrary
+4D masks. A different attention backend is needed for packing.
+
+\paragraph{Lesson.} \emph{Attention backend selection is not just about ``flash vs SDPA''---it's
+about what \underline{mask shapes} each backend supports efficiently. SDPA's flash path
+only handles causal masks; any custom mask triggers the slow fallback. This motivated
+the move to FlexAttention in Iter 10.}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 7 --- torch.compile Replaces Liger}
@@ -473,50 +517,6 @@ frequent graph re-capture). This workload is at its single-GPU ceiling for the
 \paragraph{Lesson.} \emph{torch.compile's ``reduce-overhead'' mode (cudagraphs) assumes
 static shapes. VLMs with variable-resolution images violate this assumption fundamentally.
 Don't force static-shape optimizations on inherently dynamic workloads.}
-
-% ─────────────────────────────────────────────────────────────────────────────
-\subsection{Iteration 4 --- Offline Image Preprocessing (Planned, Superseded)}
-
-\paragraph{Hypothesis.} CPU-bound image preprocessing (PIL resize + normalize + tile)
-is the DataLoader bottleneck. Pre-processing all images to tensor shards on disk would
-let the DataLoader only tokenize text and load pre-computed tensors via mmap.
-
-\paragraph{Experiment.} Planned but not executed.
-
-\paragraph{Finding.} Iteration~3 revealed that vision compute (SigLIP forward) is only
-5\,ms/tile on Blackwell---far faster than expected. The DataLoader is NOT the bottleneck;
-the GPU is simply underutilized at B=4. Pre-processing would save $\sim$5\,ms/step on
-a 270\,ms step (1.9\%), making it not worth the infrastructure complexity.
-
-\paragraph{Conclusion.} \textbf{Superseded} by batch size scaling (Iter 3). The planned
-offline preprocessing infrastructure was never needed because vision compute is not
-the bottleneck on modern GPUs.
-
-\paragraph{Lesson.} \emph{Measure before building infrastructure. We planned an entire
-caching system (scripts, datasets, collators) before discovering that the ``slow'' component
-takes only 5\,ms. Batch scaling gave 83\% improvement with zero infrastructure.}
-
-% ─────────────────────────────────────────────────────────────────────────────
-\subsection{Iteration 6 --- First Packing Attempt (Failed)}
-
-\paragraph{Hypothesis.} Concatenating sequences into fixed-length packed bins with a
-4D block-diagonal attention mask should eliminate all padding.
-
-\paragraph{Experiment.} Implement packing with explicit \texttt{attention\_mask}
-(4D dense tensor, shape $B \times 1 \times N \times N$) under SDPA backend.
-
-\paragraph{Finding.} SDPA detects the non-trivial 4D mask and falls back to the
-\emph{math kernel} (naive $O(N^2)$ materialized attention)---orders of magnitude slower
-than the flash/efficient kernels used for simple causal masks. Training step time
-increased 3$\times$.
-
-\paragraph{Conclusion.} \textbf{Reverted}. SDPA cannot efficiently handle arbitrary
-4D masks. A different attention backend is needed for packing.
-
-\paragraph{Lesson.} \emph{Attention backend selection is not just about ``flash vs SDPA''---it's
-about what \underline{mask shapes} each backend supports efficiently. SDPA's flash path
-only handles causal masks; any custom mask triggers the slow fallback. This motivated
-the move to FlexAttention in Iter 10.}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 9 --- DataLoader Optimization (Incremental)}
@@ -614,44 +614,6 @@ architecture-specific instructions. Don't waste time writing custom Triton atten
 for Blackwell—use TileGym's production kernel.}
 
 % ─────────────────────────────────────────────────────────────────────────────
-\subsection{Iteration 13 --- TileGym Full Stack: ALL Qwen2 Ops}
-
-\paragraph{Hypothesis.} If FA4 alone gives 7--12\%, replacing \emph{all} Qwen2 ops
-(RoPE, RMSNorm, SwiGLU, attention, CE loss) with cuTile equivalents should provide
-a larger cumulative speedup over Liger-Kernel.
-
-\paragraph{Experiment.} Apply \texttt{apply\_tilegym\_kernel\_to\_qwen2(use\_cutile=True)}
-which patches all ops. Additionally, implement custom \texttt{FusedLinearCrossEntropy}
-using TileGym's \texttt{\_ce\_cutile} kernel with ``grad-in-forward'' pattern (compute
-$\nabla_h$, $\nabla_W$ within the forward loop; backward becomes $O(1)$).
-
-\paragraph{Finding.}
-
-\begin{table}[H]\centering\small
-\caption{TileGym full stack vs Liger-Kernel (Stage 2, grad\_ckpt, B=4)}
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-Seq Len & Liger tok/s & TileGym tok/s & Speed $\Delta$ & VRAM $\Delta$ \\ \midrule
-512 & 38.3K & 49.7K & \textbf{+30\%} & \textbf{--50\%} \\
-1024 & 46.5K & 64.6K & \textbf{+39\%} & \textbf{--59\%} \\
-2048 & 48.7K & 68.7K & \textbf{+41\%} & \textbf{--64\%} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\noindent The VRAM reduction (50--64\%) comes from the grad-in-forward CE pattern:
-logits ($B \times L \times V$) are never materialized; gradients are accumulated
-chunk-by-chunk (1024 tokens) during the forward pass.
-
-\paragraph{Conclusion.} TileGym's full stack is \textbf{both faster AND more memory-efficient}
-than Liger-Kernel on Blackwell. It is the correct kernel solution for this hardware.
-
-\paragraph{Lesson.} \emph{cuTile's online softmax kernel (\texttt{\_ce\_online\_kernel}) computes
-loss + grad in a single pass over vocab tiles. Combined with grad-in-forward (accumulate
-$\nabla_h$ per chunk, never store $\nabla_{\text{logits}}$), this eliminates the largest
-memory bottleneck in LLM training: the logits tensor ($B \times L \times V = B \times L \times 151936$).}
-
-% ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 12 --- Stage 2 Readiness (cuTile Forward Doesn't Help Backward)}
 
 \paragraph{Hypothesis.} TileGym FA4 gave 7--12\% speedup in Stage~1 (forward-only attention).
@@ -691,6 +653,44 @@ CUDA 13.1+ (system has 13.0).
 \paragraph{Lesson.} \emph{Optimizing a component that's $<$15\% of step time (attention forward)
 while the rest (backward at 70\%) is unchanged yields negligible E2E gains.
 Amdahl's Law is unforgiving: always target the dominant cost.}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Iteration 13 --- TileGym Full Stack: ALL Qwen2 Ops}
+
+\paragraph{Hypothesis.} If FA4 alone gives 7--12\%, replacing \emph{all} Qwen2 ops
+(RoPE, RMSNorm, SwiGLU, attention, CE loss) with cuTile equivalents should provide
+a larger cumulative speedup over Liger-Kernel.
+
+\paragraph{Experiment.} Apply \texttt{apply\_tilegym\_kernel\_to\_qwen2(use\_cutile=True)}
+which patches all ops. Additionally, implement custom \texttt{FusedLinearCrossEntropy}
+using TileGym's \texttt{\_ce\_cutile} kernel with ``grad-in-forward'' pattern (compute
+$\nabla_h$, $\nabla_W$ within the forward loop; backward becomes $O(1)$).
+
+\paragraph{Finding.}
+
+\begin{table}[H]\centering\small
+\caption{TileGym full stack vs Liger-Kernel (Stage 2, grad\_ckpt, B=4)}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Seq Len & Liger tok/s & TileGym tok/s & Speed $\Delta$ & VRAM $\Delta$ \\ \midrule
+512 & 38.3K & 49.7K & \textbf{+30\%} & \textbf{--50\%} \\
+1024 & 46.5K & 64.6K & \textbf{+39\%} & \textbf{--59\%} \\
+2048 & 48.7K & 68.7K & \textbf{+41\%} & \textbf{--64\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The VRAM reduction (50--64\%) comes from the grad-in-forward CE pattern:
+logits ($B \times L \times V$) are never materialized; gradients are accumulated
+chunk-by-chunk (1024 tokens) during the forward pass.
+
+\paragraph{Conclusion.} TileGym's full stack is \textbf{both faster AND more memory-efficient}
+than Liger-Kernel on Blackwell. It is the correct kernel solution for this hardware.
+
+\paragraph{Lesson.} \emph{cuTile's online softmax kernel (\texttt{\_ce\_online\_kernel}) computes
+loss + grad in a single pass over vocab tiles. Combined with grad-in-forward (accumulate
+$\nabla_h$ per chunk, never store $\nabla_{\text{logits}}$), this eliminates the largest
+memory bottleneck in LLM training: the logits tensor ($B \times L \times V = B \times L \times 151936$).}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration 14 --- Batch-Size Scaling + FlashOptim}
