@@ -338,6 +338,7 @@ def get_stage1_model_and_processor(
     vision_pixel_shuffle_factor: int = 2,
     enable_dynamic_tiling: bool = False,
     use_packing: bool = False,
+    use_cutile: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
@@ -345,6 +346,7 @@ def get_stage1_model_and_processor(
         pretrained_vision_model_path: Path to the pretrained vision model.
         pretrained_text_model_path: Path to the pretrained text model.
         use_packing: If True, uses flex_attention for efficient packed sequence training.
+        use_cutile: If True, uses cuTile Flash Attention backend (Blackwell-optimized).
 
     Returns:
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
@@ -352,7 +354,15 @@ def get_stage1_model_and_processor(
     rank_zero_info("Initializing SiQ-VL model for stage 1...")
     _apply_liger_kernel()
 
-    text_attn_impl = "flex_attention" if use_packing else "sdpa"
+    if use_cutile:
+        from siq_vl.kernels.attention_backend import register_cutile_attention
+        register_cutile_attention()
+        text_attn_impl = "cutile"
+        rank_zero_info(">>> cuTile Flash Attention registered as attention backend")
+    elif use_packing:
+        text_attn_impl = "flex_attention"
+    else:
+        text_attn_impl = "sdpa"
 
     config = get_siq_vl_config(
         text_model_name_or_path=pretrained_text_model_path,
