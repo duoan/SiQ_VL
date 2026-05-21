@@ -831,15 +831,25 @@ Combined targets:
   | 1024 | 46.5K | 54.3K | +17% |
   | 2048 | 48.7K | 57.0K | +17% |
 
-- **Peak throughput (Stage 1)**: B=16, N=1024 → **84.3K tok/s** at 42.3 GB
+- **Peak throughput (Stage 1)**: B=4, N=1024 → **100.3K tok/s** at 5.63 GB
+- **Peak throughput (Stage 2 + grad_ckpt)**: B=32, N=1024 → **73.9K tok/s** at 14.47 GB
 - **Integration**: `--use_tilegym` flag in `scripts/train.py`, or `use_tilegym=True` in model init.
-  Automatically applies TileGym + Liger's `fused_linear_cross_entropy` (best of both).
+  Full TileGym stack: RoPE + RMSNorm + SwiGLU + FA4 attention + cuTile fused_linear_CE.
 - **flash-attn-4 status**: `pip install flash-attn-4[cu13]` blocked by CUDA 13.0 → requires 13.1+.
+- **Stage 2 vs Liger (with gradient checkpointing)**:
+
+  | N | Liger tok/s / VRAM | TileGym tok/s / VRAM | Speed | VRAM |
+  |---|---|---|---|---|
+  | 512 | 38.3K / 5.28 GB | 49.7K / 2.64 GB | **+30%** | **-50%** |
+  | 1024 | 46.5K / 9.43 GB | 64.6K / 3.89 GB | **+39%** | **-59%** |
+  | 2048 | 48.7K / 17.74 GB | 68.7K / 6.39 GB | **+41%** | **-64%** |
+
 - **Lessons**:
   - TileGym is to Liger what cuTile is to Triton — same idea, but targets Blackwell natively.
-  - The ~12-17% speedup comes from ALL ops, not just attention. SwiGLU/RMSNorm/RoPE are all
-    faster because cuTile emits `wgmma` + TMA instructions that Triton can't generate on sm_120.
-  - `fused_linear_cross_entropy` is complementary — TileGym doesn't have this, Liger does.
+  - The cuTile CE kernel (`_ce_online_kernel`) does online softmax + loss in ONE pass over
+    vocab tiles. It's both faster AND more memory-efficient than chunked PyTorch CE.
+  - After the kernel runs, logits buffer contains softmax probs in-place — free backward data!
+  - Combined effect: **30-41% faster, 50-64% less VRAM** than Liger. Zero Liger dependency.
 
 ---
 
@@ -916,7 +926,7 @@ materialized in Stage 1 where backward was never called.
 | 8 | Batch size 16→20 + compile | 28,322 | 14,982 | 252.9 | 29.09 GB | 6.06x |
 | 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 15,777 | 297 | 34.0 GB | 6.38x |
 | 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 16,701 | 64.9 | 2.39 GB | 6.75x |
-| **13** | **TileGym full patch (all cuTile ops)** | **33,615** | **17,777** | **60.8** | **3.55 GB** | **7.19x** |
+| **13** | **TileGym full stack + cuTile CE** | **52,974** | **28,023** | **40.8** | **5.63 GB** | **11.33x** |
 
 ² Loss ratio: single-subset (sharegpt4v/coco) = 0.529; mixed-data (6 subsets) = 0.589.
   Eff. tok/s = GPU tok/s × loss_ratio for the respective dataset.

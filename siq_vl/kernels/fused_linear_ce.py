@@ -1,24 +1,25 @@
-"""TileGym cuTile fused linear cross-entropy with autograd backward support.
+"""Fused linear cross-entropy using TileGym's cuTile CE kernel.
 
 Replaces the standard `lm_head(hidden) → CE(logits, labels)` pattern with a
 chunked computation that never materializes the full [BT, V] logits tensor.
 
-Forward: uses TileGym's cuTile kernel (tilegym.ops.fused_linear_cross_entropy)
-Backward: chunked softmax → grad_hidden = grad_logits @ weight
+Forward: chunked matmul + TileGym _ce_cutile kernel (online softmax over vocab tiles)
+Backward: reuses in-place softmax probs from forward for grad_hidden = (probs - one_hot) @ W
 
 Monkey-patches Qwen2ForCausalLM.forward to use this fused path during training.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+from tilegym.ops.cutile.experimental.fused_linear_cross_entropy import _ce_cutile
 
 _CHUNK_SIZE = 4096
 
 
 class FusedLinearCrossEntropy(torch.autograd.Function):
-    """Autograd wrapper: chunked matmul + CE forward, chunked grad backward."""
+    """Autograd wrapper using TileGym's cuTile CE kernel for forward."""
 
     @staticmethod
     def forward(
@@ -29,41 +30,48 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         ignore_index: int,
     ) -> Tensor:
         bt, h = hidden_states.shape
+        vocab_size = weight.shape[0]
         chunk_size = min(_CHUNK_SIZE, bt)
         num_chunks = (bt + chunk_size - 1) // chunk_size
 
-        total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
+        loss_all = torch.empty(bt, device=hidden_states.device, dtype=torch.float32)
         n_valid = 0
 
-        # Store per-chunk softmax probs for backward
+        # After _ce_cutile, logits_chunk is overwritten with softmax probs in-place.
+        # We store these for backward.
         grad_logits_chunks = []
 
         for i in range(num_chunks):
             s, e = i * chunk_size, min((i + 1) * chunk_size, bt)
-            x_chunk = hidden_states[s:e]
+            x_chunk = hidden_states[s:e].detach()
             t_chunk = target[s:e]
 
+            # GEMM: logits = x @ W^T (detached buffer for in-place CE kernel)
             logits_chunk = x_chunk @ weight.T
+            loss_chunk = loss_all[s:e]
+
             valid_mask = t_chunk != ignore_index
             n_valid_chunk = valid_mask.sum().item()
 
             if n_valid_chunk > 0:
-                loss_chunk = F.cross_entropy(
-                    logits_chunk.float(), t_chunk, ignore_index=ignore_index, reduction="sum"
-                )
-                total_loss = total_loss + loss_chunk
-                n_valid += n_valid_chunk
+                # TileGym cuTile kernel: computes loss AND overwrites logits with softmax probs
+                _ce_cutile(logits_chunk, t_chunk, loss_chunk, ignore_index)
 
-                with torch.no_grad():
-                    probs = F.softmax(logits_chunk.float(), dim=-1)
-                    safe_target = t_chunk.clamp(min=0)
-                    probs.scatter_(1, safe_target.unsqueeze(1), probs.gather(1, safe_target.unsqueeze(1)) - 1.0)
-                    probs[~valid_mask] = 0.0
-                    grad_logits_chunks.append(probs.to(hidden_states.dtype))
+                # logits_chunk now contains softmax probs — compute grad_logits = probs - one_hot
+                safe_target = t_chunk.clamp(min=0)
+                logits_chunk[torch.arange(logits_chunk.shape[0], device=logits_chunk.device), safe_target] -= 1.0
+                logits_chunk[~valid_mask] = 0.0
+                grad_logits_chunks.append(logits_chunk.to(hidden_states.dtype))
+                n_valid += n_valid_chunk
             else:
+                loss_chunk.zero_()
                 grad_logits_chunks.append(None)
 
-        loss = total_loss / max(n_valid, 1)
+        # Reduction: mean over valid tokens
+        if n_valid > 0:
+            loss = loss_all.sum() / n_valid
+        else:
+            loss = loss_all.sum()
 
         ctx.save_for_backward(hidden_states, weight)
         ctx.grad_logits_chunks = grad_logits_chunks
@@ -94,6 +102,7 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
                 grad_hidden[s:e] = 0.0
                 continue
 
+            # grad_logits already contains (probs - one_hot) from forward
             scaled_grad = grad_logits * scale
             grad_hidden[s:e] = scaled_grad @ weight
 
@@ -110,7 +119,10 @@ def fused_linear_cross_entropy(
     target: Tensor,
     ignore_index: int = -100,
 ) -> Tensor:
-    """Fused linear + cross-entropy — never materializes full [BT, V] logits.
+    """Fused linear + cross-entropy using TileGym cuTile kernel.
+
+    Never materializes full [BT, V] logits — processes in chunks.
+    The cuTile kernel computes loss + softmax probs in a single pass.
 
     Args:
         hidden_states: (BT, H) flattened hidden states
@@ -122,15 +134,13 @@ def fused_linear_cross_entropy(
 
 
 def patch_qwen2_fused_linear_ce():
-    """Monkey-patch Qwen2ForCausalLM.forward to use fused linear cross-entropy.
+    """Monkey-patch Qwen2ForCausalLM.forward to use TileGym fused linear cross-entropy.
 
     This replaces lm_head(hidden) → CE(logits, labels) with a single fused op
     that computes the loss without materializing the full logits tensor.
     """
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
     from transformers.modeling_outputs import CausalLMOutputWithPast
-
-    _original_forward = Qwen2ForCausalLM.forward.__wrapped__ if hasattr(Qwen2ForCausalLM.forward, '__wrapped__') else None
 
     def _fused_forward(
         self,
@@ -160,7 +170,6 @@ def patch_qwen2_fused_linear_ce():
 
         loss = None
         if labels is not None and self.training:
-            # Shift labels: predict next token
             shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
@@ -173,10 +182,8 @@ def patch_qwen2_fused_linear_ce():
                 shift_labels.view(bt),
                 ignore_index=-100,
             )
-            # Return dummy logits (empty) during training to save memory
             logits = torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype)
         else:
-            # Inference: compute logits normally
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])
             if labels is not None:
