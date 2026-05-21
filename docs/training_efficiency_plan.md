@@ -832,11 +832,23 @@ Combined targets:
   | 2048 | 48.7K | 57.0K | +17% |
 
 - **Peak throughput (Stage 1)**: B=4, N=1024 → **100.3K tok/s** at 5.63 GB
-- **Peak throughput (Stage 2 + grad_ckpt)**: B=32, N=1024 → **73.9K tok/s** at 14.47 GB
+- **Peak throughput (Stage 2 + grad_ckpt)**: B=32, N=1024 → **76.5K tok/s** at 5.27 GB (after grad-in-forward)
 - **Integration**: `--use_tilegym` flag in `scripts/train.py`, or `use_tilegym=True` in model init.
   Full TileGym stack: RoPE + RMSNorm + SwiGLU + FA4 attention + cuTile fused_linear_CE.
 - **flash-attn-4 status**: `pip install flash-attn-4[cu13]` blocked by CUDA 13.0 → requires 13.1+.
-- **Stage 2 vs Liger (with gradient checkpointing)**:
+
+#### Fused Linear CE: grad-in-forward pattern
+
+The custom `FusedLinearCrossEntropy` (`siq_vl/kernels/fused_linear_ce.py`) computes `grad_hidden`
+and `grad_weight` within the forward pass loop (per chunk), using `grad_logits` directly from
+TileGym's `_ce_cutile` kernel. The backward method is O(1) — just scalar scaling by `grad_output`.
+
+  | Config | Before (store grad_logits) | After (grad-in-forward) | VRAM Δ | Speed Δ |
+  |---|---|---|---|---|
+  | B=32, N=1024, grad_ckpt | 73.9K tok/s, 14.47 GB | 76.5K tok/s, 5.27 GB | **-64%** | **+3.5%** |
+  | B=4, N=4096, grad_ckpt | 70.0K tok/s, 9.08 GB | 72.2K tok/s, 4.47 GB | **-51%** | **+3%** |
+
+#### Final comparison: TileGym full stack vs Liger (Stage 2 + gradient checkpointing, B=4)
 
   | N | Liger tok/s / VRAM | TileGym tok/s / VRAM | Speed | VRAM |
   |---|---|---|---|---|
@@ -849,6 +861,9 @@ Combined targets:
   - The cuTile CE kernel (`_ce_online_kernel`) does online softmax + loss in ONE pass over
     vocab tiles. It's both faster AND more memory-efficient than chunked PyTorch CE.
   - After the kernel runs, logits buffer contains softmax probs in-place — free backward data!
+  - grad-in-forward pattern: compute `grad_hidden`/`grad_weight` inside forward loop, backward
+    becomes trivial. Saves 51-64% VRAM by never storing `grad_logits` chunks.
+  - `tilegym.ops.matmul` is slower than `torch.mm` for large GEMMs — cuBLAS already optimal.
   - Combined effect: **30-41% faster, 50-64% less VRAM** than Liger. Zero Liger dependency.
 
 ---
@@ -955,16 +970,29 @@ per_device_train_batch_size = 128   # for N≤4096 sequences
 gradient_accumulation_steps = 1     # already large effective batch
 ```
 
-#### Next: FlashOptim (Databricks) — Optimizer Memory Compression
+#### FlashOptim (Databricks) — Optimizer Memory Compression
 
 - **What**: Drop-in `FlashAdamW` replaces `torch.optim.AdamW`, quantizing optimizer states
   (momentum, variance) to int8 + 8-bit error correction. Reduces per-param memory by ~57%.
-- **Why**: With B=768 filling 80% VRAM, the remaining budget is tight. FlashOptim could free
-  ~4 GB of optimizer states, allowing B=896+ or longer sequences.
 - **Features**: Fused Triton kernels (no overhead), gradient release (update during backward),
   compressed checkpoints (50%+ smaller), compatible with FSDP2.
-- **Hypothesis**: 35% less peak memory with identical convergence.
-- **Status**: TO BE TESTED.
+
+  | Optimizer | Max B (N=1024) | VRAM @B=768 | tok/s @B=768 |
+  |---|---|---|---|
+  | torch.optim.AdamW | 768 | 76.0 GB | 74,798 |
+  | FlashAdamW (int8 states) | 768 | 75.6 GB | 74,889 |
+  | FlashAdamW + gradient_release | **832** | 81.7 GB (B=832) | 74,779 |
+
+- **Measured savings**: 0.4 GB optimizer memory (int8 quantization). Gradient release frees
+  gradient tensor (~1 GB), enabling B=832 vs B=768 max with AdamW.
+- **Throughput impact**: None — identical tok/s across all optimizers.
+- **Why marginal**: For 0.5B trainable params, optimizer states = ~4 GB out of 76 GB total.
+  Activation memory from the batch dominates at large B. FlashOptim's savings are more
+  impactful for 7B+ models where optimizer states consume 10-50+ GB.
+- **Recommendation**: Use `FlashAdamW` as default (free savings, no downsides, convergence
+  identical per paper). Gradient release is useful if NOT doing gradient accumulation or
+  gradient clipping. Add `flashoptim>=0.1.4` to deps.
+- **Status**: TESTED — marginal for this model scale, recommended for future scale-up.
 
 ---
 
@@ -993,11 +1021,20 @@ gradient_accumulation_steps = 1     # already large effective batch
 | 8 | Batch size 16→20 + compile | 28,322 | 14,982 | 252.9 | 29.09 GB | 6.06x |
 | 10 | Packing + FlexAttention (mixed) ¹ | 26,787 | 15,777 | 297 | 34.0 GB | 6.38x |
 | 11 | TileGym FA4 (cuTile, native GQA) | 31,581 | 16,701 | 64.9 | 2.39 GB | 6.75x |
-| 13 | TileGym full stack + cuTile CE | 52,974 | 28,023 | 40.8 | 5.63 GB | 11.33x |
-| **14** | **Batch scaling (B=768, N=1024)** | **74,774** | **39,561** | **10,518** | **75.98 GB** | **16.0x** |
+| 13 | TileGym full stack + cuTile CE ³ | 52,974 | 28,023 | 40.8 | 5.63 GB | 11.33x |
+| **14** | **Batch scaling (B=768, N=1024) ⁴** | **74,774** | **39,561** | **10,518** | **75.98 GB** | **16.0x** |
 
 ² Loss ratio: single-subset (sharegpt4v/coco) = 0.529; mixed-data (6 subsets) = 0.589.
   Eff. tok/s = GPU tok/s × loss_ratio for the respective dataset.
+
+³ Iter 13 measured on real sharegpt4v/coco pipeline (B=4, variable lengths, avg ~540 tok/sample).
+  Peak synthetic throughput: Stage 1 = 100.3K tok/s (B=4, N=1024); Stage 2 = 76.5K tok/s
+  (B=32, N=1024, grad_ckpt, AdamW). The cuTile CE + grad-in-forward pattern reduced Stage 2
+  VRAM by 64% (14.47 → 5.27 GB).
+
+⁴ Iter 14 measured on synthetic data (B=768, N=1024, Stage 2 unfrozen + grad_ckpt + AdamW).
+  Throughput is B-independent (~74K tok/s at any B from 32 to 768) — GPU compute was already
+  fully saturated. FlashAdamW adds 0.4 GB savings; gradient_release enables B=832 max.
 
 ¹ Iter 10 measured on mixed-data (6 subsets, high length variance) whereas Iters 0–8 used
 single-subset (sharegpt4v/coco). On the mixed dataset, the answers are proportionally longer
