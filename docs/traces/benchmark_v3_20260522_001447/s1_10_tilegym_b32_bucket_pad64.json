@@ -1,0 +1,31 @@
+{
+  "model": "small",
+  "model_label": "SigLIP2-base-224 + Qwen2.5-0.5B",
+  "stage": 1,
+  "config": {
+    "batch_size": 32,
+    "use_bucketing": true,
+    "use_packing": false,
+    "pack_max_length": 1024,
+    "pad_to_multiple_of": 64,
+    "use_tilegym": true,
+    "use_liger": false,
+    "no_fused_ce": false,
+    "use_compile": false,
+    "force_fp32": false,
+    "use_grad_ckpt": false,
+    "use_lora": false
+  },
+  "results": {
+    "steps": 20,
+    "avg_B": 32.0,
+    "avg_N": 384.0,
+    "avg_step_ms": 114.59595699989222,
+    "pos_per_sec": 107228.91384389378,
+    "real_tok_per_sec": 91866.2427157871,
+    "loss_tok_per_sec": 49924.536168456456,
+    "pad_pct": 14.326985677083337,
+    "loss_pct": 54.34481120873902,
+    "vram_gb": 10.931077003479004
+  }
+}

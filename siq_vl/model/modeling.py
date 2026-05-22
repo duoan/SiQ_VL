@@ -63,9 +63,15 @@ def _apply_tilegym_kernel(use_cutile: bool = True):
         _apply_liger_kernel()
 
 
-def _apply_liger_kernel():
-    """Apply Liger-Kernel optimizations to Qwen2 (fused linear-CE, RMSNorm, SwiGLU).
-    Must be called before model instantiation. Safe to call multiple times."""
+def _apply_liger_kernel(fused_linear_cross_entropy: bool = True):
+    """Apply Liger-Kernel optimizations to Qwen2.
+    Must be called before model instantiation. Safe to call multiple times.
+
+    Args:
+        fused_linear_cross_entropy: Enable chunked fused LM-head + CE loss.
+            Saves massive VRAM but slower on compute-rich GPUs (90GB+).
+            Disable for Stage 2 on high-VRAM hardware.
+    """
     global _LIGER_APPLIED
     if _LIGER_APPLIED:
         return
@@ -75,11 +81,12 @@ def _apply_liger_kernel():
         apply_liger_kernel_to_qwen2(
             rope=True,
             cross_entropy=False,
-            fused_linear_cross_entropy=True,
+            fused_linear_cross_entropy=fused_linear_cross_entropy,
             rms_norm=True,
             swiglu=True,
         )
-        rank_zero_info(">>> Liger-Kernel applied: fused_linear_cross_entropy + RMSNorm + SwiGLU + RoPE")
+        ce_status = "ON" if fused_linear_cross_entropy else "OFF"
+        rank_zero_info(f">>> Liger-Kernel applied: FusedCE={ce_status}, RMSNorm, SwiGLU, RoPE")
         _LIGER_APPLIED = True
     except ImportError:
         rank_zero_info(">>> Liger-Kernel not installed, skipping optimizations")
@@ -368,6 +375,7 @@ def get_stage1_model_and_processor(
     use_cutile: bool = False,
     use_tilegym: bool = False,
     use_liger: bool = False,
+    use_fused_ce: bool = True,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
@@ -380,6 +388,8 @@ def get_stage1_model_and_processor(
                      Supersedes both Liger and use_cutile.
         use_liger: If True, applies Liger-Kernel fused ops. If False and no other kernel
                    is selected, uses vanilla PyTorch.
+        use_fused_ce: When use_liger=True, whether to enable fused_linear_cross_entropy.
+                      Disable on high-VRAM GPUs for Stage 2 (saves 18% speed).
 
     Returns:
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
@@ -390,14 +400,14 @@ def get_stage1_model_and_processor(
         _apply_tilegym_kernel(use_cutile=True)
         text_attn_impl = "sdpa"  # TileGym patches SDPA in-place
     elif use_cutile:
-        _apply_liger_kernel()
+        _apply_liger_kernel(fused_linear_cross_entropy=use_fused_ce)
         from siq_vl.kernels.attention_backend import register_cutile_attention
         register_cutile_attention()
         text_attn_impl = "cutile"
         rank_zero_info(">>> TileGym FA4 (cuTile) registered: native GQA + autotuned tiles")
     else:
         if use_liger:
-            _apply_liger_kernel()
+            _apply_liger_kernel(fused_linear_cross_entropy=use_fused_ce)
         if use_packing:
             text_attn_impl = "flex_attention"
         else:

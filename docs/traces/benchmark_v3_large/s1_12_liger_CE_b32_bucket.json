@@ -1,0 +1,31 @@
+{
+  "model": "large",
+  "model_label": "SigLIP2-so400m-384 + Qwen2.5-1.5B",
+  "stage": 1,
+  "config": {
+    "batch_size": 32,
+    "use_bucketing": true,
+    "use_packing": false,
+    "pack_max_length": 1024,
+    "pad_to_multiple_of": null,
+    "use_tilegym": false,
+    "use_liger": true,
+    "no_fused_ce": false,
+    "use_compile": false,
+    "force_fp32": false,
+    "use_grad_ckpt": false,
+    "use_lora": false
+  },
+  "results": {
+    "steps": 20,
+    "avg_B": 32.0,
+    "avg_N": 376.3,
+    "avg_step_ms": 437.1455491001143,
+    "pos_per_sec": 27545.97416075316,
+    "real_tok_per_sec": 26424.837273945333,
+    "loss_tok_per_sec": 13087.517445338903,
+    "pad_pct": 4.070057135264415,
+    "loss_pct": 49.527334112452934,
+    "vram_gb": 22.66049861907959
+  }
+}

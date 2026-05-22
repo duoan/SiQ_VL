@@ -44,11 +44,13 @@ MODEL_CONFIGS = {
         "vision": "google/siglip2-base-patch16-224",
         "text": "Qwen/Qwen2.5-0.5B-Instruct",
         "label": "SigLIP2-base-224 + Qwen2.5-0.5B",
+        "pixel_shuffle_factor": 2,  # 224/16=14, 14/2=7 ✓
     },
     "large": {
         "vision": "google/siglip2-so400m-patch14-384",
         "text": "Qwen/Qwen2.5-1.5B-Instruct",
         "label": "SigLIP2-so400m-384 + Qwen2.5-1.5B",
+        "pixel_shuffle_factor": 3,  # 384/14=27, 27/3=9 ✓
     },
 }
 
@@ -218,6 +220,8 @@ def main():
     # Kernel optimization
     parser.add_argument("--use_tilegym", action="store_true", help="TileGym full stack (cuTile)")
     parser.add_argument("--use_liger", action="store_true", help="Liger-Kernel fused ops")
+    parser.add_argument("--no_fused_ce", action="store_true",
+                        help="Disable Liger fused_linear_cross_entropy (faster on high-VRAM GPUs)")
     parser.add_argument("--use_compile", action="store_true", help="torch.compile the model")
     parser.add_argument("--force_fp32", action="store_true", help="Reproduce FP32 baseline bug")
     # Stage 2 options
@@ -263,8 +267,10 @@ def main():
     model, processor = get_stage1_model_and_processor(
         pretrained_vision_model_path=config["vision"],
         pretrained_text_model_path=config["text"],
+        vision_pixel_shuffle_factor=config["pixel_shuffle_factor"],
         use_tilegym=args.use_tilegym,
         use_liger=args.use_liger,
+        use_fused_ce=not args.no_fused_ce,
     )
 
     if args.force_fp32:
@@ -404,6 +410,7 @@ def main():
                 "pad_to_multiple_of": args.pad_to_multiple_of,
                 "use_tilegym": args.use_tilegym,
                 "use_liger": args.use_liger,
+                "no_fused_ce": args.no_fused_ce,
                 "use_compile": args.use_compile,
                 "force_fp32": args.force_fp32,
                 "use_grad_ckpt": args.use_grad_ckpt,

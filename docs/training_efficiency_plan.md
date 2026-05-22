@@ -1042,7 +1042,171 @@ gradient_accumulation_steps = 1     # already large effective batch
 
 ## 4.1. Performance Summary & MFU Analysis
 
-### Unified Benchmark Results (v2 — Controlled Single-Backbone)
+### Benchmark Results (v3 — Final, Clean Re-run)
+
+All numbers below use a **single backbone** (SigLIP2-base-224 + Qwen2.5-0.5B, 589.7M total).
+Measured end-to-end on real data (`sharegpt4v/coco`, 50K samples) using
+`scripts/benchmark_real_efficiency.py`. **No callbacks, no gradient checkpointing, no overhead.**
+Raw traces at `docs/traces/benchmark_v3_20260522_001447/`.
+
+Script: `scripts/run_benchmark_v3.sh`
+
+---
+
+#### Metric Definitions
+
+| Metric | Formula | Meaning |
+|--------|---------|---------|
+| **Real tok/s** | `attention_mask.sum() / wall_time` | Effective throughput: non-padding tokens processed per second |
+| **Pos/s (hw)** | `B × N / wall_time` | Hardware throughput: total positions including padding |
+| **Pad%** | `1 - attention_mask.sum() / (B × N)` | Fraction of positions that are padding (wasted compute) |
+| **Loss%** | `(labels != -100).sum() / attention_mask.sum()` | Fraction of real tokens that produce gradient signal |
+| **VRAM** | `torch.cuda.max_memory_allocated()` | Peak GPU memory usage |
+| **Speedup** | `Real tok/s (config) / Real tok/s (baseline)` | Efficiency gain vs respective stage baseline |
+
+---
+
+#### Stage 1 Results (Frozen LLM — only projector trains)
+
+| # | Config | Real tok/s | VRAM | Pad% | Speedup |
+|---|--------|-----------|------|------|---------|
+| S1-01 | **Baseline**: FP32, B=4 | 14,713 | 10.5 GB | 12.3% | 1.00x |
+| S1-02 | BF16 fix, B=4 | 34,747 | 7.1 GB | 12.3% | **2.36x** |
+| S1-03 | BF16, B=16 (no bucket) | 45,893 | 25.2 GB | 16.9% | 3.12x |
+| S1-04 | BF16, B=16, bucketing | 52,854 | 18.0 GB | 3.8% | 3.59x |
+| S1-05 | BF16, B=32, bucketing | 54,136 | 35.1 GB | 4.4% | 3.68x |
+| S1-06 | BF16, B=64, bucketing | 51,191 | 69.4 GB | 5.0% | 3.48x |
+| S1-07 | **Liger (with FusedCE)**, B=32, bucket | 76,252 | 9.5 GB | 4.4% | **5.18x** |
+| S1-08 | Liger (no FusedCE), B=32, bucket | 66,029 | 31.7 GB | 4.4% | 4.49x |
+| S1-09 | **torch.compile**, B=32, bucket | 94,342 | 21.9 GB | 4.4% | **6.41x** |
+| S1-10 | TileGym, B=32, bucket, pad64 | 91,866 | 10.9 GB | 14.3% | 6.24x |
+| S1-11 | TileGym, B=64, bucket, pad64 | 93,344 | 18.2 GB | 14.0% | 6.34x |
+| S1-12 | Packing N=1024, B=64 (no kernel) | 57,204 | 72.2 GB | 0.0% | 3.89x |
+| S1-13 | **Packing + TileGym**, B=64, N=1024 | **100,923** | **18.1 GB** | **0.0%** | **6.86x** |
+
+#### Stage 2 Results (Unfrozen LLM, NO gradient checkpointing)
+
+| # | Config | Real tok/s | VRAM | Pad% | Speedup |
+|---|--------|-----------|------|------|---------|
+| S2-01 | Vanilla, B=4 (baseline) | 29,167 | 7.9 GB | 12.3% | 1.00x |
+| S2-02 | Vanilla, B=16, bucket | 44,934 | 20.3 GB | 3.8% | 1.54x |
+| S2-03 | Vanilla, B=32, bucket | 45,748 | 39.5 GB | 4.4% | 1.57x |
+| S2-04 | Liger (no FusedCE), B=16, bucket | 52,330 | 18.1 GB | 3.8% | **1.79x** |
+| S2-05 | Liger (with FusedCE), B=16, bucket ❌ | 17,434 | 8.0 GB | 3.8% | 0.60x |
+| S2-06 | Liger (no FusedCE), B=32, bucket | 55,504 | 35.2 GB | 4.4% | **1.90x** |
+| S2-07 | torch.compile, B=16, bucket | 68,105 | 13.2 GB | 3.8% | 2.34x |
+| S2-08 | **torch.compile**, B=32, bucket | 73,052 | 25.4 GB | 4.4% | **2.50x** |
+| S2-09 | TileGym, B=16, bucket, pad64 | 72,174 | 9.1 GB | 14.4% | 2.47x |
+| S2-10 | TileGym, B=32, bucket, pad64 | 76,907 | 15.7 GB | 14.3% | 2.64x |
+| S2-11 | TileGym, B=64, bucket, pad64 | 79,155 | 27.4 GB | 14.0% | **2.71x** |
+| S2-12 | Packing N=1024, B=32 (no kernel) | 51,091 | 44.7 GB | 0.0% | 1.75x |
+| S2-13 | **Packing + TileGym**, B=64, N=1024 | **86,080** | **27.4 GB** | **0.0%** | **2.95x** |
+
+---
+
+#### Key Findings (v3, Final)
+
+1. **Total speedup**: Stage 1 = **6.86x** (14.7K → 100.9K), Stage 2 = **2.95x** (29.2K → 86.1K).
+
+2. **BF16 fix = 2.36x** — single largest ROI optimization (2-line change).
+
+3. **Liger FusedCE: stage-dependent behavior**:
+   - Stage 1 (frozen LLM): FusedCE is **beneficial** — 76.3K vs 66.0K (+15.5%), VRAM 9.5G vs 31.7G
+   - Stage 2 (unfrozen LLM): FusedCE is **catastrophic** — 17.4K vs 52.3K (-67%)
+   - Root cause: In Stage 1, FusedCE only runs forward (no backward through LM head → saves memory+compute).
+     In Stage 2, chunked backward dominates with many small Triton kernel launches.
+
+4. **Vanilla throughput saturates at B=16–32** (both stages). Beyond B=32, no Real tok/s improvement.
+
+5. **torch.compile**: Excellent in both stages (6.41x S1, 2.50x S2). No external dependencies.
+   Trade-off: ~3 min JIT compilation on first run, higher VRAM than TileGym.
+
+6. **TileGym: best speed/VRAM Pareto**:
+   - Stage 1: 91.9K at 10.9 GB (vs compile's 94.3K at 21.9 GB)
+   - Stage 2: 79.2K at 27.4 GB (TileGym B=64, 2.71x)
+   - Best overall: Packing + TileGym B=64 = 86.1K at 27.4 GB (2.95x)
+
+7. **Gradient checkpointing: unnecessary on 90GB GPUs**. Removing it yielded +15-21% speed
+   at peak Stage 2 VRAM of only 27-44 GB (well within 90 GB budget).
+
+8. **Packing + TileGym is the peak recipe for both stages** (small model): 0% padding waste,
+   fixed shapes enable optimal TileGym tiling. Stage 1 = 100.9K, Stage 2 = 86.1K.
+
+---
+
+### Large Model Results (v3 — SigLIP2-so400m-384 + Qwen2.5-1.5B)
+
+Cross-scale comparison using the same methodology. Raw traces at `docs/traces/benchmark_v3_large/`.
+
+**Key limitation**: TileGym is **incompatible** with SigLIP-so400m because its head_dim=72
+(1152/16 attention heads), which is not a power of 2. cuTile requires power-of-2 tile dimensions.
+
+#### Stage 1 Results (Large Model, Frozen LLM)
+
+| # | Config | Real tok/s | VRAM | Pad% | Speedup |
+|---|--------|-----------|------|------|---------|
+| S1-01 | **Baseline**: FP32, B=2 | 4,626 | 13.4 GB | 6.0% | 1.00x |
+| S1-02 | BF16 fix, B=2 | 13,862 | 7.7 GB | 6.0% | **3.00x** |
+| S1-03 | BF16, B=8 (no bucket) | 18,248 | 21.2 GB | 15.2% | 3.94x |
+| S1-04 | BF16, B=8, bucketing | 20,460 | 16.1 GB | 2.6% | 4.42x |
+| S1-05 | BF16, B=16, bucketing | 21,703 | 28.9 GB | 3.4% | 4.69x |
+| S1-06 | BF16, B=32, bucketing | 21,157 | 54.3 GB | 4.1% | 4.57x |
+| S1-07 | Liger (+CE), B=16, bucket | 23,083 | 13.2 GB | 3.4% | 4.99x |
+| S1-08 | Liger (noCE), B=16, bucket | 25,532 | 25.0 GB | 3.4% | **5.52x** |
+| S1-09 | **torch.compile**, B=16, bucket | **31,110** | 19.9 GB | 3.4% | **6.73x** |
+| S1-10 | Packing N=1024, B=16 | 24,851 | 35.7 GB | 0.0% | 5.37x |
+| S1-11 | **torch.compile**, B=32, bucket | **31,078** | 36.1 GB | 4.1% | **6.72x** |
+| S1-12 | Liger (+CE), B=32, bucket | 26,425 | 22.7 GB | 4.1% | 5.71x |
+
+#### Stage 2 Results (Large Model, Unfrozen LLM, NO grad_ckpt)
+
+| # | Config | Real tok/s | VRAM | Pad% | Speedup |
+|---|--------|-----------|------|------|---------|
+| S2-01 | Vanilla, B=2 (baseline) | 11,569 | 8.5 GB | 6.0% | 1.00x |
+| S2-02 | Vanilla, B=8, bucket | 16,944 | 18.6 GB | 2.6% | 1.46x |
+| S2-03 | Vanilla, B=16, bucket | 18,208 | 33.8 GB | 3.4% | 1.57x |
+| S2-04 | Liger (noCE), B=8, bucket | 19,011 | 16.1 GB | 2.6% | 1.64x |
+| S2-05 | Liger (noCE), B=16, bucket | 20,899 | 28.9 GB | 3.4% | **1.81x** |
+| S2-06 | Liger (+CE), B=16, bucket ❌ | 10,731 | 18.7 GB | 3.4% | 0.93x |
+| S2-07 | torch.compile, B=8, bucket | 21,975 | 13.7 GB | 2.6% | 1.90x |
+| S2-08 | **torch.compile**, B=16, bucket | **24,153** | **23.7 GB** | 3.4% | **2.09x** |
+| S2-09 | Packing N=1024, B=8 | 19,639 | 23.0 GB | 0.0% | 1.70x |
+| S2-10 | Liger (+CE), B=32, bucket | 15,045 | 32.0 GB | 4.1% | 1.30x |
+
+#### Cross-Scale Comparison
+
+| Metric | Small (0.5B) | Large (1.5B) | Ratio |
+|--------|-------------|-------------|-------|
+| Stage 1 baseline (FP32) | 14,713 tok/s | 4,626 tok/s | 3.2x slower |
+| Stage 1 peak | 100,923 tok/s (Packing+TileGym) | 31,110 tok/s (torch.compile) | 3.2x slower |
+| Stage 1 max speedup | 6.86x | 6.73x | Similar gains |
+| Stage 2 baseline | 29,167 tok/s | 11,569 tok/s | 2.5x slower |
+| Stage 2 peak | 86,080 tok/s (Packing+TileGym) | 24,153 tok/s (torch.compile) | 3.6x slower |
+| Stage 2 max speedup | 2.95x | 2.09x | Large benefits less |
+| Best overall config | Packing + TileGym B=64 | torch.compile B=16 | Different winners |
+
+#### Key Findings (Large Model)
+
+1. **torch.compile is the best option for the large model** (6.73x S1, 2.09x S2).
+   TileGym is incompatible due to SigLIP-so400m's non-power-of-2 head dimension.
+
+2. **BF16 fix still yields 3.0x** — consistent with the small model (2.36x), confirming
+   this is a universal low-hanging fruit regardless of scale.
+
+3. **Liger FusedCE behavior is scale-dependent**:
+   - Large model, Stage 1: FusedCE slightly slower than noCE (23K vs 25.5K), opposite to small model
+   - Large model, Stage 2: FusedCE still harmful (10.7K vs 20.9K, -49%)
+   - At 1.5B scale, materializing logits is affordable in forward; FusedCE chunk overhead outweighs savings
+
+4. **Vanilla saturates early** (B=16 for large model vs B=32 for small). The 1.5B model
+   is more compute-bound — larger batches add latency without throughput gain.
+
+5. **Throughput scales ~3.2x between 0.5B and 1.5B** — roughly proportional to parameter count,
+   suggesting both models are compute-bound (not memory-bound) at optimal batch sizes.
+
+---
+
+### Unified Benchmark Results (v2 — SUPERSEDED by v3 above)
 
 All numbers below use the **same backbone** (SigLIP2-base-224 + Qwen2.5-0.5B, 589.7M total)
 across all experiments. Measured end-to-end on real data (`sharegpt4v/coco`, 50K samples)
@@ -1092,21 +1256,50 @@ processing 120K positions/s with 20% padding (which yields only 96K real tok/s).
 | 11 | Packing N=1024, B=64 (no kernel) | 57,120 | 72.2 GB | 0.0% | 410.5 | 3.8x |
 | 12 | **Packing + TileGym**, B=64, N=1024 | **100,228** | **18.1 GB** | **0.0%** | 234.0 | **6.7x** |
 
-#### Stage 2 Results (Unfrozen LLM + gradient checkpointing)
+#### Stage 2 Results (Unfrozen LLM, NO gradient checkpointing)
 
-| # | Config | Real tok/s | VRAM | Pad% | Step ms | Speedup |
-|---|--------|-----------|------|------|---------|---------|
-| S2-1 | Vanilla, B=4, grad_ckpt | 20,854 | 5.2 GB | 12.3% | 66.5 | 1.0x |
-| S2-2 | Vanilla, B=16, bucket, grad_ckpt | 38,331 | 12.6 GB | 3.8% | 137.1 | 1.8x |
-| S2-3 | Liger, B=16, bucket, grad_ckpt | 16,645 | 2.4 GB | 3.8% | 315.8 | 0.8x ❌ |
-| S2-4 | **TileGym**, B=16, bucket, pad64, grad_ckpt | 55,284 | 3.4 GB | 14.4% | 95.1 | **2.7x** |
-| S2-5 | **TileGym**, B=32, bucket, pad64, grad_ckpt | **64,132** | **4.3 GB** | 14.3% | 164.2 | **3.1x** |
+> **Note**: Gradient checkpointing is disabled — our 90GB GPU has abundant VRAM,
+> and grad_ckpt costs 15-21% speed for memory savings we don't need.
+> Previous results (v2) incorrectly used grad_ckpt; these supersede them.
+
+| # | Config | Real tok/s | VRAM | Speedup |
+|---|--------|-----------|------|---------|
+| S2-1 | Vanilla, B=4 (baseline) | 28,514 | 7.9 GB | 1.00x |
+| S2-2 | Vanilla, B=16, bucket | 27,622 | 20.3 GB | 0.97x |
+| S2-3a | Liger (no FusedCE), B=16, bucket | 36,485 | 18.1 GB | **1.28x** |
+| S2-3b | Liger (with FusedCE), B=16, bucket ❌ | 13,250 | 8.0 GB | 0.46x |
+| S2-4 | TileGym, B=16, bucket, pad64 | 47,604 | 9.1 GB | **1.67x** |
+| S2-5 | TileGym, B=32, bucket, pad64 | 69,632 | 15.7 GB | **2.44x** |
+| S2-6 | Liger (no FusedCE), B=32, bucket | 30,958 | 35.2 GB | 1.09x |
+| S2-8 | Vanilla, B=32, bucket | 40,963 | 39.5 GB | 1.44x |
+| S2-9 | **torch.compile**, B=16, bucket | 68,243 | 13.2 GB | **2.39x** |
+| S2-10 | **TileGym, B=64**, bucket, pad64 | **79,198** | **27.4 GB** | **2.78x** |
+| S2-11 | Packing N=1024, B=32 (no kernel) | 50,887 | 44.7 GB | 1.78x |
+| S2-12 | Packing + TileGym, B=32 | 17,153 | 16.5 GB | 0.60x ❌ |
+| S2-13 | Packing + TileGym, B=64 | 70,813 | 27.4 GB | 2.48x |
+| S2-14 | **torch.compile**, B=32, bucket | 73,245 | 25.4 GB | **2.57x** |
+
+##### Why gradient checkpointing was removed
+
+| Config | With grad_ckpt | Without | Speed gain | VRAM cost |
+|--------|---------------|---------|-----------|-----------|
+| Vanilla B=16 | 133.4 ms | 115.3 ms | +15.7% | +7.8 GB |
+| Liger (no CE) B=16 | 108.7 ms | 96.6 ms | +12.5% | +5.4 GB |
+| TileGym B=16 | 107.0 ms | 88.1 ms | +21.4% | +5.1 GB |
+
+On a 90GB GPU using <36 GB total, grad_ckpt is pure overhead.
+
+##### Why Liger's FusedCE is disabled in Stage 2
+
+See "Deep Dive" section below. Summary: `fused_linear_cross_entropy` uses chunked
+matmuls that are 2x slower than one large cuBLAS GEMM. Only enable it when VRAM is
+the bottleneck (24-48 GB GPUs training 7B+ models).
 
 ---
 
 #### Key Findings (Unified, Single-Backbone)
 
-1. **Total Stage 1 speedup: 6.7x** (14,868 → 100,228 real tok/s) on the same backbone.
+1. **Total speedup**: Stage 1 = **6.7x** (14,868 → 100,228 real tok/s), Stage 2 = **2.78x** (28,514 → 79,198 real tok/s).
 
 2. **BF16 fix is 2.4x** — the single largest return-on-effort optimization (2-line change).
 
@@ -1114,26 +1307,99 @@ processing 120K positions/s with 20% padding (which yields only 96K real tok/s).
    improve Real tok/s (55K→51K) but explodes VRAM (18→69 GB). The GPU is memory-bandwidth
    bound at this model scale — larger batches only increase latency proportionally.
 
-4. **Liger-Kernel: massive VRAM savings, divergent speed impact**:
-   - Stage 1: +41% speed (76K vs 54K) AND -73% VRAM (9.5 vs 35 GB)
-   - Stage 2: -57% speed (16.6K vs 38K) BUT -81% VRAM (2.4 vs 12.6 GB)
-   - Root cause: Liger's Triton JIT compilation overhead dominates in Stage 2 where
-     backward pass (many kernel launches) amplifies startup costs.
+4. **Liger-Kernel: must disable FusedCE in Stage 2**:
+   - Stage 1 (all patches): +41% speed (76K vs 54K) AND -73% VRAM (9.5 vs 35 GB)
+   - Stage 2 with FusedCE: **-54% speed** (13.3K vs 28.5K) — FusedCE's chunked matmul is 2x slower
+   - Stage 2 without FusedCE: **+28% speed** (36.5K vs 28.5K) — RoPE+RMSNorm+SwiGLU alone are beneficial
+   - Root cause: FusedCE's chunked approach avoids materializing full logits → huge VRAM savings
+     but many small Triton kernel launches that undersaturate Blackwell SMs.
 
-5. **torch.compile is the single fastest config (Stage 1)**: 94.8K tok/s at B=32.
-   But uses 21.9 GB VRAM (2x more than TileGym for similar speed).
+5. **torch.compile: excellent in both stages**:
+   - Stage 1: 94.8K tok/s at B=32 (6.4x, best Stage 1 single-config)
+   - Stage 2: 73.2K tok/s at B=32 (2.57x), 68.2K at B=16 (2.39x)
+   - Trade-off: Long compilation time (~3 min first run), higher VRAM than TileGym.
 
-6. **TileGym: best speed/VRAM Pareto**:
+6. **TileGym B=64: overall Stage 2 peak at 79.2K tok/s (2.78x)**:
    - Stage 1: 91.8K tok/s at only 10.9 GB (vs compile's 94.8K at 21.9 GB)
-   - Stage 2: 64.1K tok/s at only 4.3 GB (3.1x speedup, 66% VRAM reduction)
+   - Stage 2: 79.2K tok/s at 27.4 GB (2.78x) — best absolute throughput
+   - TileGym B=32: 69.6K tok/s at 15.7 GB — best speed/VRAM Pareto for Stage 2
    - Trade-off: Requires pad_to_multiple_of=64 (adds 14% intentional padding)
 
-7. **Packing alone is counterproductive without kernel optimization**:
-   57K tok/s at 72 GB VRAM — worse than vanilla bucketing at B=32 (54K at 35 GB).
-   Packing creates longer sequences (N=1024) that are more expensive per step.
+7. **Packing: shape-sensitive, benefits only at B=64+**:
+   - Stage 1: Packing alone (57K, 72 GB) is worse than bucketing (54K, 35 GB)
+   - Stage 2: Packing vanilla B=32 (50.9K) is OK, but Packing+TileGym B=32 crashes to 17K (shape issue)
+   - Packing + TileGym B=64: 70.8K tok/s (2.48x) — competitive but TileGym+bucketing is simpler
 
 8. **Packing + TileGym = peak efficiency**: 100K tok/s, 0% waste, 18 GB.
    TileGym needs fixed shapes; packing provides exactly that (fixed N=1024 bins).
+
+---
+
+### Deep Dive: Why Liger-Kernel Is Slower in Stage 2
+
+**Date**: 2026-05-22
+
+**Observation**: Liger-Kernel shows -57% speed regression in Stage 2 (16.6K vs 38K tok/s),
+despite being +41% faster in Stage 1. The VRAM savings are massive (-81%) but speed suffers.
+
+#### Component Isolation Experiment
+
+Tested each Liger patch independently (subprocess isolation, B=16, N=384, Qwen2.5-0.5B, grad_ckpt=ON):
+
+| Configuration | ms/step | VRAM | Delta vs Vanilla |
+|---|---|---|---|
+| Vanilla (no patches) | 133.6 ms | 13.41 GB | baseline |
+| Liger: RoPE only | 132.7 ms | 13.41 GB | -0.7% |
+| Liger: RoPE + RMSNorm | 119.6 ms | 13.39 GB | **-10.4%** |
+| Liger: RoPE + RMSNorm + SwiGLU | 109.0 ms | 13.39 GB | **-18.4%** |
+| Liger: ALL (RoPE+RMSNorm+SwiGLU+FusedCE) | 254.8 ms | 2.26 GB | **+90.8%** |
+| Liger: FusedCE ONLY | 284.5 ms | 2.32 GB | **+113.0%** |
+
+**Verdict**: `fused_linear_cross_entropy` is the sole culprit. All other Liger kernels (RoPE, RMSNorm, SwiGLU) are beneficial (-18% combined).
+
+#### Scale Dependency (FusedCE overhead at different B*N)
+
+| B | N | B*N | Vanilla | FusedCE | Delta | VRAM Saved |
+|---|---|---|---|---|---|---|
+| 4 | 256 | 1,024 | 55.3 ms | 295.8 ms | +435% | 0.9 GB |
+| 16 | 384 | 6,144 | 133.5 ms | 279.1 ms | +109% | 11.1 GB |
+| 16 | 1024 | 16,384 | 363.1 ms | 513.3 ms | +41% | 31.1 GB |
+| 8 | 2048 | 16,384 | 373.9 ms | 524.0 ms | +40% | 31.1 GB |
+| 4 | 4096 | 16,384 | 394.5 ms | 544.7 ms | +38% | 31.1 GB |
+
+The overhead decreases at larger B*N but never reaches breakeven. Even at 16K tokens, FusedCE is +38% slower.
+
+#### Root Cause Analysis
+
+Liger's `fused_linear_cross_entropy` uses a **chunked matmul** strategy:
+- Standard path: one large `[B*N, 896] @ [896, 151936]` GEMM → cuBLAS saturates the GPU SMs
+- FusedCE path: iterates vocabulary in small chunks → many small Triton kernel launches
+
+The overhead comes from:
+1. **Kernel launch overhead**: Many small GEMMs (chunk_size × vocab_chunk) instead of one large GEMM
+2. **Triton JIT**: Each chunk dispatches through Triton's JIT compilation cache
+3. **Gradient checkpointing amplification**: The entire chunked forward is recomputed during backward,
+   doubling the number of small kernel launches
+4. **Undersaturated GPU**: On Blackwell (sm_120), a single large cuBLAS GEMM already saturates
+   all SMs; splitting into chunks leaves SMs idle between launches
+
+#### Why FusedCE Exists (and when to use it)
+
+FusedCE was designed for **VRAM-constrained** training:
+- The logits tensor `[B*N, vocab_size]` = `[16*384, 151936]` = 1.8 GB in bf16
+- For larger models (7B+, 70B) with longer sequences (4K+), this tensor dominates VRAM
+- FusedCE never materializes it → massive VRAM reduction (83% in our case)
+
+**Decision**: For our 90 GB GPU, VRAM is NOT the bottleneck. FusedCE is **inappropriate**.
+
+#### Recommendation
+
+| Scenario | Optimal Config |
+|---|---|
+| Stage 1 (frozen LLM, compute-light) | Liger ALL or TileGym |
+| Stage 2, VRAM-limited (24–48 GB GPU) | Liger ALL (accept speed loss) |
+| Stage 2, VRAM-abundant (90 GB GPU) | **Liger RoPE+RMSNorm+SwiGLU (NO FusedCE)** → 18% faster than vanilla |
+| Stage 2, maximum speed | TileGym B=32, no grad_ckpt (2.44x speedup, 15.7 GB) |
 
 ---
 
