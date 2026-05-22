@@ -645,9 +645,9 @@ class SiQ_VLProcessor(ProcessorMixin):
     def model_input_names(self):
         return ["input_ids", "attention_mask", "pixel_values"]
 
-    def to_dict(self, legacy_serialization=True):
-        output = super().to_dict(legacy_serialization=legacy_serialization)
-        output.pop("image_processor", None)  # Remove if exists
+    def to_dict(self, **kwargs):
+        output = super().to_dict()
+        output.pop("image_processor", None)
         output["vit_image_size"] = self.vit_image_size
         output["vit_patch_size"] = self.vit_patch_size
         output["pixel_shuffle_factor"] = self.pixel_shuffle_factor

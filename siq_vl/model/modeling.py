@@ -37,8 +37,41 @@ _LIGER_APPLIED = False
 _TILEGYM_APPLIED = False
 
 
-def _apply_tilegym_kernel(use_cutile: bool = True):
-    """Apply TileGym kernels to Qwen2 (RoPE, RMSNorm, SwiGLU, attention, fused linear-CE).
+def _wrap_tilegym_attention_with_fallback():
+    """Wrap TileGym's global attention interface with a fallback to standard SDPA.
+
+    TileGym patches ALL_ATTENTION_FUNCTIONS["sdpa"] globally, which breaks non-Qwen2
+    models (e.g. RoBERTa in CLIPScore) whose head_dim or seq_len is incompatible with
+    cuTile's autotune search space. This wrapper catches the ValueError and falls back
+    to PyTorch's native scaled_dot_product_attention.
+    """
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    tilegym_fmha = ALL_ATTENTION_FUNCTIONS.get("sdpa")
+    if tilegym_fmha is None:
+        return
+
+    def safe_fmha_interface(module, q, k, v, attention_mask, **kwargs):
+        try:
+            return tilegym_fmha(module, q, k, v, attention_mask, **kwargs)
+        except (ValueError, RuntimeError):
+            import torch.nn.functional as F
+
+            is_causal = kwargs.get("is_causal", True) if attention_mask is None else False
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                is_causal=is_causal,
+                dropout_p=kwargs.get("dropout", 0.0),
+            )
+            return attn_out, None
+
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = safe_fmha_interface
+    rank_zero_info(">>> TileGym attention wrapped with SDPA fallback for non-Qwen2 models")
+
+
+def _apply_tilegym_kernel(use_cutile: bool = True, fused_linear_cross_entropy: bool = True):
+    """Apply TileGym kernels to Qwen2 (RoPE, RMSNorm, SwiGLU, attention, optionally fused linear-CE).
     Native Blackwell-optimized kernels via cuTile DSL — 13-17% faster than Liger alone.
     Must be called before model instantiation. Safe to call multiple times."""
     global _TILEGYM_APPLIED, _LIGER_APPLIED
@@ -51,16 +84,21 @@ def _apply_tilegym_kernel(use_cutile: bool = True):
         backend = "cuTile DSL" if use_cutile else "Triton"
         rank_zero_info(f">>> TileGym applied ({backend}): RoPE + RMSNorm + SwiGLU + FA4 attention")
 
-        from siq_vl.kernels.fused_linear_ce import patch_qwen2_fused_linear_ce
+        _wrap_tilegym_attention_with_fallback()
 
-        patch_qwen2_fused_linear_ce()
-        rank_zero_info(">>> + fused_linear_cross_entropy (chunked, never materializes [BT,V] logits)")
+        if fused_linear_cross_entropy:
+            from siq_vl.kernels.fused_linear_ce import patch_qwen2_fused_linear_ce
+
+            patch_qwen2_fused_linear_ce()
+            rank_zero_info(">>> + fused_linear_cross_entropy (chunked, never materializes [BT,V] logits)")
+        else:
+            rank_zero_info(">>> FusedCE DISABLED (standard CE loss)")
 
         _TILEGYM_APPLIED = True
-        _LIGER_APPLIED = True  # prevent Liger from double-patching
+        _LIGER_APPLIED = True
     except ImportError:
         rank_zero_info(">>> TileGym not installed, falling back to Liger-Kernel")
-        _apply_liger_kernel()
+        _apply_liger_kernel(fused_linear_cross_entropy=fused_linear_cross_entropy)
 
 
 def _apply_liger_kernel(fused_linear_cross_entropy: bool = True):
@@ -397,7 +435,7 @@ def get_stage1_model_and_processor(
     rank_zero_info("Initializing SiQ-VL model for stage 1...")
 
     if use_tilegym:
-        _apply_tilegym_kernel(use_cutile=True)
+        _apply_tilegym_kernel(use_cutile=True, fused_linear_cross_entropy=use_fused_ce)
         text_attn_impl = "sdpa"  # TileGym patches SDPA in-place
     elif use_cutile:
         _apply_liger_kernel(fused_linear_cross_entropy=use_fused_ce)
@@ -453,6 +491,8 @@ def get_stage2_model_and_processor(
     lora_dropout: float = 0.05,  # Dropout probability for the LoRA update matrices
     lora_target_modules: list[str] | None = None,
     use_tilegym: bool = False,
+    use_liger: bool = True,
+    use_fused_ce: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the stage 2 SiQ-VL model and processor.
@@ -464,11 +504,14 @@ def get_stage2_model_and_processor(
         lora_dropout: Dropout probability for the LoRA update matrices.
         lora_target_modules: Target modules for the LoRA update matrices.
         use_tilegym: If True, uses TileGym cuTile kernels instead of Liger.
+        use_liger: If True, applies Liger-Kernel. If False, uses vanilla PyTorch.
+        use_fused_ce: Enable fused_linear_cross_entropy. Default False for Stage 2
+            because FusedCE is catastrophically slow with backward pass on high-VRAM GPUs.
     """
     if use_tilegym:
-        _apply_tilegym_kernel(use_cutile=True)
-    else:
-        _apply_liger_kernel()
+        _apply_tilegym_kernel(use_cutile=True, fused_linear_cross_entropy=use_fused_ce)
+    elif use_liger:
+        _apply_liger_kernel(fused_linear_cross_entropy=use_fused_ce)
 
     model = SiQ_VLForCausalLM.from_pretrained(stage_1_checkpoint_path, torch_dtype=torch.bfloat16)
     processor = SiQ_VLProcessor.from_pretrained(stage_1_checkpoint_path)

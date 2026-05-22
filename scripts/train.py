@@ -23,11 +23,12 @@ from siq_vl.callbacks import (
     MetricsCallback,
     SmartGPUCleanCallback,
 )
-from siq_vl.collator import SiQ_VLDataCollator
-from siq_vl.dataset import VQADataset
+from siq_vl.collator import PackingCollator, SiQ_VLDataCollator
+from siq_vl.dataset import ProcessedVQADataset, VQADataset
 from siq_vl.model.modeling import get_stage1_model_and_processor, get_stage2_model_and_processor
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.set_float32_matmul_precision("high")
 
 
 def is_dist():
@@ -361,6 +362,41 @@ def parse_args():
         default=False,
         help="Use TileGym cuTile kernels (Blackwell-native, replaces Liger). 13-17%% faster than Liger.",
     )
+    parser.add_argument(
+        "--no_fused_ce",
+        action="store_true",
+        default=False,
+        help="Disable Liger fused_linear_cross_entropy. Recommended for Stage 2 on high-VRAM GPUs.",
+    )
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        action="store_true",
+        default=False,
+        help="Disable gradient checkpointing. Recommended on 90GB+ GPUs (saves 15-21%% speed).",
+    )
+    parser.add_argument(
+        "--no_callbacks",
+        action="store_true",
+        default=False,
+        help="Disable all custom callbacks (GenerationCallback, MetricsCallback, EarlyStopping, GPUClean). "
+        "Recommended for max throughput during production training.",
+    )
+    parser.add_argument(
+        "--use_packing",
+        action="store_true",
+        default=False,
+        help="Use PackingCollator for bin-packing in DataLoader workers. "
+        "Packs multiple samples into fixed-length sequences to eliminate padding waste "
+        "and stabilize TileGym autotuning. Processing is parallelized across workers.",
+    )
+    parser.add_argument(
+        "--seq_length",
+        type=int,
+        default=None,
+        help="Target sequence length for packing (required when --use_packing is set). "
+        "Recommended: 512 for Stage 1 (projector alignment), 1024 for Stage 2 (instruction FT). "
+        "Based on data analysis: Stage 1 P99=407/max=492, Stage 2 P99=927/max=2193.",
+    )
 
     # Precision configuration
     parser.add_argument(
@@ -592,24 +628,22 @@ def train(args=None):
 
     rank_zero_info(">>> Loading Model and Processor...")
 
-    if args.no_liger:
-        from siq_vl.model import modeling as _modeling
-        _modeling._LIGER_APPLIED = True
-        rank_zero_info(">>> Liger-Kernel DISABLED")
-
-    if args.use_tilegym:
-        from siq_vl.model import modeling as _modeling
-        _modeling._LIGER_APPLIED = True  # prevent Liger from also applying
-        rank_zero_info(">>> TileGym mode: will use cuTile DSL kernels instead of Liger")
-
     default_repo_name = f"siq-vl_{vision_name}_{text_name}_{stage_name}"
+
+    use_liger = not args.no_liger and not args.use_tilegym
+    use_fused_ce = not args.no_fused_ce
+    rank_zero_info(f">>> Kernel config: tilegym={args.use_tilegym}, liger={use_liger}, fused_ce={use_fused_ce}")
+    rank_zero_info(f">>> Gradient checkpointing: {not args.no_gradient_checkpointing}")
 
     if stage_name == "stage1":
         vl_model, vl_processor = get_stage1_model_and_processor(
             pretrained_vision_model_path=vision_model_name_or_path,
             pretrained_text_model_path=text_model_name_or_path,
+            vision_pixel_shuffle_factor=args.pixel_shuffle_factor,
             enable_dynamic_tiling=args.enable_dynamic_tiling,
             use_tilegym=args.use_tilegym,
+            use_liger=use_liger,
+            use_fused_ce=use_fused_ce,
         )
     elif stage_name == "stage2":
         stage_1_checkpoint_path = args.stage_1_checkpoint_path
@@ -624,6 +658,8 @@ def train(args=None):
             lora_dropout=args.lora_dropout,
             lora_target_modules=args.lora_target_modules,
             use_tilegym=args.use_tilegym,
+            use_liger=use_liger,
+            use_fused_ce=use_fused_ce,
         )
 
     # ====================================================
@@ -641,67 +677,88 @@ def train(args=None):
     for subset, weight in zip(SUB_SETS, sub_sets_weights, strict=False):
         rank_zero_info(f">>> Loading subset '{subset}' (weight={weight})...")
         raw_dataset = load_dataset(DATA_PATH, name=subset, split="train", num_proc=args.num_proc)
-        rank_zero_info(f">>> DEBUG: Raw dataset {subset} length: {len(raw_dataset)}")
-        rank_zero_info(f">>> DEBUG: Raw dataset {subset} sample: {raw_dataset[0]}")
+        rank_zero_info(f">>> Loaded {subset}: {len(raw_dataset)} samples")
         all_raw_datasets.append(raw_dataset)
         all_weights.append(weight)
 
-    from datasets.combine import interleave_datasets
+    from datasets import concatenate_datasets
 
     total_weight = sum(all_weights)
     probabilities = [weight / total_weight for weight in all_weights]
-    rank_zero_info(">>> Building weighted mixture dataset with probabilities:")
+    rank_zero_info(">>> Building dataset mixture:")
     for name, probability in zip(SUB_SETS, probabilities, strict=False):
         rank_zero_info(f"    - {name}: probability={probability:.4f}")
 
-    rank_zero_info(f">>> DEBUG: All weights: {all_weights}")
-    rank_zero_info(f">>> DEBUG: Probabilities: {probabilities}")
-    rank_zero_info(f">>> DEBUG: All raw datasets: {len(all_raw_datasets)}")
+    # concatenate_datasets is O(1) -- just creates a virtual view, no index building
+    concat_raw_dataset = concatenate_datasets(all_raw_datasets)
+    rank_zero_info(f">>> Concatenated dataset: {len(concat_raw_dataset)} samples (instant)")
 
-    concat_raw_dataset = interleave_datasets(
-        all_raw_datasets,
-        probabilities=probabilities,
-        seed=args.seed,
-        stopping_strategy="all_exhausted",
-    )
-
-    # Limit dataset size if specified (for quick testing / controlling total samples)
+    # Limit dataset size if specified
     if args.max_samples is not None:
         rank_zero_info(f">>> Limiting dataset to {args.max_samples} samples")
         concat_raw_dataset = concat_raw_dataset.select(range(min(args.max_samples, len(concat_raw_dataset))))
 
-    splits = concat_raw_dataset.train_test_split(test_size=args.max_eval_samples, shuffle=True)
+    # Build per-sample weights for WeightedRandomSampler (equal prob per dataset)
+    sample_weights_full = []
+    for ds, weight in zip(all_raw_datasets, all_weights):
+        n = len(ds)
+        sample_weights_full.extend([weight / n] * n)
+
+    splits = concat_raw_dataset.train_test_split(test_size=args.max_eval_samples, shuffle=True, seed=args.seed)
     train_raw_dataset = splits["train"]
     eval_raw_dataset = splits["test"]
+
+    # Remap weights to the train split indices
+    import numpy as np
+    train_indices = splits["train"]._indices
+    if train_indices is not None:
+        idx_array = np.asarray(train_indices).flatten()
+        weights_array = np.array(sample_weights_full)
+        train_sample_weights = weights_array[idx_array].tolist()
+    else:
+        train_sample_weights = sample_weights_full[:len(train_raw_dataset)]
 
     # Use VQADataset (standard Dataset) instead of VQAIterableDataset
     # This allows Trainer's DataLoader to automatically use DistributedSampler
     # No manual sharding needed!
     rank_zero_info(">>> Creating VQADataset (standard Dataset with DistributedSampler support)...")
-    train_dataset = VQADataset(train_raw_dataset)
+    base_train_dataset = VQADataset(train_raw_dataset)
     eval_dataset = VQADataset(eval_raw_dataset, is_fixed=True)
 
-    rank_zero_info(f">>> DEBUG: Train Dataset: {train_dataset}")
-    rank_zero_info(f">>> DEBUG: Train Dataset Length: {len(train_dataset)}")
-    rank_zero_info(f">>> DEBUG: Eval Dataset: {eval_dataset}")
-    rank_zero_info(f">>> DEBUG: Eval Dataset Length: {len(eval_dataset)}")
-    if len(train_dataset) > 0:
-        rank_zero_info(f">>> DEBUG: Train Dataset Sample: {train_dataset[0]}")
-    if len(eval_dataset) > 0:
-        rank_zero_info(f">>> DEBUG: Eval Dataset Sample: {eval_dataset[0]}")
+    # Packing: ProcessedVQADataset (image processing in workers) + PackingCollator (fast tensor ops)
+    if args.use_packing:
+        if args.seq_length is None:
+            raise ValueError("--seq_length is required when --use_packing is set. "
+                             "Recommended: 512 for Stage 1, 1024 for Stage 2.")
+        train_dataset = ProcessedVQADataset(
+            train_raw_dataset, processor=vl_processor, max_length=args.seq_length,
+        )
+        pad_token_id = vl_processor.tokenizer.pad_token_id or 0
+        data_collator = PackingCollator(pack_max_length=args.seq_length, pad_token_id=pad_token_id)
+        eval_collator = SiQ_VLDataCollator(processor=vl_processor, return_raw_data=False)
+        rank_zero_info(f">>> Packing: seq_length={args.seq_length}, ProcessedVQADataset + PackingCollator")
+    else:
+        train_dataset = base_train_dataset
+        collator_max_length = 512 if args.use_tilegym else None
+        data_collator = SiQ_VLDataCollator(
+            processor=vl_processor,
+            return_raw_data=not args.no_callbacks,
+            max_length=collator_max_length,
+        )
+        eval_collator = None
+
+    rank_zero_info(f">>> Train Dataset: {type(train_dataset).__name__}, len={len(train_dataset)}")
+    rank_zero_info(f">>> Eval Dataset: {type(eval_dataset).__name__}, len={len(eval_dataset)}")
 
     # ----------------------------------------------------
     # Auto-calculate max_steps from max_samples & global batch
     # ----------------------------------------------------
     max_steps = args.max_steps
     if max_steps is None or max_steps <= 0:
-        # Compute effective global batch size
         global_batch_size = per_device_train_batch_size * gradient_accumulation_steps * get_world_size()
         if global_batch_size <= 0:
             global_batch_size = 1
 
-        # Use the original concat_raw_dataset length for max_steps calculation
-        # (before sharding, so we get the total dataset size)
         effective_samples = len(concat_raw_dataset)
         max_steps = (effective_samples + global_batch_size - 1) // global_batch_size
         rank_zero_info(
@@ -709,9 +766,6 @@ def train(args=None):
         )
     else:
         rank_zero_info(f">>> Using user-specified max_steps={max_steps}")
-
-    # Initialize Collator
-    data_collator = SiQ_VLDataCollator(processor=vl_processor, return_raw_data=True)
 
     # ====================================================
     # 4. Training Arguments
@@ -745,7 +799,6 @@ def train(args=None):
         dataloader_pin_memory=True,
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
         dataloader_prefetch_factor=4 if args.dataloader_num_workers > 0 else None,
-        group_by_length=True,
         torch_compile=args.torch_compile,
         torch_compile_mode="max-autotune-no-cudagraphs" if args.torch_compile else None,
         # --- Evaluation ---
@@ -754,9 +807,9 @@ def train(args=None):
         # Use same batch size for eval as for training
         per_device_eval_batch_size=per_device_train_batch_size,
         eval_accumulation_steps=1,  # Accumulate eval results in one go
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        load_best_model_at_end=not args.no_callbacks,
+        metric_for_best_model="eval_loss" if not args.no_callbacks else None,
+        greater_is_better=False if not args.no_callbacks else None,
         # Note: max_eval_samples is handled when creating eval_dataset above
         # --- Learning Rate ---
         # Project alignment using 1e-3
@@ -764,13 +817,14 @@ def train(args=None):
         learning_rate=args.learning_rate,
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
+        optim="adamw_torch_fused",
         weight_decay=0.01,  # prevent overfitting
         max_steps=max_steps,
         max_grad_norm=1.0,  # Clip gradients to prevent instability
         # --- Precision & Memory ---
         bf16=args.bf16,  # REQUIRED for Qwen (Ampere+ GPUs). Do not use fp16.
         fp16=args.fp16,
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
         # --- Logging & Metrics & Saving ---
         logging_steps=args.logging_steps,
         save_strategy="steps",
@@ -783,15 +837,13 @@ def train(args=None):
         # The issue: Trainer was summing losses across gradient accumulation steps
         # instead of averaging them, causing reported loss to be 4x higher
         # include_for_metrics=["input", "loss"],  # Remove this - it causes loss aggregation issues
-        include_tokens_per_second=True,
         include_num_input_tokens_seen=True,
         # average_tokens_across_devices=True,  # Remove this - may cause loss calculation issues in DDP
         # --- CRITICAL FOR CUSTOM DATASET ---
         # Must be False. If True, Trainer removes columns like 'raw_question'
         # because the model signature doesn't explicitly list them.
         remove_unused_columns=False,
-        label_names=["labels"],  # Explicitly tell Trainer which column is the label
-        save_safetensors=False,
+        label_names=["labels"],
         # --- Hugging Face Hub ---
         push_to_hub=args.push_to_hub,
         hub_model_id=hub_model_id,
@@ -842,24 +894,26 @@ def train(args=None):
     # ====================================================
     # 6. Start Training
     # ====================================================
-    # Initialize generation callback for periodic evaluation
-    # Pass processor and the underlying HF dataset so the callback doesn't need the Trainer
-    generation_callback = GenerationCallback(
-        processor=vl_processor,
-        eval_dataset=eval_dataset,
-        num_samples=args.gen_samples,
-        eval_interval=args.gen_steps,
-        max_new_tokens=args.gen_max_new_tokens,
-        temperature=args.gen_temperature,
-        num_beams=args.gen_num_beams,
-    )
+    if args.no_callbacks:
+        callbacks = []
+        rank_zero_info(">>> All callbacks DISABLED (max throughput mode)")
+    else:
+        generation_callback = GenerationCallback(
+            processor=vl_processor,
+            eval_dataset=eval_dataset,
+            num_samples=args.gen_samples,
+            eval_interval=args.gen_steps,
+            max_new_tokens=args.gen_max_new_tokens,
+            temperature=args.gen_temperature,
+            num_beams=args.gen_num_beams,
+        )
 
-    callbacks = [
-        generation_callback,
-        MetricsCallback(),
-        EarlyStoppingCallback(early_stopping_patience=10, early_stopping_threshold=1e-4),
-        SmartGPUCleanCallback(interval=20 if torch.cuda.is_available() else 2),
-    ]
+        callbacks = [
+            generation_callback,
+            MetricsCallback(),
+            EarlyStoppingCallback(early_stopping_patience=10, early_stopping_threshold=1e-4),
+            SmartGPUCleanCallback(interval=20 if torch.cuda.is_available() else 2),
+        ]
 
     # Profiler callback (if --profile is set)
     if args.profile:
@@ -927,15 +981,29 @@ def train(args=None):
         callbacks.append(ProfilerCallback(profiler, args.profile_warmup_steps + args.profile_steps))
 
     class SiQVLTrainer(Trainer):
+        def __init__(self, *args, eval_data_collator=None, train_sample_weights=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._eval_data_collator = eval_data_collator
+            self._train_sample_weights = train_sample_weights
+
         def _get_train_sampler(self, train_dataset=None):
-            ds = train_dataset if train_dataset is not None else self.train_dataset
-            if self.args.group_by_length and hasattr(ds, "lengths"):
-                from transformers.trainer_pt_utils import LengthGroupedSampler
-                return LengthGroupedSampler(
-                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
-                    lengths=ds.lengths,
+            if self._train_sample_weights is not None:
+                from torch.utils.data import WeightedRandomSampler
+                return WeightedRandomSampler(
+                    weights=self._train_sample_weights,
+                    num_samples=len(self._train_sample_weights),
+                    replacement=True,
                 )
             return super()._get_train_sampler(train_dataset)
+
+        def get_eval_dataloader(self, eval_dataset=None):
+            if self._eval_data_collator is not None:
+                original = self.data_collator
+                self.data_collator = self._eval_data_collator
+                dataloader = super().get_eval_dataloader(eval_dataset)
+                self.data_collator = original
+                return dataloader
+            return super().get_eval_dataloader(eval_dataset)
 
     trainer = SiQVLTrainer(
         model=vl_model,
@@ -943,21 +1011,22 @@ def train(args=None):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        eval_data_collator=eval_collator,
+        train_sample_weights=train_sample_weights,
         processing_class=vl_processor,
         callbacks=callbacks,
     )
 
-    rank_zero_info(">>> DEBUG: Checking Labels...")
+    rank_zero_info(">>> DEBUG: Checking first batch shape...")
     batch = next(iter(trainer.get_train_dataloader()))
-    input_ids = batch["input_ids"][0]
-    labels = batch["labels"][0]
-    for i in range(len(input_ids)):
-        if labels[i] != -100:
-            rank_zero_info(f"Token: {vl_processor.decode([input_ids[i]])} | Label: {labels[i].item()}")
-    rank_zero_info(f"input_ids:\n {input_ids} \n")
-    rank_zero_info(f"labels:\n {[label.item() for label in labels]} \n")
-    rank_zero_info(f"Question:\n {batch['questions'][0]} \n")
-    rank_zero_info(f"Answer:\n {batch['answers'][0]} \n")
+    rank_zero_info(f"  input_ids: {batch['input_ids'].shape}")
+    rank_zero_info(f"  labels: {batch['labels'].shape}")
+    rank_zero_info(f"  pixel_values: {batch['pixel_values'].shape}")
+    if "attention_mask" in batch:
+        rank_zero_info(f"  attention_mask: {batch['attention_mask'].shape}")
+    if "questions" in batch:
+        rank_zero_info(f"  Question: {batch['questions'][0]}")
+        rank_zero_info(f"  Answer: {batch['answers'][0]}")
 
     rank_zero_info(">>> Start Training...")
     trainer.train()
