@@ -1042,7 +1042,105 @@ gradient_accumulation_steps = 1     # already large effective batch
 
 ## 4.1. Performance Summary & MFU Analysis
 
-### Cumulative Optimization Results (VERIFIED — Iteration 15)
+### Unified Benchmark Results (v2 — Controlled Single-Backbone)
+
+All numbers below use the **same backbone** (SigLIP2-base-224 + Qwen2.5-0.5B, 589.7M total)
+across all experiments. Measured end-to-end on real data (`sharegpt4v/coco`, 50K samples)
+using `scripts/benchmark_real_efficiency.py`. Raw traces at `docs/traces/benchmark_small_v2/`.
+
+**Important**: Previous results (Iteration 15) mixed two different model scales
+(Phase A: 1.5B, Phase B: 0.5B), making speedup claims invalid. This section
+supersedes Iteration 15 with apple-to-apple measurements on a single backbone.
+
+---
+
+#### Metric Definitions
+
+All metrics are **measured** (not estimated) per training step:
+
+| Metric | Formula | Meaning |
+|--------|---------|---------|
+| **Real tok/s** | `attention_mask.sum() / wall_time` | Effective throughput: non-padding tokens processed per second |
+| **Pos/s (hw)** | `B × N / wall_time` | Hardware throughput: total positions including padding |
+| **Pad%** | `1 - attention_mask.sum() / (B × N)` | Fraction of positions that are padding (wasted compute) |
+| **Loss%** | `(labels != -100).sum() / attention_mask.sum()` | Fraction of real tokens that produce gradient signal |
+| **Step (ms)** | `torch.cuda.synchronize(); t1 - t0` | Wall-clock time for fwd + bwd + zero_grad |
+| **VRAM** | `torch.cuda.max_memory_allocated()` | Peak GPU memory usage |
+| **Speedup** | `Real tok/s (config) / Real tok/s (baseline)` | Efficiency gain vs FP32 baseline |
+
+**Key insight**: We measure **Real tok/s** (not Pos/s) because it captures true training
+efficiency — padding tokens consume GPU cycles but contribute zero learning signal.
+A config with 0% padding that processes 100K positions/s is strictly better than one
+processing 120K positions/s with 20% padding (which yields only 96K real tok/s).
+
+---
+
+#### Stage 1 Results (Frozen LLM — only projector trains)
+
+| # | Config | Real tok/s | VRAM | Pad% | Step ms | Speedup |
+|---|--------|-----------|------|------|---------|---------|
+| 1 | **Baseline**: FP32, B=4 | 14,868 | 10.5 GB | 12.3% | 93.3 | 1.0x |
+| 2 | BF16 + no_grad, B=4 | 35,096 | 7.1 GB | 12.3% | 39.5 | **2.4x** |
+| 3 | BF16, B=16 (no bucket) | 45,972 | 25.2 GB | 16.9% | 117.7 | 3.1x |
+| 4 | BF16, B=16, bucketing | 52,850 | 18.0 GB | 3.8% | 99.5 | 3.6x |
+| 5 | BF16, B=32, bucketing | 54,080 | 35.1 GB | 4.4% | 194.7 | 3.6x |
+| 6 | BF16, B=64, bucketing | 51,174 | 69.4 GB | 5.0% | 412.9 | 3.4x |
+| 7 | **Liger-Kernel**, B=32, bucketing | 76,137 | 9.5 GB | 4.4% | 138.3 | **5.1x** |
+| 8 | **torch.compile**, B=32, bucketing | 94,757 | 21.9 GB | 4.4% | 111.1 | **6.4x** |
+| 9 | **TileGym**, B=32, bucket, pad64 | 91,757 | 10.9 GB | 14.3% | 114.7 | 6.2x |
+| 10 | TileGym, B=64, bucket, pad64 | 93,311 | 18.2 GB | 14.0% | 226.4 | 6.3x |
+| 11 | Packing N=1024, B=64 (no kernel) | 57,120 | 72.2 GB | 0.0% | 410.5 | 3.8x |
+| 12 | **Packing + TileGym**, B=64, N=1024 | **100,228** | **18.1 GB** | **0.0%** | 234.0 | **6.7x** |
+
+#### Stage 2 Results (Unfrozen LLM + gradient checkpointing)
+
+| # | Config | Real tok/s | VRAM | Pad% | Step ms | Speedup |
+|---|--------|-----------|------|------|---------|---------|
+| S2-1 | Vanilla, B=4, grad_ckpt | 20,854 | 5.2 GB | 12.3% | 66.5 | 1.0x |
+| S2-2 | Vanilla, B=16, bucket, grad_ckpt | 38,331 | 12.6 GB | 3.8% | 137.1 | 1.8x |
+| S2-3 | Liger, B=16, bucket, grad_ckpt | 16,645 | 2.4 GB | 3.8% | 315.8 | 0.8x ❌ |
+| S2-4 | **TileGym**, B=16, bucket, pad64, grad_ckpt | 55,284 | 3.4 GB | 14.4% | 95.1 | **2.7x** |
+| S2-5 | **TileGym**, B=32, bucket, pad64, grad_ckpt | **64,132** | **4.3 GB** | 14.3% | 164.2 | **3.1x** |
+
+---
+
+#### Key Findings (Unified, Single-Backbone)
+
+1. **Total Stage 1 speedup: 6.7x** (14,868 → 100,228 real tok/s) on the same backbone.
+
+2. **BF16 fix is 2.4x** — the single largest return-on-effort optimization (2-line change).
+
+3. **Vanilla throughput saturates at B=16 (~54K tok/s)**: Increasing B beyond 16 does NOT
+   improve Real tok/s (55K→51K) but explodes VRAM (18→69 GB). The GPU is memory-bandwidth
+   bound at this model scale — larger batches only increase latency proportionally.
+
+4. **Liger-Kernel: massive VRAM savings, divergent speed impact**:
+   - Stage 1: +41% speed (76K vs 54K) AND -73% VRAM (9.5 vs 35 GB)
+   - Stage 2: -57% speed (16.6K vs 38K) BUT -81% VRAM (2.4 vs 12.6 GB)
+   - Root cause: Liger's Triton JIT compilation overhead dominates in Stage 2 where
+     backward pass (many kernel launches) amplifies startup costs.
+
+5. **torch.compile is the single fastest config (Stage 1)**: 94.8K tok/s at B=32.
+   But uses 21.9 GB VRAM (2x more than TileGym for similar speed).
+
+6. **TileGym: best speed/VRAM Pareto**:
+   - Stage 1: 91.8K tok/s at only 10.9 GB (vs compile's 94.8K at 21.9 GB)
+   - Stage 2: 64.1K tok/s at only 4.3 GB (3.1x speedup, 66% VRAM reduction)
+   - Trade-off: Requires pad_to_multiple_of=64 (adds 14% intentional padding)
+
+7. **Packing alone is counterproductive without kernel optimization**:
+   57K tok/s at 72 GB VRAM — worse than vanilla bucketing at B=32 (54K at 35 GB).
+   Packing creates longer sequences (N=1024) that are more expensive per step.
+
+8. **Packing + TileGym = peak efficiency**: 100K tok/s, 0% waste, 18 GB.
+   TileGym needs fixed shapes; packing provides exactly that (fixed N=1024 bins).
+
+---
+
+### Historical Cumulative Results (DEPRECATED — mixed backbone, for reference only)
+
+> **WARNING**: Results below used TWO different model scales (Phase A: 1.5B, Phase B: 0.5B).
+> The "22.9x" speedup claim is NOT apple-to-apple. See unified results above for valid data.
 
 All numbers below were re-measured end-to-end on real data (`sharegpt4v/coco`, 50K samples)
 using `scripts/benchmark_real_efficiency.py`. Raw traces at `docs/traces/iter_15_ground_truth_efficiency.json`.

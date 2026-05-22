@@ -367,6 +367,7 @@ def get_stage1_model_and_processor(
     use_packing: bool = False,
     use_cutile: bool = False,
     use_tilegym: bool = False,
+    use_liger: bool = False,
 ) -> tuple[SiQ_VLForCausalLM, SiQ_VLProcessor]:
     """
     Get the initialized SiQ-VL model for stage 1 (multimodality projector allignment) pre-training
@@ -377,6 +378,8 @@ def get_stage1_model_and_processor(
         use_cutile: If True, uses cuTile Flash Attention backend (Blackwell-optimized).
         use_tilegym: If True, uses TileGym full kernel replacement (RoPE+RMSNorm+SwiGLU+FA4).
                      Supersedes both Liger and use_cutile.
+        use_liger: If True, applies Liger-Kernel fused ops. If False and no other kernel
+                   is selected, uses vanilla PyTorch.
 
     Returns:
         SiQ_VLForCausalLM instance and SiQ_VLProcessor instance.
@@ -393,7 +396,8 @@ def get_stage1_model_and_processor(
         text_attn_impl = "cutile"
         rank_zero_info(">>> TileGym FA4 (cuTile) registered: native GQA + autotuned tiles")
     else:
-        _apply_liger_kernel()
+        if use_liger:
+            _apply_liger_kernel()
         if use_packing:
             text_attn_impl = "flex_attention"
         else:
