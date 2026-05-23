@@ -26,6 +26,7 @@ from siq_vl.callbacks import (
 from siq_vl.collator import PackingCollator, SiQ_VLDataCollator
 from siq_vl.dataset import ProcessedVQADataset, VQADataset
 from siq_vl.model.modeling import get_stage1_model_and_processor, get_stage2_model_and_processor
+from siq_vl.optim import CompositeOptimizer, create_muon_optimizer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.set_float32_matmul_precision("high")
@@ -341,6 +342,27 @@ def parse_args():
         type=float,
         default=1e-3,
         help="Learning rate",
+    )
+
+    # Optimizer
+    parser.add_argument(
+        "--optim_type",
+        type=str,
+        default="adamw",
+        choices=["adamw", "muon"],
+        help="Optimizer: adamw (fused AdamW) or muon (Muon for 2D weights + AdamW for rest)",
+    )
+    parser.add_argument(
+        "--muon_lr",
+        type=float,
+        default=0.02,
+        help="Learning rate for Muon optimizer (hidden 2D weights)",
+    )
+    parser.add_argument(
+        "--muon_momentum",
+        type=float,
+        default=0.95,
+        help="Momentum for Muon optimizer",
     )
 
     # Compilation
@@ -981,10 +1003,26 @@ def train(args=None):
         callbacks.append(ProfilerCallback(profiler, args.profile_warmup_steps + args.profile_steps))
 
     class SiQVLTrainer(Trainer):
-        def __init__(self, *args, eval_data_collator=None, train_sample_weights=None, **kwargs):
+        def __init__(self, *args, eval_data_collator=None, train_sample_weights=None, optim_type="adamw", muon_lr=0.02, muon_momentum=0.95, **kwargs):
             super().__init__(*args, **kwargs)
             self._eval_data_collator = eval_data_collator
             self._train_sample_weights = train_sample_weights
+            self._optim_type = optim_type
+            self._muon_lr = muon_lr
+            self._muon_momentum = muon_momentum
+
+        def create_optimizer(self):
+            if self._optim_type == "muon":
+                self.optimizer, n_muon, n_adamw = create_muon_optimizer(
+                    self.model,
+                    muon_lr=self._muon_lr,
+                    muon_momentum=self._muon_momentum,
+                    adamw_lr=self.args.learning_rate,
+                    weight_decay=self.args.weight_decay,
+                )
+                rank_zero_info(f">>> Muon optimizer: {n_muon} params (2D hidden), {n_adamw} params (AdamW)")
+                return self.optimizer
+            return super().create_optimizer()
 
         def _get_train_sampler(self, train_dataset=None):
             if self._train_sample_weights is not None:
@@ -1013,6 +1051,9 @@ def train(args=None):
         data_collator=data_collator,
         eval_data_collator=eval_collator,
         train_sample_weights=train_sample_weights,
+        optim_type=args.optim_type,
+        muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
         processing_class=vl_processor,
         callbacks=callbacks,
     )

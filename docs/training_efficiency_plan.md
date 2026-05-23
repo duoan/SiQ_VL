@@ -1566,7 +1566,95 @@ Our 24% MFU is within the expected range and near the ceiling for this model sca
 
 ---
 
-## 4.2. Negative Results / Failed Experiments
+## 4.2. Production Optimization Stack (Final Configuration)
+
+### Applied Optimizations (Stage 2, SigLIP2-base-224 + Qwen2.5-0.5B)
+
+| Optimization | Source | Impact |
+|---|---|---|
+| TileGym cuTile kernels (RoPE, RMSNorm, SwiGLU, FA4) | TileGym/NVIDIA | Core kernel acceleration |
+| FusedCE (`fused_linear_cross_entropy`) | TileGym `_ce_online_kernel` | 33% throughput gain (avoids 151K-vocab logits materialization) |
+| `torch.compile` (max-autotune-no-cudagraphs) | PyTorch Inductor | ~5% on remaining elementwise ops |
+| `adamw_torch_fused` / Muon optimizer | PyTorch native | Reduced kernel launch overhead / faster convergence |
+| ProcessedVQADataset + PackingCollator | Custom | Parallel CPU workers, no data loading stalls |
+| `datasets.concatenate_datasets` + `WeightedRandomSampler` | Custom | Instant dataset mix (vs minutes with interleave) |
+| `torch.set_float32_matmul_precision("high")` | PyTorch | Fix torch.compile + TileGym compat |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | PyTorch | Reduced memory fragmentation |
+| No gradient checkpointing | — | 90GB VRAM permits full activations |
+| No callbacks | — | Removes eval/generation overhead during benchmarks |
+
+### nsys GPU Kernel Profile (Steady-state, 500 steps)
+
+Profile: `docs/traces/stage2_compile_500steps.nsys-rep`
+
+| GPU Time % | Kernel Category | Description |
+|---|---|---|
+| **64%** | GEMM (cutlass + triton_fused_mm) | Actual model compute |
+| **13%** | TileGym (SwiGLU + FMHA + RoPE + RMSNorm) | Custom fused kernels |
+| **7.5%** | FusedCE (`_ce_online_kernel`) | Cross-entropy loss |
+| **5%** | Fused Optimizer (AdamW/Muon) | Parameter updates |
+| **~10%** | Elementwise + memory ops | Residual overhead |
+
+Steady-state throughput: **3.7–3.9 it/s** (batch=64, seq=1024, ~84K tok/s hardware)
+
+---
+
+### Optimizer Ablation: Muon vs AdamW
+
+**Hypothesis**: Muon (Newton-Schulz orthogonalized momentum) may converge faster than AdamW for VLM finetuning, despite being designed for pretraining.
+
+**Setup**: Stage 2 finetuning, 1000 steps, identical data/batch/kernels. Muon uses lr=5e-4 for 2D hidden weights + AdamW lr=1e-4 for embeddings/norms/heads. AdamW uses lr=2e-5 (fused).
+
+#### Convergence Speed (Time-to-Loss)
+
+| Target Loss | AdamW wall-time | Muon wall-time | Wall-clock Speedup | Token Efficiency |
+|---|---|---|---|---|
+| 2.00 | 87s | 73s | **1.2x** | 1.7x |
+| 1.95 | 144s | 89s | **1.6x** | 2.3x |
+| 1.92 | 158s | 104s | **1.5x** | 2.0x |
+| 1.90 | 200s | 136s | **1.5x** | 1.9x |
+| 1.88 | 286s | 136s | **2.1x** | 2.7x |
+| 1.86 | 286s | 168s | **1.7x** | 2.1x |
+| 1.84 | never (1000 steps) | 168s | **∞** | — |
+| 1.82 | never | 184s | **∞** | — |
+| 1.80 | never | 231s | **∞** | — |
+
+#### Final Results (1000 steps, 22.5M tokens)
+
+| Optimizer | Final Loss | Wall-time | Steady it/s |
+|---|---|---|---|
+| AdamW (fused, lr=2e-5) | 1.855 | 591s | 3.7–3.9 |
+| **Muon (lr=5e-4) + AdamW aux** | **1.729** | 619s | 3.3–3.5 |
+
+#### Key Findings
+
+1. **Muon converges 1.5–2.1x faster** in wall-clock time to reach the same loss.
+2. **Muon reaches losses AdamW never achieves**: AdamW plateaus at 1.855; Muon reaches 1.729 (−6.8%).
+3. **Token efficiency 1.7–2.7x better**: Muon needs 2–3x fewer tokens to hit the same loss milestone.
+4. **Throughput overhead is small** (~15% slower per-step due to Newton-Schulz iterations), but more than compensated by faster convergence.
+5. **Muon lr is critical for finetuning**: Default lr=0.02 (for pretraining) destroys pretrained weights. lr=5e-4 is optimal for finetuning.
+6. **GramMuon (Tri Dao)**: Tested but Quack CuTeDSL kernels have compat issues with PyTorch 2.9.1. PyTorch native `torch.optim.Muon` is best for 0.5B model size. GramMuon's symmetric GEMM kernels will help at 1.5B+ scale.
+
+#### Muon lr Sensitivity
+
+| Muon lr | Final Loss (500 steps) | Behavior |
+|---|---|---|
+| 0.02 (default) | 3.162 | Catastrophic — destroys pretrained weights |
+| 0.002 | 2.615 | Diverging — loss increases then oscillates |
+| **0.0005** | **1.771** | **Optimal** — smooth convergence, best final loss |
+
+#### Implementation
+
+Optimizer logic is in `siq_vl/optim.py`:
+- `CompositeOptimizer`: wraps Muon + AdamW for HF Trainer compatibility
+- `create_muon_optimizer()`: auto-partitions parameters (≥2D hidden → Muon, rest → AdamW)
+- CLI: `--optim_type muon --muon_lr 0.0005 --learning_rate 1e-4`
+
+**Recommendation**: Use Muon for Stage 2 finetuning. For Stage 1 (projector-only), AdamW with lr=1e-3 remains optimal since most parameters are frozen.
+
+---
+
+## 4.3. Negative Results / Failed Experiments
 
 > Not every hypothesis pans out. These are recorded here for the blog's "pitfalls" section
 > and to prevent future re-investigation of dead ends.
@@ -1805,6 +1893,7 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - `scripts/benchmark_stage2.py` — Stage 2 benchmark (LoRA / Full FT / grad_ckpt comparison)
 - `scripts/benchmark_batch_scaling.py` — Batch-size scaling (find max B for VRAM budget)
 - `scripts/benchmark_flashoptim.py` — FlashOptim (Databricks) vs AdamW comparison
+- `siq_vl/optim.py` — Optimizer factory (CompositeOptimizer, Muon+AdamW, param partitioning)
 - `scripts/train.py::train` — Trainer assembly + Stage switching
 - `scripts/train_launch.sh` — host detection + accelerate launch
 - `modal_train.py` — (planned) Modal App definition for distributed training
@@ -1818,5 +1907,7 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 - **varlen**: FlashAttention 2's "variable length" API (`flash_attn_varlen_func`), using `cu_seqlens` to express packed batches
 - **Modal**: Serverless cloud platform for running GPU workloads; provisions containers with GPUs on demand, with persistent Volumes for data/checkpoints
 - **cuTile DSL**: NVIDIA's domain-specific language for writing GPU kernels targeting Blackwell (sm_120) architecture, with native support for wgmma, TMA, and autotuning
+- **Muon**: Optimizer for hidden-layer weights (≥2D) that orthogonalizes momentum via Newton-Schulz iterations. Converges 1.5–2x faster than AdamW for finetuning but only applies to matrix weights; embeddings/norms/heads still use AdamW
+- **GramMuon**: Tri Dao's accelerated Muon variant using Gram Newton-Schulz (fewer matmuls) with custom symmetric GEMM CuTeDSL kernels for Hopper/Blackwell
 - **FSDP (Fully Sharded Data Parallel)**: PyTorch-native distributed training strategy that shards model parameters, gradients, and optimizer states across GPUs
 - **FlashOptim**: Databricks library providing drop-in optimizer replacements (`FlashAdamW`) that quantize states to int8 + error correction, reducing per-parameter memory by ~57%. Features gradient release (update during backward) and compressed checkpoints
