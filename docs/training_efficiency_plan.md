@@ -1880,6 +1880,105 @@ To ensure blog numbers are credible and reproducible, every iteration must:
 
 ---
 
+## 4.3. Hyperparameter Ablation Study (Iter 14)
+
+**Setup**: Stage 2 full-finetune, Muon+AdamW optimizer, TileGym+FusedCE, torch.compile,
+Blackwell B200 single GPU. All runs use 500 steps, seed=42, cosine schedule (unless noted).
+
+### 4.3.1. Sequence Length: 1024 vs 2048
+
+| Config | Final Loss | Runtime (s) | Throughput (tok/s) | Tokens Seen |
+|--------|-----------|------------|-------------------|-------------|
+| bs=64, seq=1024 | **1.781** | **169.9** | **66,430** | 11.28M |
+| bs=64, seq=2048 | 1.795 | 237.3 | 48,170 | 11.43M |
+
+**Finding**: seq_length=2048 is **strictly worse** for this dataset:
+- 40% slower throughput (memory pressure from 2x larger activations)
+- Marginally worse convergence (+0.014 loss)
+- Nearly identical tokens seen → very few samples exceed 1024 tokens
+
+**Decision**: Keep seq_length=1024 for both stages.
+
+### 4.3.2. Batch Size: 64 vs 128
+
+| Config | Final Loss | Runtime (s) | Throughput (tok/s) | Tokens Seen |
+|--------|-----------|------------|-------------------|-------------|
+| bs=64, seq=1024 | 1.781 | 169.9 | 66,430 | 11.28M |
+| bs=128, seq=1024 | **1.691** | 395.3 | 56,180 | 22.21M |
+
+**Finding**: bs=128 provides **5.3% lower final loss** (1.691 vs 1.781) because:
+- 2x more tokens per step → better gradient estimates (grad_norm 1.8 vs 2.3)
+- Sees 2x total tokens in same step count
+
+**Trade-off**: 15% throughput drop (66K→56K tok/s) due to increased memory pressure.
+
+**Time-to-loss comparison** (to reach loss=1.815):
+- bs=64: 94.1s (step 250)
+- bs=128: 180.2s (step 125, 5.5M tokens)
+
+**Recommendation**: Use bs=128 for production training (better model quality); use bs=64 for rapid prototyping (higher throughput).
+
+### 4.3.3. LR Schedule: Cosine vs WSD (Warmup-Stable-Decay)
+
+| Schedule | Final Loss | Runtime (s) | LR @ step 400 |
+|----------|-----------|------------|---------------|
+| cosine (warmup=3%) | 1.781 | 169.9 | 7.9e-5 |
+| WSD (warmup=5%, decay=20%) | 1.781 | 170.8 | 5.0e-4 |
+
+**Finding**: WSD ≈ cosine for short runs (500 steps). Both converge identically.
+
+WSD's theoretical advantage (sustained high LR during stable phase) only materializes
+in long training runs (>5000 steps). For short finetuning, the schedules are equivalent.
+
+**Decision**: Default to cosine (simpler, no decay_ratio tuning). Switch to WSD for
+longer pretraining runs where sustained LR stability matters.
+
+### 4.3.4. CUDA Graphs: max-autotune vs max-autotune-no-cudagraphs
+
+| Mode | Steady-state (it/s) | Graph Breaks | Note |
+|------|---------------------|-------------|------|
+| max-autotune-no-cudagraphs | **3.3** | 0 | baseline |
+| max-autotune (CUDA Graphs) | 1.3 | 0 | 2.5x slower |
+
+**Finding**: CUDA Graphs is a **negative optimization** for 0.5B model:
+- Kernel launch overhead is already negligible at this scale (~0.3ms/step)
+- Graph capture + replay management overhead dominates
+- FusedCE's chunked loop creates multiple graph segments, amplifying capture cost
+
+**Required patches** (for reference if scaling to >7B):
+- `tilegym/.../fused_linear_cross_entropy.py`: replace `loss_chunk[~valid] = 0.0` → `loss_chunk.mul_(valid)`
+- `siq_vl/kernels/fused_linear_ce.py`: remove `.item()` calls, data-dependent branches, boolean indexing
+
+**Decision**: Keep `max-autotune-no-cudagraphs` for 0.5B. Revisit at 7B+ scale.
+
+### 4.3.5. Model Scale: 0.5B vs 1.5B
+
+| Model | Throughput (tok/s) | Loss @ 200 steps | Wall-clock (200 steps) | MFU |
+|-------|-------------------|-----------------|----------------------|-----|
+| Qwen2.5-0.5B | 66,400 | ~1.87 | ~50s | ~18% |
+| Qwen2.5-1.5B | 22,100 | **1.689** | 204s | ~18% |
+
+**Finding**: 1.5B achieves **lower loss in similar wall-clock time** (loss 1.689 in 204s vs 0.5B needing 170s to reach only 1.781). The larger model is 3x more sample-efficient.
+
+**MFU is identical** (~18%) for both scales on B200 — GPU is not under-utilized at 0.5B. The bottleneck is memory bandwidth and dynamic operations (vision token injection), not compute saturation.
+
+**Implication**: For best model quality per dollar, 1.5B is preferred. For rapid iteration, 0.5B with higher throughput enables faster experimentation.
+
+### 4.3.6. Summary: Recommended Production Config
+
+```
+# Optimal Stage 2 config based on ablations:
+--per_device_train_batch_size 128      # (if VRAM allows, else 64)
+--seq_length 1024                       # dataset doesn't benefit from longer
+--lr_scheduler_type cosine              # equivalent to WSD for finetuning
+--optim_type muon --muon_lr 0.0005      # 4.9x faster convergence vs AdamW
+--use_tilegym --torch_compile           # kernel fusion + compilation
+--use_packing                           # zero padding waste
+--no_gradient_checkpointing             # only if VRAM fits
+```
+
+---
+
 ## Appendix A — Key Code Index
 
 - `siq_vl/model/modeling.py::SiQ_VLForCausalLM.forward` — vision replacement + LLM forward core

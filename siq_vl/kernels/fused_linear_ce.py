@@ -37,11 +37,8 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
         chunk_size = min(_CHUNK_SIZE, bt)
         num_chunks = (bt + chunk_size - 1) // chunk_size
 
-        loss_all = torch.empty(bt, device=hidden_states.device, dtype=torch.float32)
-        n_valid = 0
+        loss_all = torch.zeros(bt, device=hidden_states.device, dtype=torch.float32)
 
-        # Precompute gradients in forward (fused_linear_jsd pattern).
-        # Each chunk's grad_logits (C, V) lives only within one iteration.
         grad_hidden = torch.zeros(bt, h, device=hidden_states.device, dtype=hidden_states.dtype)
         grad_weight = torch.zeros(vocab_size, h, device=hidden_states.device, dtype=hidden_states.dtype)
 
@@ -51,45 +48,37 @@ class FusedLinearCrossEntropy(torch.autograd.Function):
             t_chunk = target[s:e]
             loss_chunk = loss_all[s:e]
 
-            valid_mask = t_chunk != ignore_index
-            n_valid_chunk = valid_mask.sum().item()
-
-            if n_valid_chunk == 0:
-                loss_chunk.zero_()
-                continue
+            # valid mask as float for multiplication (no boolean indexing)
+            valid_mask = (t_chunk != ignore_index).float()
 
             # GEMM 1: logits = x @ W^T (chunk_size, V)
             logits_chunk = x_chunk.detach() @ weight.T
 
             # cuTile kernel: loss + overwrite logits with softmax probs (in-place)
             _ce_cutile(logits_chunk, t_chunk, loss_chunk, ignore_index)
+            # Zero out loss for invalid tokens (moved from _ce_cutile for CUDA Graph compat)
+            loss_chunk.mul_(valid_mask)
 
             # logits_chunk is now softmax probs — compute grad_logits = probs - one_hot
             safe_target = t_chunk.clamp(min=0)
             rows = torch.arange(logits_chunk.shape[0], device=logits_chunk.device)
             logits_chunk[rows, safe_target] -= 1.0
-            logits_chunk[~valid_mask] = 0.0
-            # logits_chunk is now grad_logits (C, V) — use immediately for backward GEMMs
+            # Zero out invalid rows via multiplication (CUDA Graph friendly)
+            logits_chunk.mul_(valid_mask.unsqueeze(1))
 
-            # GEMM 2: grad_hidden_chunk = grad_logits @ weight  (C,V) @ (V,H) -> (C,H)
+            # GEMM 2: grad_hidden_chunk = grad_logits @ weight
             grad_hidden[s:e] = logits_chunk.to(hidden_states.dtype) @ weight
 
-            # GEMM 3: grad_weight += grad_logits.T @ hidden  (V,C) @ (C,H) -> (V,H)
+            # GEMM 3: grad_weight += grad_logits.T @ hidden
             grad_weight.addmm_(logits_chunk.to(hidden_states.dtype).T, x_chunk)
 
-            # logits_chunk (C, V) is freed here — never stored!
-
-            n_valid += n_valid_chunk
-
-        # Loss reduction
-        if n_valid > 0:
-            loss = loss_all.sum() / n_valid
-            # Scale grads by 1/n_valid (the loss reduction factor)
-            inv_n = 1.0 / n_valid
-            grad_hidden.mul_(inv_n)
-            grad_weight.mul_(inv_n)
-        else:
-            loss = loss_all.sum()
+        # Loss reduction — no .item(), no data-dependent branching
+        n_valid = (target != ignore_index).sum()
+        n_valid_safe = torch.clamp(n_valid, min=1).float()
+        loss = loss_all.sum() / n_valid_safe
+        inv_n = 1.0 / n_valid_safe
+        grad_hidden.mul_(inv_n)
+        grad_weight.mul_(inv_n)
 
         ctx.save_for_backward(grad_hidden, grad_weight)
         ctx.has_weight_grad = weight.requires_grad

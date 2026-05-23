@@ -364,6 +364,18 @@ def parse_args():
         default=0.95,
         help="Momentum for Muon optimizer",
     )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="cosine",
+        help="LR scheduler type (cosine, warmup_stable_decay, linear, constant_with_warmup, etc.)",
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.03,
+        help="Warmup ratio for LR scheduler",
+    )
 
     # Compilation
     parser.add_argument(
@@ -371,6 +383,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Apply torch.compile to the model (incompatible with Liger-Kernel)",
+    )
+    parser.add_argument(
+        "--torch_compile_mode",
+        type=str,
+        default="max-autotune-no-cudagraphs",
+        help="torch.compile mode (max-autotune, max-autotune-no-cudagraphs, reduce-overhead, default)",
     )
     parser.add_argument(
         "--no_liger",
@@ -822,7 +840,7 @@ def train(args=None):
         dataloader_persistent_workers=args.dataloader_num_workers > 0,
         dataloader_prefetch_factor=4 if args.dataloader_num_workers > 0 else None,
         torch_compile=args.torch_compile,
-        torch_compile_mode="max-autotune-no-cudagraphs" if args.torch_compile else None,
+        torch_compile_mode=args.torch_compile_mode if args.torch_compile else None,
         # --- Evaluation ---
         eval_strategy="steps",
         eval_steps=args.eval_steps,
@@ -837,8 +855,8 @@ def train(args=None):
         # Project alignment using 1e-3
         # Recommendation for full finetuning: 1e-5 to 2e-5
         learning_rate=args.learning_rate,
-        warmup_ratio=0.03,
-        lr_scheduler_type="cosine",
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
         optim="adamw_torch_fused",
         weight_decay=0.01,  # prevent overfitting
         max_steps=max_steps,
@@ -1023,6 +1041,22 @@ def train(args=None):
                 rank_zero_info(f">>> Muon optimizer: {n_muon} params (2D hidden), {n_adamw} params (AdamW)")
                 return self.optimizer
             return super().create_optimizer()
+
+        def create_scheduler(self, num_training_steps, optimizer=None):
+            if self.args.lr_scheduler_type == "warmup_stable_decay":
+                from transformers import get_wsd_schedule
+                if optimizer is None:
+                    optimizer = self.optimizer
+                warmup_steps = int(num_training_steps * self.args.warmup_ratio)
+                decay_steps = int(num_training_steps * 0.2)
+                self.lr_scheduler = get_wsd_schedule(
+                    optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_stable_steps=num_training_steps - warmup_steps - decay_steps,
+                    num_decay_steps=decay_steps,
+                )
+                return self.lr_scheduler
+            return super().create_scheduler(num_training_steps, optimizer)
 
         def _get_train_sampler(self, train_dataset=None):
             if self._train_sample_weights is not None:
