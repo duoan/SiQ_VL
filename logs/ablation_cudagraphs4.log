@@ -1,0 +1,349 @@
+>>> Running in single-GPU/non-distributed mode.
+>>> Using subsets and weights:
+    - coco_colors: weight=1.0
+    - densefusion_1m: weight=1.0
+    - face_emotion: weight=1.0
+    - google_landmarks: weight=1.0
+    - laion_gpt4v: weight=1.0
+    - sharegpt4o: weight=1.0
+    - sharegpt4v(coco): weight=1.0
+    - sharegpt4v(llava): weight=1.0
+    - sharegpt4v(knowledge): weight=1.0
+    - sharegpt4v(sam): weight=1.0
+>>> Using output_dir: ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2
+>>> Loading Model and Processor...
+>>> Kernel config: tilegym=True, liger=False, fused_ce=True
+>>> Gradient checkpointing: False
+[2026-05-22 18:38:03] [tilegym.transformers.monkey_patch] [INFO] [logger.py:195] --------------------------------
+[2026-05-22 18:38:03] [tilegym.transformers.monkey_patch] [INFO] [logger.py:195] apply_tilegym_kernel_to_qwen2
+[2026-05-22 18:38:03] [tilegym.transformers.monkey_patch] [INFO] [logger.py:195] --------------------------------
+[2026-05-22 18:38:03] [tilegym.backend.selector] [INFO] [logger.py:195] Set backend to cutile
+>>> TileGym applied (cuTile DSL): RoPE + RMSNorm + SwiGLU + FA4 attention
+>>> TileGym attention wrapped with SDPA fallback for non-Qwen2 models
+>>> + fused_linear_cross_entropy (chunked, never materializes [BT,V] logits)
+Loading weights:   0%|          | 0/499 [00:00<?, ?it/s]Loading weights: 100%|██████████| 499/499 [00:00<00:00, 15492.37it/s]
+DEBUG - Model pixel_shuffle_factor: 2
+DEBUG - Processor pixel_shuffle_factor: 2
+DEBUG - Processor tokens_per_tile: 49
+Total model parameters: 589,669,504 | Vision model parameters: 92,884,224 (15.75%) | Text model parameters: 494,032,768 (83.78%) | Projector parameters: 2,752,512 (0.47%) | Trainable model parameters: 496,785,280, (84.25%)
+SiQ_VLConfig {
+  "architectures": [
+    "SiQ_VLForCausalLM"
+  ],
+  "bos_token_id": null,
+  "dtype": "bfloat16",
+  "eos_token_id": 151645,
+  "ignore_token_index": -100,
+  "image_token_index": 151655,
+  "model_type": "siq_vl",
+  "pad_token_id": 151643,
+  "projector_config": {
+    "_name_or_path": "",
+    "architectures": null,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "hidden_act": "silu",
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "model_type": "siq_vl",
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "problem_type": null,
+    "return_dict": true,
+    "text_hidden_size": 896,
+    "vision_hidden_size": 768,
+    "vision_pixel_shuffle_factor": 2
+  },
+  "text_config": {
+    "_name_or_path": "",
+    "architectures": [
+      "Qwen2ForCausalLM"
+    ],
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "eos_token_id": 151645,
+    "hidden_act": "silu",
+    "hidden_size": 896,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "intermediate_size": 4864,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "layer_types": [
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 32768,
+    "max_window_layers": 21,
+    "model_type": "siq_vl",
+    "num_attention_heads": 14,
+    "num_hidden_layers": 24,
+    "num_key_value_heads": 2,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "pad_token_id": null,
+    "problem_type": null,
+    "return_dict": true,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "rope_theta": 1000000.0,
+      "rope_type": "default"
+    },
+    "sliding_window": null,
+    "tie_word_embeddings": true,
+    "use_cache": true,
+    "use_sliding_window": false,
+    "vocab_size": 151936
+  },
+  "transformers_version": "5.3.0",
+  "vision_config": {
+    "_name_or_path": "",
+    "architectures": null,
+    "attention_dropout": 0.0,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 768,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "image_size": 224,
+    "intermediate_size": 3072,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "layer_norm_eps": 1e-06,
+    "model_type": "siq_vl",
+    "num_attention_heads": 12,
+    "num_channels": 3,
+    "num_hidden_layers": 12,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "patch_size": 16,
+    "problem_type": null,
+    "return_dict": true
+  },
+  "vision_end_token_index": 151653,
+  "vision_start_token_index": 151652
+}
+
+SiQ_VLTextConfig {
+  "architectures": [
+    "Qwen2ForCausalLM"
+  ],
+  "attention_dropout": 0.0,
+  "bos_token_id": 151643,
+  "dtype": "bfloat16",
+  "eos_token_id": 151645,
+  "hidden_act": "silu",
+  "hidden_size": 896,
+  "initializer_range": 0.02,
+  "intermediate_size": 4864,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "max_position_embeddings": 32768,
+  "max_window_layers": 21,
+  "model_type": "siq_vl",
+  "num_attention_heads": 14,
+  "num_hidden_layers": 24,
+  "num_key_value_heads": 2,
+  "pad_token_id": null,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "rope_theta": 1000000.0,
+    "rope_type": "default"
+  },
+  "sliding_window": null,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.3.0",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 151936
+}
+
+SiQ_VLVisionConfig {
+  "attention_dropout": 0.0,
+  "dtype": "bfloat16",
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_size": 768,
+  "image_size": 224,
+  "intermediate_size": 3072,
+  "layer_norm_eps": 1e-06,
+  "model_type": "siq_vl",
+  "num_attention_heads": 12,
+  "num_channels": 3,
+  "num_hidden_layers": 12,
+  "patch_size": 16,
+  "transformers_version": "5.3.0"
+}
+
+SiQ_VLProjectorConfig {
+  "dtype": "bfloat16",
+  "hidden_act": "silu",
+  "model_type": "siq_vl",
+  "text_hidden_size": 896,
+  "transformers_version": "5.3.0",
+  "vision_hidden_size": 768,
+  "vision_pixel_shuffle_factor": 2
+}
+
+>>> Loading Dataset...
+>>> Loading subset 'coco_colors' (weight=1.0)...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+>>> Loaded coco_colors: 118287 samples
+>>> Loading subset 'densefusion_1m' (weight=1.0)...
+>>> Loaded densefusion_1m: 1058751 samples
+>>> Loading subset 'face_emotion' (weight=1.0)...
+>>> Loaded face_emotion: 797 samples
+>>> Loading subset 'google_landmarks' (weight=1.0)...
+>>> Loaded google_landmarks: 299993 samples
+>>> Loading subset 'laion_gpt4v' (weight=1.0)...
+>>> Loaded laion_gpt4v: 9301 samples
+>>> Loading subset 'sharegpt4o' (weight=1.0)...
+>>> Loaded sharegpt4o: 57284 samples
+>>> Loading subset 'sharegpt4v(coco)' (weight=1.0)...
+>>> Loaded sharegpt4v(coco): 50017 samples
+>>> Loading subset 'sharegpt4v(llava)' (weight=1.0)...
+>>> Loaded sharegpt4v(llava): 29986 samples
+>>> Loading subset 'sharegpt4v(knowledge)' (weight=1.0)...
+>>> Loaded sharegpt4v(knowledge): 1988 samples
+>>> Loading subset 'sharegpt4v(sam)' (weight=1.0)...
+>>> Loaded sharegpt4v(sam): 8990 samples
+>>> Building dataset mixture:
+    - coco_colors: probability=0.1000
+    - densefusion_1m: probability=0.1000
+    - face_emotion: probability=0.1000
+    - google_landmarks: probability=0.1000
+    - laion_gpt4v: probability=0.1000
+    - sharegpt4o: probability=0.1000
+    - sharegpt4v(coco): probability=0.1000
+    - sharegpt4v(llava): probability=0.1000
+    - sharegpt4v(knowledge): probability=0.1000
+    - sharegpt4v(sam): probability=0.1000
+>>> Concatenated dataset: 1635394 samples (instant)
+>>> Creating VQADataset (standard Dataset with DistributedSampler support)...
+>>> Packing: seq_length=1024, ProcessedVQADataset + PackingCollator
+>>> Train Dataset: ProcessedVQADataset, len=1635344
+>>> Eval Dataset: VQADataset, len=50
+>>> Using user-specified max_steps=500
+>>> Generated run name: siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183816
+>>> Setting WANDB_PROJECT to: siq-vl
+>>> Saving custom model code files to checkpoint directory...
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/siq_vl/model/modeling.py... ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2
+>>> Copied modeling.py to ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2/modeling.py
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/siq_vl/model/configuration.py... ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2
+>>> Copied configuration.py to ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2/configuration.py
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/siq_vl/model/processing.py... ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2
+>>> Copied processing.py to ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2/processing.py
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/README.md... ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2
+>>> Copied README.md to ./outputs/siglip2-base-patch16-224_qwen2.5-0.5b-instruct_stage2_20260522_183803/stage2/README.md
+>>> All callbacks DISABLED (max throughput mode)
+>>> DEBUG: Checking first batch shape...
+  input_ids: torch.Size([22, 1024])
+  labels: torch.Size([22, 1024])
+  pixel_values: torch.Size([64, 3, 224, 224])
+  attention_mask: torch.Size([22, 1024])
+>>> Start Training...
+>>> Muon optimizer: 169 params (2D hidden), 122 params (AdamW)
+  0%|          | 0/500 [00:00<?, ?it/s]W0522 18:38:30.283000 351113 torch/_dynamo/convert_frame.py:1358] [23/8] torch._dynamo hit config.recompile_limit (8)
+W0522 18:38:30.283000 351113 torch/_dynamo/convert_frame.py:1358] [23/8]    function: '_patched_launch' (/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/experimental.py:68)
+W0522 18:38:30.283000 351113 torch/_dynamo/convert_frame.py:1358] [23/8]    last reason: 23/7: ___check_obj_id(stream, 129363508828032)                 # return _original_launch(stream, grid, kernel, kernel_args)  # tilegym/experimental.py:73 in _patched_launch
+W0522 18:38:30.283000 351113 torch/_dynamo/convert_frame.py:1358] [23/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0522 18:38:30.283000 351113 torch/_dynamo/convert_frame.py:1358] [23/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+W0522 18:38:38.232000 351113 torch/_dynamo/convert_frame.py:1358] [59/8] torch._dynamo hit config.recompile_limit (8)
+W0522 18:38:38.232000 351113 torch/_dynamo/convert_frame.py:1358] [59/8]    function: 'torch_dynamo_resume_in_forward_at_223' (/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py:223)
+W0522 18:38:38.232000 351113 torch/_dynamo/convert_frame.py:1358] [59/8]    last reason: 59/7: past_key_values.layers[7].is_initialized == False        # if not self.is_initialized:  # transformers/cache_utils.py:117 in update
+W0522 18:38:38.232000 351113 torch/_dynamo/convert_frame.py:1358] [59/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0522 18:38:38.232000 351113 torch/_dynamo/convert_frame.py:1358] [59/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[2026-05-22 18:38:39] [tilegym] [WARNING] [experimental.py:71] [EXPERIMENTAL] _ce_online_kernel is an experimental kernel contributed by external GitHub TileGym contributors. This kernel has not been fully validated by the core team.
+skipping cudagraphs due to mutated inputs (1 instances). Found from : 
+   File "/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/ops/cutile/experimental/fused_linear_cross_entropy.py", line 88, in torch_dynamo_resume_in__ce_cutile_at_81
+    loss_chunk.mul_(valid)
+
+skipping cudagraphs due to mutated inputs (1 instances). Found from : 
+   File "/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/ops/cutile/experimental/fused_linear_cross_entropy.py", line 88, in torch_dynamo_resume_in__ce_cutile_at_81
+    loss_chunk.mul_(valid)
+
+[2026-05-22 18:38:39] [tilegym] [WARNING] [experimental.py:71] [EXPERIMENTAL] _rms_bwd_kernel is an experimental kernel contributed by external GitHub TileGym contributors. This kernel has not been fully validated by the core team.
+[2026-05-22 18:38:39] [tilegym] [WARNING] [experimental.py:71] [EXPERIMENTAL] _swiglu_backward_kernel is an experimental kernel contributed by external GitHub TileGym contributors. This kernel has not been fully validated by the core team.
+  0%|          | 1/500 [00:19<2:39:10, 19.14s/it]skipping cudagraphs due to mutated inputs (1 instances). Found from : 
+   File "/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/ops/cutile/experimental/fused_linear_cross_entropy.py", line 88, in torch_dynamo_resume_in__ce_cutile_at_81
+    loss_chunk.mul_(valid)
+
+  0%|          | 2/500 [00:26<1:41:02, 12.17s/it]  1%|          | 3/500 [00:26<56:21,  6.80s/it]  skipping cudagraphs due to mutated inputs (1 instances). Found from : 
+   File "/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/ops/cutile/experimental/fused_linear_cross_entropy.py", line 88, in torch_dynamo_resume_in__ce_cutile_at_81
+    loss_chunk.mul_(valid)
+
+  1%|          | 4/500 [00:27<35:48,  4.33s/it]skipping cudagraphs due to mutated inputs (1 instances). Found from : 
+   File "/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/ops/cutile/experimental/fused_linear_cross_entropy.py", line 88, in torch_dynamo_resume_in__ce_cutile_at_81
+    loss_chunk.mul_(valid)
+
+  1%|          | 5/500 [00:27<24:30,  2.97s/it]  1%|          | 6/500 [00:30<22:24,  2.72s/it]skipping cudagraphs due to mutated inputs (1 instances). Found from : 
+   File "/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/ops/cutile/experimental/fused_linear_cross_entropy.py", line 88, in torch_dynamo_resume_in__ce_cutile_at_81
+    loss_chunk.mul_(valid)
+
+  1%|▏         | 7/500 [00:30<16:30,  2.01s/it]  2%|▏         | 8/500 [00:33<17:42,  2.16s/it]  2%|▏         | 9/500 [00:34<14:24,  1.76s/it]  2%|▏         | 10/500 [00:36<16:22,  2.00s/it]  2%|▏         | 11/500 [00:37<13:32,  1.66s/it]  2%|▏         | 12/500 [00:37<10:14,  1.26s/it]  3%|▎         | 13/500 [00:38<09:18,  1.15s/it]  3%|▎         | 14/500 [00:39<07:20,  1.10it/s]  3%|▎         | 15/500 [00:39<05:58,  1.35it/s]  3%|▎         | 16/500 [00:41<08:56,  1.11s/it]  3%|▎         | 17/500 [00:41<07:03,  1.14it/s]

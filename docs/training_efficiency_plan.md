@@ -1964,17 +1964,62 @@ longer pretraining runs where sustained LR stability matters.
 
 **Implication**: For best model quality per dollar, 1.5B is preferred. For rapid iteration, 0.5B with higher throughput enables faster experimentation.
 
-### 4.3.6. Summary: Recommended Production Config
+### 4.3.6. Gradient Accumulation Sweep
 
-```
-# Optimal Stage 2 config based on ablations:
---per_device_train_batch_size 128      # (if VRAM allows, else 64)
+| Config | Effective BS | Actual Loss | Throughput (tok/s) | Runtime (22.5M tokens) |
+|--------|-------------|------------|-------------------|----------------------|
+| bs=128, GA=1 | 128 | 1.691 | 56,200 | 395s |
+| bs=64, GA=2 | 128 | 1.689 | **74,100** | 304s |
+| bs=64, GA=4 | 256 | 1.700 | 77,600 | 290s |
+
+**Finding**: `grad_accum=2` with `bs=64` is the **optimal config**:
+- Same convergence quality as raw bs=128 (loss 1.689 ≈ 1.691)
+- **32% higher throughput** (74K vs 56K tok/s) — amortizes per-step overhead
+- Lower peak VRAM (only bs=64 activations in memory)
+- GA=4 gives marginal throughput gain but slightly worse convergence (effective BS=256 too large)
+
+### 4.3.7. DataLoader & Vision Pipeline Analysis
+
+- **DataLoader workers=0**: 4.2s/step (6.9x slower) — confirms parallel data loading is critical
+- **DataLoader workers=16**: fully hides data loading latency, no benefit from more workers
+- **Vision encoder (SigLIP-base)**: only **13ms** per step (**4.3%** of step time) — caching NOT worthwhile
+
+### 4.3.8. 1.5B Muon LR Sweep
+
+| Muon LR | Actual Loss (200 steps) | Grad Norm | Stability |
+|---------|------------------------|-----------|-----------|
+| 3e-4 | 1.729 | 1.20 | stable |
+| 5e-4 | 1.660 | 1.13 | stable |
+| **1e-3** | **1.620** | 1.07 | stable |
+| 2e-3 | 1.851 | 1.02 | diverging |
+
+**Optimal for 1.5B**: Muon LR=1e-3 (2x the 0.5B optimal of 5e-4).
+
+**Cross-scale comparison** (same wall-clock budget ~315s):
+- 0.5B + GA=2: loss 1.689, sees 22.5M tokens
+- 1.5B + GA=2 + LR=1e-3: loss **1.620**, sees 9M tokens
+
+1.5B achieves **better quality with 60% fewer tokens** — vastly more sample-efficient.
+
+### 4.3.9. Summary: Recommended Production Config
+
+```bash
+# === 0.5B Rapid Prototyping (74K tok/s) ===
+--per_device_train_batch_size 64
+--gradient_accumulation_steps 2         # effective bs=128, 32% faster than raw bs=128
 --seq_length 1024                       # dataset doesn't benefit from longer
 --lr_scheduler_type cosine              # equivalent to WSD for finetuning
 --optim_type muon --muon_lr 0.0005      # 4.9x faster convergence vs AdamW
 --use_tilegym --torch_compile           # kernel fusion + compilation
+--torch_compile_mode max-autotune-no-cudagraphs  # CUDA Graphs hurts at 0.5B
 --use_packing                           # zero padding waste
 --no_gradient_checkpointing             # only if VRAM fits
+--dataloader_num_workers 16             # fully hides data loading
+
+# === 1.5B Best Quality (28.6K tok/s) ===
+# Same as above, except:
+--muon_lr 0.001                         # 2x higher for larger model
+--text_model_name_or_path Qwen/Qwen2.5-1.5B-Instruct
 ```
 
 ---

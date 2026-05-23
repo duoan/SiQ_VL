@@ -1,0 +1,369 @@
+>>> Running in single-GPU/non-distributed mode.
+>>> Using subsets and weights:
+    - coco_colors: weight=1.0
+    - densefusion_1m: weight=1.0
+    - face_emotion: weight=1.0
+    - google_landmarks: weight=1.0
+    - laion_gpt4v: weight=1.0
+    - sharegpt4o: weight=1.0
+    - sharegpt4v(coco): weight=1.0
+    - sharegpt4v(llava): weight=1.0
+    - sharegpt4v(knowledge): weight=1.0
+    - sharegpt4v(sam): weight=1.0
+>>> Using output_dir: ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2
+>>> Loading Model and Processor...
+>>> Kernel config: tilegym=True, liger=False, fused_ce=True
+>>> Gradient checkpointing: False
+[2026-05-22 20:19:52] [tilegym.transformers.monkey_patch] [INFO] [logger.py:195] --------------------------------
+[2026-05-22 20:19:52] [tilegym.transformers.monkey_patch] [INFO] [logger.py:195] apply_tilegym_kernel_to_qwen2
+[2026-05-22 20:19:52] [tilegym.transformers.monkey_patch] [INFO] [logger.py:195] --------------------------------
+[2026-05-22 20:19:52] [tilegym.backend.selector] [INFO] [logger.py:195] Set backend to cutile
+>>> TileGym applied (cuTile DSL): RoPE + RMSNorm + SwiGLU + FA4 attention
+>>> TileGym attention wrapped with SDPA fallback for non-Qwen2 models
+>>> + fused_linear_cross_entropy (chunked, never materializes [BT,V] logits)
+Loading weights:   0%|          | 0/547 [00:00<?, ?it/s]Loading weights: 100%|██████████| 547/547 [00:00<00:00, 22288.45it/s]
+DEBUG - Model pixel_shuffle_factor: 2
+DEBUG - Processor pixel_shuffle_factor: 2
+DEBUG - Processor tokens_per_tile: 49
+Total model parameters: 1,641,317,120 | Vision model parameters: 92,884,224 (5.66%) | Text model parameters: 1,543,714,304 (94.05%) | Projector parameters: 4,718,592 (0.29%) | Trainable model parameters: 1,548,432,896, (94.34%)
+SiQ_VLConfig {
+  "architectures": [
+    "SiQ_VLForCausalLM"
+  ],
+  "bos_token_id": null,
+  "dtype": "bfloat16",
+  "eos_token_id": 151645,
+  "ignore_token_index": -100,
+  "image_token_index": 151655,
+  "model_type": "siq_vl",
+  "pad_token_id": 151643,
+  "projector_config": {
+    "_name_or_path": "",
+    "architectures": null,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "hidden_act": "silu",
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "model_type": "siq_vl",
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "problem_type": null,
+    "return_dict": true,
+    "text_hidden_size": 1536,
+    "vision_hidden_size": 768,
+    "vision_pixel_shuffle_factor": 2
+  },
+  "text_config": {
+    "_name_or_path": "",
+    "architectures": [
+      "Qwen2ForCausalLM"
+    ],
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "eos_token_id": 151645,
+    "hidden_act": "silu",
+    "hidden_size": 1536,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "intermediate_size": 8960,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "layer_types": [
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 32768,
+    "max_window_layers": 21,
+    "model_type": "siq_vl",
+    "num_attention_heads": 12,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 2,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "pad_token_id": null,
+    "problem_type": null,
+    "return_dict": true,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "rope_theta": 1000000.0,
+      "rope_type": "default"
+    },
+    "sliding_window": null,
+    "tie_word_embeddings": true,
+    "use_cache": true,
+    "use_sliding_window": false,
+    "vocab_size": 151936
+  },
+  "transformers_version": "5.3.0",
+  "vision_config": {
+    "_name_or_path": "",
+    "architectures": null,
+    "attention_dropout": 0.0,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 768,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "image_size": 224,
+    "intermediate_size": 3072,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "layer_norm_eps": 1e-06,
+    "model_type": "siq_vl",
+    "num_attention_heads": 12,
+    "num_channels": 3,
+    "num_hidden_layers": 12,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "patch_size": 16,
+    "problem_type": null,
+    "return_dict": true
+  },
+  "vision_end_token_index": 151653,
+  "vision_start_token_index": 151652
+}
+
+SiQ_VLTextConfig {
+  "architectures": [
+    "Qwen2ForCausalLM"
+  ],
+  "attention_dropout": 0.0,
+  "bos_token_id": 151643,
+  "dtype": "bfloat16",
+  "eos_token_id": 151645,
+  "hidden_act": "silu",
+  "hidden_size": 1536,
+  "initializer_range": 0.02,
+  "intermediate_size": 8960,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "max_position_embeddings": 32768,
+  "max_window_layers": 21,
+  "model_type": "siq_vl",
+  "num_attention_heads": 12,
+  "num_hidden_layers": 28,
+  "num_key_value_heads": 2,
+  "pad_token_id": null,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "rope_theta": 1000000.0,
+    "rope_type": "default"
+  },
+  "sliding_window": null,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.3.0",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 151936
+}
+
+SiQ_VLVisionConfig {
+  "attention_dropout": 0.0,
+  "dtype": "bfloat16",
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_size": 768,
+  "image_size": 224,
+  "intermediate_size": 3072,
+  "layer_norm_eps": 1e-06,
+  "model_type": "siq_vl",
+  "num_attention_heads": 12,
+  "num_channels": 3,
+  "num_hidden_layers": 12,
+  "patch_size": 16,
+  "transformers_version": "5.3.0"
+}
+
+SiQ_VLProjectorConfig {
+  "dtype": "bfloat16",
+  "hidden_act": "silu",
+  "model_type": "siq_vl",
+  "text_hidden_size": 1536,
+  "transformers_version": "5.3.0",
+  "vision_hidden_size": 768,
+  "vision_pixel_shuffle_factor": 2
+}
+
+>>> Loading Dataset...
+>>> Loading subset 'coco_colors' (weight=1.0)...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+>>> Loaded coco_colors: 118287 samples
+>>> Loading subset 'densefusion_1m' (weight=1.0)...
+>>> Loaded densefusion_1m: 1058751 samples
+>>> Loading subset 'face_emotion' (weight=1.0)...
+>>> Loaded face_emotion: 797 samples
+>>> Loading subset 'google_landmarks' (weight=1.0)...
+>>> Loaded google_landmarks: 299993 samples
+>>> Loading subset 'laion_gpt4v' (weight=1.0)...
+>>> Loaded laion_gpt4v: 9301 samples
+>>> Loading subset 'sharegpt4o' (weight=1.0)...
+>>> Loaded sharegpt4o: 57284 samples
+>>> Loading subset 'sharegpt4v(coco)' (weight=1.0)...
+>>> Loaded sharegpt4v(coco): 50017 samples
+>>> Loading subset 'sharegpt4v(llava)' (weight=1.0)...
+>>> Loaded sharegpt4v(llava): 29986 samples
+>>> Loading subset 'sharegpt4v(knowledge)' (weight=1.0)...
+>>> Loaded sharegpt4v(knowledge): 1988 samples
+>>> Loading subset 'sharegpt4v(sam)' (weight=1.0)...
+>>> Loaded sharegpt4v(sam): 8990 samples
+>>> Building dataset mixture:
+    - coco_colors: probability=0.1000
+    - densefusion_1m: probability=0.1000
+    - face_emotion: probability=0.1000
+    - google_landmarks: probability=0.1000
+    - laion_gpt4v: probability=0.1000
+    - sharegpt4o: probability=0.1000
+    - sharegpt4v(coco): probability=0.1000
+    - sharegpt4v(llava): probability=0.1000
+    - sharegpt4v(knowledge): probability=0.1000
+    - sharegpt4v(sam): probability=0.1000
+>>> Concatenated dataset: 1635394 samples (instant)
+>>> Creating VQADataset (standard Dataset with DistributedSampler support)...
+>>> Packing: seq_length=1024, ProcessedVQADataset + PackingCollator
+>>> Train Dataset: ProcessedVQADataset, len=1635344
+>>> Eval Dataset: VQADataset, len=50
+>>> Using user-specified max_steps=200
+>>> Generated run name: siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_202005
+>>> Setting WANDB_PROJECT to: siq-vl
+>>> Saving custom model code files to checkpoint directory...
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/siq_vl/model/modeling.py... ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2
+>>> Copied modeling.py to ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2/modeling.py
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/siq_vl/model/configuration.py... ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2
+>>> Copied configuration.py to ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2/configuration.py
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/siq_vl/model/processing.py... ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2
+>>> Copied processing.py to ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2/processing.py
+>>> Preparing to copy /home/duo.an/workspaces/SiQ_VL/README.md... ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2
+>>> Copied README.md to ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2/README.md
+>>> All callbacks DISABLED (max throughput mode)
+>>> DEBUG: Checking first batch shape...
+  input_ids: torch.Size([22, 1024])
+  labels: torch.Size([22, 1024])
+  pixel_values: torch.Size([64, 3, 224, 224])
+  attention_mask: torch.Size([22, 1024])
+>>> Start Training...
+>>> Muon optimizer: 197 params (2D hidden), 142 params (AdamW)
+  0%|          | 0/200 [00:00<?, ?it/s]W0522 20:20:17.893000 394567 torch/_dynamo/convert_frame.py:1358] [23/8] torch._dynamo hit config.recompile_limit (8)
+W0522 20:20:17.893000 394567 torch/_dynamo/convert_frame.py:1358] [23/8]    function: '_patched_launch' (/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/tilegym/experimental.py:68)
+W0522 20:20:17.893000 394567 torch/_dynamo/convert_frame.py:1358] [23/8]    last reason: 23/7: ___check_obj_id(stream, 134552925014336)                 # return _original_launch(stream, grid, kernel, kernel_args)  # tilegym/experimental.py:73 in _patched_launch
+W0522 20:20:17.893000 394567 torch/_dynamo/convert_frame.py:1358] [23/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0522 20:20:17.893000 394567 torch/_dynamo/convert_frame.py:1358] [23/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+W0522 20:20:23.632000 394567 torch/_dynamo/convert_frame.py:1358] [59/8] torch._dynamo hit config.recompile_limit (8)
+W0522 20:20:23.632000 394567 torch/_dynamo/convert_frame.py:1358] [59/8]    function: 'torch_dynamo_resume_in_forward_at_223' (/home/duo.an/workspaces/SiQ_VL/.venv/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py:223)
+W0522 20:20:23.632000 394567 torch/_dynamo/convert_frame.py:1358] [59/8]    last reason: 59/7: past_key_values.layers[7].is_initialized == False        # if not self.is_initialized:  # transformers/cache_utils.py:117 in update
+W0522 20:20:23.632000 394567 torch/_dynamo/convert_frame.py:1358] [59/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0522 20:20:23.632000 394567 torch/_dynamo/convert_frame.py:1358] [59/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[2026-05-22 20:20:24] [tilegym] [WARNING] [experimental.py:71] [EXPERIMENTAL] _ce_online_kernel is an experimental kernel contributed by external GitHub TileGym contributors. This kernel has not been fully validated by the core team.
+[2026-05-22 20:20:24] [tilegym] [WARNING] [experimental.py:71] [EXPERIMENTAL] _rms_bwd_kernel is an experimental kernel contributed by external GitHub TileGym contributors. This kernel has not been fully validated by the core team.
+[2026-05-22 20:20:24] [tilegym] [WARNING] [experimental.py:71] [EXPERIMENTAL] _swiglu_backward_kernel is an experimental kernel contributed by external GitHub TileGym contributors. This kernel has not been fully validated by the core team.
+  0%|          | 1/200 [00:18<1:01:46, 18.62s/it]  1%|          | 2/200 [00:20<28:09,  8.53s/it]    2%|▏         | 3/200 [00:21<17:36,  5.36s/it]  2%|▏         | 4/200 [00:23<12:39,  3.87s/it]  2%|▎         | 5/200 [00:24<09:46,  3.01s/it]  3%|▎         | 6/200 [00:26<08:00,  2.48s/it]  4%|▎         | 7/200 [00:27<06:55,  2.15s/it]  4%|▍         | 8/200 [00:29<06:13,  1.95s/it]  4%|▍         | 9/200 [00:34<09:24,  2.96s/it]  5%|▌         | 10/200 [00:35<07:51,  2.48s/it]  6%|▌         | 11/200 [00:37<06:52,  2.18s/it]  6%|▌         | 12/200 [00:38<06:05,  1.95s/it]  6%|▋         | 13/200 [00:40<05:34,  1.79s/it]  7%|▋         | 14/200 [00:41<05:14,  1.69s/it]  8%|▊         | 15/200 [00:42<04:56,  1.60s/it]  8%|▊         | 16/200 [00:44<04:45,  1.55s/it]  8%|▊         | 17/200 [00:46<05:03,  1.66s/it]  9%|▉         | 18/200 [00:47<04:52,  1.60s/it] 10%|▉         | 19/200 [00:49<04:41,  1.55s/it] 10%|█         | 20/200 [00:50<04:40,  1.56s/it] 10%|█         | 21/200 [00:52<04:32,  1.52s/it] 11%|█         | 22/200 [00:53<04:30,  1.52s/it] 12%|█▏        | 23/200 [00:55<04:26,  1.50s/it] 12%|█▏        | 24/200 [00:56<04:22,  1.49s/it] 12%|█▎        | 25/200 [00:58<04:15,  1.46s/it] 13%|█▎        | 26/200 [00:59<04:12,  1.45s/it] 14%|█▎        | 27/200 [01:00<04:07,  1.43s/it] 14%|█▍        | 28/200 [01:02<04:09,  1.45s/it] 14%|█▍        | 29/200 [01:03<04:09,  1.46s/it] 15%|█▌        | 30/200 [01:05<04:04,  1.44s/it] 16%|█▌        | 31/200 [01:06<04:05,  1.45s/it] 16%|█▌        | 32/200 [01:08<04:07,  1.48s/it] 16%|█▋        | 33/200 [01:09<04:05,  1.47s/it] 17%|█▋        | 34/200 [01:11<04:09,  1.51s/it] 18%|█▊        | 35/200 [01:12<04:06,  1.49s/it] 18%|█▊        | 36/200 [01:14<04:03,  1.48s/it] 18%|█▊        | 37/200 [01:15<04:01,  1.48s/it] 19%|█▉        | 38/200 [01:17<04:03,  1.50s/it] 20%|█▉        | 39/200 [01:18<03:55,  1.47s/it] 20%|██        | 40/200 [01:20<03:55,  1.47s/it] 20%|██        | 41/200 [01:21<03:53,  1.47s/it] 21%|██        | 42/200 [01:23<03:56,  1.49s/it] 22%|██▏       | 43/200 [01:24<03:49,  1.46s/it] 22%|██▏       | 44/200 [01:26<03:50,  1.48s/it] 22%|██▎       | 45/200 [01:27<03:48,  1.47s/it] 23%|██▎       | 46/200 [01:28<03:46,  1.47s/it] 24%|██▎       | 47/200 [01:30<03:47,  1.49s/it] 24%|██▍       | 48/200 [01:31<03:42,  1.46s/it] 24%|██▍       | 49/200 [01:33<03:41,  1.46s/it] 25%|██▌       | 50/200 [01:34<03:40,  1.47s/it]                                                 25%|██▌       | 50/200 [01:34<03:40,  1.47s/it] 26%|██▌       | 51/200 [01:36<03:41,  1.49s/it] 26%|██▌       | 52/200 [01:37<03:39,  1.48s/it] 26%|██▋       | 53/200 [01:39<03:36,  1.48s/it] 27%|██▋       | 54/200 [01:40<03:35,  1.47s/it] 28%|██▊       | 55/200 [01:42<03:28,  1.44s/it] 28%|██▊       | 56/200 [01:43<03:27,  1.44s/it] 28%|██▊       | 57/200 [01:45<03:25,  1.44s/it] 29%|██▉       | 58/200 [01:46<03:29,  1.47s/it] 30%|██▉       | 59/200 [01:48<03:27,  1.47s/it] 30%|███       | 60/200 [01:49<03:28,  1.49s/it] 30%|███       | 61/200 [01:50<03:23,  1.46s/it] 31%|███       | 62/200 [01:52<03:25,  1.49s/it] 32%|███▏      | 63/200 [01:53<03:17,  1.44s/it] 32%|███▏      | 64/200 [01:55<03:14,  1.43s/it] 32%|███▎      | 65/200 [01:56<03:14,  1.44s/it] 33%|███▎      | 66/200 [01:58<03:14,  1.45s/it] 34%|███▎      | 67/200 [01:59<03:11,  1.44s/it] 34%|███▍      | 68/200 [02:01<03:14,  1.47s/it] 34%|███▍      | 69/200 [02:02<03:15,  1.49s/it] 35%|███▌      | 70/200 [02:04<03:12,  1.48s/it] 36%|███▌      | 71/200 [02:05<03:12,  1.49s/it] 36%|███▌      | 72/200 [02:07<03:09,  1.48s/it] 36%|███▋      | 73/200 [02:08<03:09,  1.49s/it] 37%|███▋      | 74/200 [02:10<03:04,  1.47s/it] 38%|███▊      | 75/200 [02:11<03:06,  1.49s/it] 38%|███▊      | 76/200 [02:13<03:08,  1.52s/it] 38%|███▊      | 77/200 [02:14<03:06,  1.52s/it] 39%|███▉      | 78/200 [02:16<02:57,  1.46s/it] 40%|███▉      | 79/200 [02:17<02:54,  1.44s/it] 40%|████      | 80/200 [02:18<02:53,  1.45s/it] 40%|████      | 81/200 [02:20<02:52,  1.45s/it] 41%|████      | 82/200 [02:21<02:51,  1.46s/it] 42%|████▏     | 83/200 [02:23<02:51,  1.47s/it] 42%|████▏     | 84/200 [02:24<02:47,  1.44s/it] 42%|████▎     | 85/200 [02:26<02:45,  1.44s/it] 43%|████▎     | 86/200 [02:27<02:45,  1.45s/it] 44%|████▎     | 87/200 [02:29<02:45,  1.46s/it] 44%|████▍     | 88/200 [02:30<02:44,  1.46s/it] 44%|████▍     | 89/200 [02:31<02:40,  1.45s/it] 45%|████▌     | 90/200 [02:33<02:42,  1.48s/it] 46%|████▌     | 91/200 [02:34<02:39,  1.46s/it] 46%|████▌     | 92/200 [02:36<02:39,  1.47s/it] 46%|████▋     | 93/200 [02:37<02:35,  1.45s/it] 47%|████▋     | 94/200 [02:39<02:33,  1.45s/it] 48%|████▊     | 95/200 [02:40<02:33,  1.46s/it] 48%|████▊     | 96/200 [02:42<02:34,  1.49s/it] 48%|████▊     | 97/200 [02:43<02:33,  1.49s/it] 49%|████▉     | 98/200 [02:45<02:31,  1.49s/it] 50%|████▉     | 99/200 [02:46<02:31,  1.50s/it] 50%|█████     | 100/200 [02:48<02:28,  1.49s/it]                                                  50%|█████     | 100/200 [02:48<02:28,  1.49s/it] 50%|█████     | 101/200 [02:49<02:27,  1.49s/it] 51%|█████     | 102/200 [02:51<02:22,  1.46s/it] 52%|█████▏    | 103/200 [02:52<02:19,  1.43s/it] 52%|█████▏    | 104/200 [02:54<02:18,  1.44s/it] 52%|█████▎    | 105/200 [02:55<02:18,  1.46s/it] 53%|█████▎    | 106/200 [02:57<02:20,  1.49s/it] 54%|█████▎    | 107/200 [02:58<02:17,  1.48s/it] 54%|█████▍    | 108/200 [03:00<02:36,  1.70s/it] 55%|█████▍    | 109/200 [03:02<02:27,  1.62s/it] 55%|█████▌    | 110/200 [03:03<02:19,  1.55s/it] 56%|█████▌    | 111/200 [03:05<02:17,  1.54s/it] 56%|█████▌    | 112/200 [03:06<02:12,  1.51s/it] 56%|█████▋    | 113/200 [03:08<02:11,  1.51s/it] 57%|█████▋    | 114/200 [03:09<02:06,  1.48s/it] 57%|█████▊    | 115/200 [03:10<02:05,  1.47s/it] 58%|█████▊    | 116/200 [03:12<02:04,  1.48s/it] 58%|█████▊    | 117/200 [03:13<02:00,  1.45s/it] 59%|█████▉    | 118/200 [03:15<01:59,  1.45s/it] 60%|█████▉    | 119/200 [03:16<01:57,  1.46s/it] 60%|██████    | 120/200 [03:18<01:54,  1.43s/it] 60%|██████    | 121/200 [03:19<01:52,  1.42s/it] 61%|██████    | 122/200 [03:20<01:49,  1.41s/it] 62%|██████▏   | 123/200 [03:22<01:48,  1.42s/it] 62%|██████▏   | 124/200 [03:23<01:48,  1.42s/it] 62%|██████▎   | 125/200 [03:25<01:49,  1.46s/it] 63%|██████▎   | 126/200 [03:26<01:48,  1.47s/it] 64%|██████▎   | 127/200 [03:28<01:45,  1.45s/it] 64%|██████▍   | 128/200 [03:29<01:44,  1.45s/it] 64%|██████▍   | 129/200 [03:30<01:41,  1.42s/it] 65%|██████▌   | 130/200 [03:32<01:39,  1.42s/it] 66%|██████▌   | 131/200 [03:33<01:38,  1.43s/it] 66%|██████▌   | 132/200 [03:35<01:38,  1.45s/it] 66%|██████▋   | 133/200 [03:36<01:36,  1.45s/it] 67%|██████▋   | 134/200 [03:38<01:36,  1.46s/it] 68%|██████▊   | 135/200 [03:39<01:35,  1.47s/it] 68%|██████▊   | 136/200 [03:41<01:35,  1.49s/it] 68%|██████▊   | 137/200 [03:42<01:31,  1.45s/it] 69%|██████▉   | 138/200 [03:44<01:30,  1.46s/it] 70%|██████▉   | 139/200 [03:45<01:30,  1.48s/it] 70%|███████   | 140/200 [03:47<01:29,  1.49s/it] 70%|███████   | 141/200 [03:48<01:26,  1.47s/it] 71%|███████   | 142/200 [03:50<01:24,  1.46s/it] 72%|███████▏  | 143/200 [03:51<01:23,  1.46s/it] 72%|███████▏  | 144/200 [03:52<01:22,  1.47s/it] 72%|███████▎  | 145/200 [03:54<01:21,  1.48s/it] 73%|███████▎  | 146/200 [03:55<01:18,  1.45s/it] 74%|███████▎  | 147/200 [03:57<01:17,  1.46s/it] 74%|███████▍  | 148/200 [03:58<01:16,  1.48s/it] 74%|███████▍  | 149/200 [04:00<01:15,  1.48s/it] 75%|███████▌  | 150/200 [04:01<01:14,  1.48s/it]                                                  75%|███████▌  | 150/200 [04:01<01:14,  1.48s/it] 76%|███████▌  | 151/200 [04:03<01:11,  1.46s/it] 76%|███████▌  | 152/200 [04:04<01:09,  1.45s/it] 76%|███████▋  | 153/200 [04:06<01:07,  1.44s/it] 77%|███████▋  | 154/200 [04:07<01:06,  1.45s/it] 78%|███████▊  | 155/200 [04:09<01:07,  1.49s/it] 78%|███████▊  | 156/200 [04:10<01:04,  1.47s/it] 78%|███████▊  | 157/200 [04:12<01:02,  1.46s/it] 79%|███████▉  | 158/200 [04:13<01:02,  1.48s/it] 80%|███████▉  | 159/200 [04:14<00:59,  1.45s/it] 80%|████████  | 160/200 [04:16<00:58,  1.46s/it] 80%|████████  | 161/200 [04:17<00:56,  1.44s/it] 81%|████████  | 162/200 [04:19<00:54,  1.43s/it] 82%|████████▏ | 163/200 [04:20<00:53,  1.44s/it] 82%|████████▏ | 164/200 [04:22<00:51,  1.44s/it] 82%|████████▎ | 165/200 [04:23<00:50,  1.46s/it] 83%|████████▎ | 166/200 [04:25<00:49,  1.46s/it] 84%|████████▎ | 167/200 [04:26<00:48,  1.48s/it] 84%|████████▍ | 168/200 [04:28<00:47,  1.47s/it] 84%|████████▍ | 169/200 [04:29<00:44,  1.44s/it] 85%|████████▌ | 170/200 [04:30<00:42,  1.42s/it] 86%|████████▌ | 171/200 [04:32<00:41,  1.44s/it] 86%|████████▌ | 172/200 [04:33<00:40,  1.45s/it] 86%|████████▋ | 173/200 [04:35<00:38,  1.43s/it] 87%|████████▋ | 174/200 [04:36<00:37,  1.46s/it] 88%|████████▊ | 175/200 [04:38<00:37,  1.49s/it] 88%|████████▊ | 176/200 [04:39<00:35,  1.48s/it] 88%|████████▊ | 177/200 [04:41<00:33,  1.48s/it] 89%|████████▉ | 178/200 [04:42<00:32,  1.49s/it] 90%|████████▉ | 179/200 [04:44<00:30,  1.47s/it] 90%|█████████ | 180/200 [04:45<00:29,  1.47s/it] 90%|█████████ | 181/200 [04:47<00:28,  1.48s/it] 91%|█████████ | 182/200 [04:48<00:26,  1.46s/it] 92%|█████████▏| 183/200 [04:49<00:24,  1.47s/it] 92%|█████████▏| 184/200 [04:51<00:23,  1.46s/it] 92%|█████████▎| 185/200 [04:52<00:21,  1.45s/it] 93%|█████████▎| 186/200 [04:54<00:20,  1.44s/it] 94%|█████████▎| 187/200 [04:55<00:18,  1.45s/it] 94%|█████████▍| 188/200 [04:57<00:17,  1.45s/it] 94%|█████████▍| 189/200 [04:58<00:16,  1.49s/it] 95%|█████████▌| 190/200 [05:00<00:14,  1.49s/it] 96%|█████████▌| 191/200 [05:01<00:13,  1.47s/it] 96%|█████████▌| 192/200 [05:03<00:11,  1.46s/it] 96%|█████████▋| 193/200 [05:04<00:10,  1.48s/it] 97%|█████████▋| 194/200 [05:06<00:09,  1.50s/it] 98%|█████████▊| 195/200 [05:07<00:07,  1.50s/it] 98%|█████████▊| 196/200 [05:09<00:06,  1.51s/it] 98%|█████████▊| 197/200 [05:10<00:04,  1.48s/it] 99%|█████████▉| 198/200 [05:12<00:02,  1.46s/it]100%|█████████▉| 199/200 [05:13<00:01,  1.45s/it]100%|██████████| 200/200 [05:14<00:00,  1.45s/it]                                                 100%|██████████| 200/200 [05:14<00:00,  1.45s/it]1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 103.4±0.5 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 295.1±0.5 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 345.9±0.4 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 306.2±0.5 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 331.8±0.4 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 319.2±0.5 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 104.2±0.5 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 281.4±0.4 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 268.3±0.4 us (20 samples)
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 101.6±0.4 us (20 samples)
+{'loss': '3.828', 'grad_norm': '1.203', 'learning_rate': '0.0004418', 'epoch': '0.003913', 'num_input_tokens_seen': 2254848, 'train_runtime': '94.94', 'train_tokens_per_second': '2.375e+04'}
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 256.7±0.4 us (20 samples)
+{'loss': '3.491', 'grad_norm': '1.148', 'learning_rate': '0.0002662', 'epoch': '0.007827', 'num_input_tokens_seen': 4511744, 'train_runtime': '168.4', 'train_tokens_per_second': '2.68e+04'}
+1 succeeded, 0 failed
+* namespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2): 358.1±0.4 us (20 samples)
+{'loss': '3.358', 'grad_norm': '1.094', 'learning_rate': '8.052e-05', 'epoch': '0.01174', 'num_input_tokens_seen': 6753280, 'train_runtime': '241.9', 'train_tokens_per_second': '2.792e+04'}
+{'loss': '3.319', 'grad_norm': '1.133', 'learning_rate': '3.278e-08', 'epoch': '0.01565', 'num_input_tokens_seen': 8999936, 'train_runtime': '315', 'train_tokens_per_second': '2.857e+04'}
+
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s][A
+Writing model shards: 100%|██████████| 1/1 [00:01<00:00,  1.92s/it][AWriting model shards: 100%|██████████| 1/1 [00:01<00:00,  1.92s/it]
+                                                 100%|██████████| 200/200 [05:19<00:00,  1.45s/it]100%|██████████| 200/200 [05:19<00:00,  1.60s/it]
+>>> Done!
+{'train_runtime': '319.3', 'train_samples_per_second': '80.19', 'train_steps_per_second': '0.626', 'train_loss': '3.499', 'epoch': '0.01565', 'num_input_tokens_seen': 8999936}
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:01<00:00,  1.93s/it]Writing model shards: 100%|██████████| 1/1 [00:01<00:00,  1.94s/it]
+>>> Final model saved to ./outputs/siglip2-base-patch16-224_qwen2.5-1.5b-instruct_stage2_20260522_201952/stage2
+[W522 20:25:36.034672247 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
